@@ -6,6 +6,11 @@ layers, SwiGLU activation with SiLU gate) are implemented in the relevant module
 documented at the point of use — they are not config parameters because they do not
 vary across Llama 3 scales and changing them produces a different architecture, not a
 different scale of this one.
+
+RoPE configuration is handled by HuggingFace's RotaryEmbeddingConfigMixin (mixed into
+PretrainedConfig in transformers 5.x). rope_theta and rope_scaling are passed through
+to the base class, which validates and standardises them into config.rope_parameters.
+Do not bypass or duplicate this system.
 """
 
 from transformers import PretrainedConfig
@@ -19,9 +24,15 @@ class Llama3Config(PretrainedConfig):
     doing so breaks the library's ability to express different model scales without
     code changes.
 
-    Defaults correspond to the Llama 3.1 8B scale and are provided as a concrete
-    reference point, not as an implicit assumption. Every parameter must be set
-    explicitly when targeting a different scale.
+    Defaults correspond to a ~123M parameter scale (hidden_size=384, 16 layers,
+    8 attention heads, 2 KV heads, FFN width 1024) chosen as a convenient small
+    baseline for development and testing. Every parameter must be set explicitly
+    when targeting a specific research scale.
+
+    RoPE scaling is handled by HuggingFace's rope system. Pass rope_scaling as a dict
+    using HF's format (key is ``rope_type``, not ``type``). Supported types:
+    ``"linear"``, ``"dynamic"``, ``"yarn"``, ``"longrope"``, ``"llama3"``. HF validates
+    the dict and standardises it into ``config.rope_parameters``.
 
     Registered with HuggingFace AutoClass via ``auto_map``. Instantiate from the Hub::
 
@@ -58,10 +69,15 @@ class Llama3Config(PretrainedConfig):
             (vs ~10,000 typical) as a prerequisite for 128K context support. This
             value has physical meaning tied to the target context length and must
             never be hardcoded in the architecture.
-        rope_scaling: Optional configuration for RoPE frequency scaling, enabling
-            context extension beyond the training length without retraining. See
-            ``_validate_rope_scaling`` for the expected dict structure. None means
-            no scaling is applied.
+        max_position_embeddings: The context length the model was trained at. Used by
+            HF's rope system as original_max_position_embeddings for scaling types that
+            need it (yarn, longrope, llama3). This is the training context length, not
+            an inference ceiling — the rope module handles longer sequences at runtime
+            via lazy cache extension. Llama 3 base training context: 8192.
+        rope_scaling: Optional RoPE scaling configuration for extending context beyond
+            max_position_embeddings without retraining. Pass as a dict in HF's format
+            with ``rope_type`` as the key. HF's RotaryEmbeddingConfigMixin validates
+            and stores this. None means no scaling (default RoPE behaviour).
         attention_dropout: Dropout probability applied to attention weights. Default
             0.0 for deterministic behaviour.
         use_cache: Whether the model returns past_key_values for KV caching. Set True
@@ -83,14 +99,15 @@ class Llama3Config(PretrainedConfig):
     def __init__(
         self,
         vocab_size: int = 128000,
-        hidden_size: int = 4096,
-        intermediate_size: int = 14336,
-        num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
-        num_key_value_heads: int = 8,
+        hidden_size: int = 384,
+        intermediate_size: int = 1024,
+        num_hidden_layers: int = 16,
+        num_attention_heads: int = 8,
+        num_key_value_heads: int = 2,
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-5,
         rope_theta: float = 500000.0,
+        max_position_embeddings: int = 8192,
         rope_scaling: dict | None = None,
         attention_dropout: float = 0.0,
         use_cache: bool = True,
@@ -111,8 +128,6 @@ class Llama3Config(PretrainedConfig):
                 f"num_key_value_heads ({num_key_value_heads}). GQA requires query "
                 f"heads to divide evenly across KV head groups."
             )
-        if rope_scaling is not None:
-            _validate_rope_scaling(rope_scaling)
 
         # head_dim is normally hidden_size // num_attention_heads but is exposed as a
         # parameter for architectures that decouple head count from head size.
@@ -127,43 +142,17 @@ class Llama3Config(PretrainedConfig):
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
 
-        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
-
-
-def _validate_rope_scaling(rope_scaling: dict) -> None:
-    """Validate the rope_scaling configuration dict.
-
-    rope_scaling must contain 'type' and 'factor'. 'type' selects the scaling
-    algorithm; 'factor' is the context extension multiplier and must be > 1.0
-    (a factor <= 1.0 does not extend context and is not a valid use of scaling).
-
-    Raises:
-        ValueError: If required keys are missing, the type is unsupported, or the
-            factor is out of range.
-    """
-    required_keys = {"type", "factor"}
-    missing = required_keys - rope_scaling.keys()
-    if missing:
-        raise ValueError(
-            f"rope_scaling is missing required keys: {missing}. "
-            f"Expected at minimum: {required_keys}."
-        )
-
-    supported_types = {"linear", "yarn"}
-    if rope_scaling["type"] not in supported_types:
-        raise ValueError(
-            f"rope_scaling 'type' must be one of {supported_types}, "
-            f"got '{rope_scaling['type']}'."
-        )
-
-    factor = rope_scaling["factor"]
-    if not isinstance(factor, (int, float)) or factor <= 1.0:
-        raise ValueError(
-            f"rope_scaling 'factor' must be a number > 1.0 (values <= 1.0 do not "
-            f"extend context), got {factor}."
+        # rope_theta, max_position_embeddings, and rope_scaling are passed to HF's
+        # base class, which owns rope configuration via RotaryEmbeddingConfigMixin.
+        # HF validates rope_scaling and standardises everything into rope_parameters.
+        # Do not store or validate these ourselves.
+        super().__init__(
+            rope_theta=rope_theta,
+            max_position_embeddings=max_position_embeddings,
+            rope_scaling=rope_scaling,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
         )

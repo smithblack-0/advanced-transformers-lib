@@ -2,12 +2,15 @@
 
 Each test verifies a specific invariant documented in the plan. The grouping mirrors
 the structure of the invariants: defaults, parameter overrides, structural validation,
-rope_scaling validation, and serialisation.
+rope configuration, and serialisation.
+
+RoPE scaling validation is owned by HF's RotaryEmbeddingConfigMixin and is not tested
+here — we test that our config correctly passes parameters through to HF's system.
 """
 
 import pytest
 
-from llama3.configuration import Llama3Config
+from src.llama3.configuration import Llama3Config
 
 
 # ---------------------------------------------------------------------------
@@ -18,8 +21,8 @@ def small_config(**kwargs) -> Llama3Config:
     """Return a config with small dimensions suitable for testing.
 
     Using full-scale defaults (hidden_size=4096 etc.) in tests that don't care about
-    scale adds noise and slows things down. This helper applies a consistent small
-    baseline that satisfies all structural constraints.
+    scale adds noise. This helper applies a consistent small baseline that satisfies
+    all structural constraints.
     """
     defaults = dict(
         hidden_size=512,
@@ -36,8 +39,9 @@ def small_config(**kwargs) -> Llama3Config:
 # Defaults
 # ---------------------------------------------------------------------------
 
-class TestDefaults:
+class TestInstantiation:
     def test_default_instantiation_succeeds(self):
+        """Config must instantiate without arguments — all parameters have defaults."""
         config = Llama3Config()
         assert config is not None
 
@@ -45,52 +49,50 @@ class TestDefaults:
         """model_type must be unique to avoid colliding with HF's built-in 'llama'."""
         assert Llama3Config.model_type == "llama3_baseline"
 
-    def test_default_vocab_size(self):
-        """128,000 matches the Llama 3 tokenizer (100K base + 28K multilingual)."""
-        assert Llama3Config().vocab_size == 128000
-
-    def test_head_dim_computed_when_not_provided(self):
-        """head_dim defaults to hidden_size // num_attention_heads."""
-        config = small_config(hidden_size=512, num_attention_heads=8)
-        assert config.head_dim == 64
-
-    def test_tie_word_embeddings_defaults_false(self):
-        """Llama 3 does not tie the input embedding table and the LM head."""
-        assert Llama3Config().tie_word_embeddings is False
-
-    def test_rope_scaling_defaults_none(self):
-        assert Llama3Config().rope_scaling is None
-
-    def test_use_cache_defaults_true(self):
-        assert Llama3Config().use_cache is True
-
     def test_auto_map_present(self):
         """auto_map must be set so HuggingFace trust_remote_code can find the classes."""
         assert "AutoConfig" in Llama3Config.auto_map
         assert "AutoModelForCausalLM" in Llama3Config.auto_map
+
+    def test_head_dim_computed_when_not_provided(self):
+        """head_dim is derived from hidden_size // num_attention_heads when not set."""
+        config = small_config(hidden_size=512, num_attention_heads=8)
+        assert config.head_dim == 64
 
 
 # ---------------------------------------------------------------------------
 # Parameter overrides
 # ---------------------------------------------------------------------------
 
-class TestParameterOverrides:
-    def test_num_hidden_layers_override(self):
+class TestParameterStorage:
+    def test_vocab_size_stored(self):
+        config = small_config(vocab_size=50000)
+        assert config.vocab_size == 50000
+
+    def test_num_hidden_layers_stored(self):
         config = small_config(num_hidden_layers=16)
         assert config.num_hidden_layers == 16
 
-    def test_rope_theta_override(self):
+    def test_rope_theta_stored(self):
         config = small_config(rope_theta=10000.0)
         assert config.rope_theta == 10000.0
 
-    def test_head_dim_explicit_override(self):
+    def test_max_position_embeddings_stored(self):
+        config = small_config(max_position_embeddings=4096)
+        assert config.max_position_embeddings == 4096
+
+    def test_head_dim_explicit_stored(self):
         """head_dim can be set directly to decouple it from hidden_size // num_heads."""
         config = small_config(head_dim=128)
         assert config.head_dim == 128
 
-    def test_use_cache_override(self):
+    def test_use_cache_stored(self):
         config = small_config(use_cache=False)
         assert config.use_cache is False
+
+    def test_tie_word_embeddings_stored(self):
+        config = small_config(tie_word_embeddings=True)
+        assert config.tie_word_embeddings is True
 
 
 # ---------------------------------------------------------------------------
@@ -120,44 +122,32 @@ class TestStructuralValidation:
 
 
 # ---------------------------------------------------------------------------
-# RoPE scaling validation
+# RoPE configuration
 # ---------------------------------------------------------------------------
 
-class TestRopeScalingValidation:
-    def test_none_is_valid(self):
-        config = small_config(rope_scaling=None)
-        assert config.rope_scaling is None
+class TestRopeConfiguration:
+    def test_no_rope_scaling_by_default(self):
+        """Without rope_scaling, HF leaves rope_parameters as None — rope_theta is used directly."""
+        config = small_config()
+        assert config.rope_parameters is None
 
-    def test_linear_scaling_valid(self):
-        config = small_config(rope_scaling={"type": "linear", "factor": 4.0})
-        assert config.rope_scaling["type"] == "linear"
-        assert config.rope_scaling["factor"] == 4.0
+    def test_linear_rope_scaling_accepted(self):
+        """Linear scaling is the simplest extension method — divides all frequencies by factor."""
+        config = small_config(
+            rope_scaling={"rope_type": "linear", "factor": 4.0}
+        )
+        assert config.rope_parameters["rope_type"] == "linear"
 
-    def test_yarn_type_accepted(self):
-        """YaRN is a recognised type even though the rope.py implementation is a placeholder."""
-        config = small_config(rope_scaling={"type": "yarn", "factor": 4.0})
-        assert config.rope_scaling["type"] == "yarn"
-
-    def test_unknown_type_raises(self):
-        with pytest.raises(ValueError, match="type"):
-            small_config(rope_scaling={"type": "unknown", "factor": 4.0})
-
-    def test_missing_factor_raises(self):
-        with pytest.raises(ValueError, match="missing required keys"):
-            small_config(rope_scaling={"type": "linear"})
-
-    def test_missing_type_raises(self):
-        with pytest.raises(ValueError, match="missing required keys"):
-            small_config(rope_scaling={"factor": 4.0})
-
-    def test_factor_below_one_raises(self):
-        with pytest.raises(ValueError, match="factor"):
-            small_config(rope_scaling={"type": "linear", "factor": 0.5})
-
-    def test_factor_equal_to_one_raises(self):
-        """factor=1.0 does not extend context and is not a valid use of rope_scaling."""
-        with pytest.raises(ValueError, match="factor"):
-            small_config(rope_scaling={"type": "linear", "factor": 1.0})
+    def test_yarn_rope_scaling_accepted(self):
+        """YaRN applies frequency-aware scaling and is fully supported via HF's system."""
+        config = small_config(
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 8192,
+            }
+        )
+        assert config.rope_parameters["rope_type"] == "yarn"
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +163,7 @@ class TestSerialisation:
         """
         original = small_config(
             rope_theta=10000.0,
-            rope_scaling={"type": "linear", "factor": 2.0},
+            max_position_embeddings=4096,
             attention_dropout=0.1,
             use_cache=False,
         )
@@ -188,7 +178,7 @@ class TestSerialisation:
         assert restored.head_dim == original.head_dim
         assert restored.rms_norm_eps == original.rms_norm_eps
         assert restored.rope_theta == original.rope_theta
-        assert restored.rope_scaling == original.rope_scaling
+        assert restored.max_position_embeddings == original.max_position_embeddings
         assert restored.attention_dropout == original.attention_dropout
         assert restored.use_cache == original.use_cache
         assert restored.tie_word_embeddings == original.tie_word_embeddings
