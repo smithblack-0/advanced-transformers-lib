@@ -4,11 +4,18 @@
 
 ### What you need
 
-A HuggingFace write-access token. To get one:
+**Step 1 -- Create the repository on HuggingFace:**
 1. Log in at https://huggingface.co
-2. Go to Settings > Access Tokens
-3. Create a new token with Write access
-4. Copy it -- you will paste it when the script prompts you
+2. Click New Model
+3. Set the name to `llama3_baseline` and owner to `smithblack-0`
+4. Set visibility as desired and click Create
+
+**Step 2 -- Create a write token scoped to that repository only:**
+1. Go to Settings > Access Tokens
+2. Click New Token, choose Fine-grained
+3. Under Repository permissions, select `smithblack-0/llama3_baseline` only
+4. Grant Write access on that repository
+5. Copy the token -- you will paste it when the script prompts you
 
 ### Running the upload
 

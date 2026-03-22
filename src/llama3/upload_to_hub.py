@@ -16,7 +16,7 @@ making accidental upload structurally impossible.
 
 from pathlib import Path
 
-from huggingface_hub import create_repo, upload_folder
+from huggingface_hub import upload_folder
 
 from .model.configuration import Llama3Config
 from .model.huggingface import Llama3ForCausalLM
@@ -86,34 +86,34 @@ def _render_card(config: Llama3Config, repo_id: str) -> str:
 def upload(repo_id: str = REPO_ID) -> None:
     """Prepare and publish the architecture and tokenizer to the Hub.
 
-    Prompts for a HuggingFace write-access token, then runs five steps:
+    Prompts for a HuggingFace write-access token scoped to this repository,
+    then runs four steps:
     1. Refresh tokenizer files in model/ via prepare_tokenizer()
     2. Write config.json to model/ from Llama3Config defaults
     3. Render and write README.md (architecture card) to model/
-    4. Create the Hub repository if it does not already exist
-    5. Upload model/ contents to the Hub repository root atomically
+    4. Upload model/ contents to the Hub repository root atomically
+
+    The repository must already exist on HuggingFace Hub before running.
+    See src/llama3/documentation.md for setup instructions.
 
     Args:
         repo_id: Target Hub repository in 'namespace/name' format.
     """
     token = input("HuggingFace write token: ").strip()
 
-    print("Step 1/5 -- Refreshing tokenizer...")
+    print("Step 1/4 -- Refreshing tokenizer...")
     prepare_tokenizer()
 
     config = Llama3Config()
 
-    print("Step 2/5 -- Writing config.json...")
+    print("Step 2/4 -- Writing config.json...")
     config.save_pretrained(MODEL_DIR)
 
-    print("Step 3/5 -- Rendering architecture card...")
+    print("Step 3/4 -- Rendering architecture card...")
     card = _render_card(config, repo_id)
     (MODEL_DIR / "README.md").write_text(card, encoding="utf-8")
 
-    print(f"Step 4/5 -- Creating repository '{repo_id}' (if needed)...")
-    create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, token=token)
-
-    print(f"Step 5/5 -- Uploading {MODEL_DIR} to {repo_id}...")
+    print(f"Step 4/4 -- Uploading {MODEL_DIR} to {repo_id}...")
     upload_folder(
         repo_id=repo_id,
         folder_path=MODEL_DIR,
