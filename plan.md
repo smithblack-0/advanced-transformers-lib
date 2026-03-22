@@ -1,7 +1,7 @@
 # Implementation Plan: advanced-transformers-lib — Llama 3 Baseline
 
 ## Status
-**Current state:** Units 1–7 verified. All blockers resolved. Unit 8 next.
+**Current state:** Units 1–7 verified. All blockers resolved. Unit 8 in planning.
 
 ---
 
@@ -111,6 +111,7 @@ advanced-transformers-lib/
 └── tests/
     └── llama3/
         ├── __init__.py
+        ├── test_tokenizer.py           # mirrors src/llama3/tokenizer.py
         └── model/
             ├── __init__.py
             ├── test_configuration.py
@@ -119,8 +120,7 @@ advanced-transformers-lib/
             ├── test_attention.py
             ├── test_decoder_layer.py
             ├── test_model.py
-            ├── test_huggingface.py
-            └── test_tokenizer.py
+            └── test_huggingface.py
 ```
 
 **Why this granularity:** One file per major responsibility. Each file has a clear, independent reason
