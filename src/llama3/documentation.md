@@ -2,35 +2,39 @@
 
 ## Uploading the Architecture to HuggingFace Hub
 
-### What you need
+### Steps
 
-**Step 1 -- Create the repository on HuggingFace:**
+**1. Edit the repository name if needed.**
+Open `src/llama3/upload_to_hub.py` and check `REPO_ID` at the top. It is set to
+`smithblack-0/llama3_baseline` by default. Change it to match your intended
+HuggingFace repository before proceeding.
+
+**2. Create the repository on HuggingFace if it does not already exist.**
 1. Log in at https://huggingface.co
 2. Click New Model
-3. Set the name to `llama3_baseline` and owner to `smithblack-0`
+3. Name it to match the `REPO_ID` you set above
 4. Set visibility as desired and click Create
 
-**Step 2 -- Create a write token scoped to that repository only:**
+**3. Create a write-access token scoped to that repository only.**
 1. Go to Settings > Access Tokens
 2. Click New Token, choose Fine-grained
-3. Under Repository permissions, select `smithblack-0/llama3_baseline` only
-4. Grant Write access on that repository
-5. Copy the token -- you will paste it when the script prompts you
+3. Under Repository permissions, add your repository and grant Write access
+4. Copy the token
 
-### Running the upload
-
-From the repository root:
+**4. Run the upload.**
 
 ```bash
 python -m src.llama3.upload_to_hub
 ```
 
-The script will prompt for your token, then run five steps:
+Paste the token when prompted. The script will:
 1. Refresh tokenizer files
 2. Write `config.json`
 3. Render the architecture card (`README.md`) from `model_card.md`
-4. Create the Hub repository if it does not exist
-5. Upload `src/llama3/model/` to the Hub repository root
+4. Upload `src/llama3/model/` to the Hub repository root
+
+**5. Delete the token (recommended).**
+Go back to Settings > Access Tokens and delete the token you just used.
 
 ### Verifying the upload
 
