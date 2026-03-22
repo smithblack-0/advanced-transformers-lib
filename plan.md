@@ -1,7 +1,7 @@
 # Implementation Plan: advanced-transformers-lib — Llama 3 Baseline
 
 ## Status
-**Current state:** Units 1–7 verified. All blockers resolved. Unit 8 in planning.
+**Current state:** Units 1–8 verified. Unit 9 next.
 
 ---
 
@@ -722,5 +722,5 @@ current unit, resolve and verify the blocker, then return.
 - [x] Blocker B — override _init_weights to no-op so PyTorch constructor defaults stand
 - [x] Blocker — Refactor: move files into src/llama3/model/, convert to relative imports
 - [x] Blocker — tokenizer.py
-- [ ] Unit 8 — upload_to_hub.py
+- [x] Unit 8 — upload_to_hub.py
 - [ ] Unit 9 — Documentation
