@@ -1,7 +1,7 @@
 # Implementation Plan: advanced-transformers-lib — Llama 3 Baseline
 
 ## Status
-**Current state:** Units 1–7 verified. Blockers A and B resolved. Blocker Refactor next.
+**Current state:** Units 1–7 verified. All blockers resolved. Unit 8 next.
 
 ---
 
@@ -720,7 +720,7 @@ current unit, resolve and verify the blocker, then return.
 - [x] Blocker — auto_map in configuration.py
 - [x] Blocker A — embed_tokens belongs on Llama3ForCausalLM, not Llama3Model
 - [x] Blocker B — override _init_weights to no-op so PyTorch constructor defaults stand
-- [ ] Blocker — Refactor: move files into src/llama3/model/, convert to relative imports
-- [ ] Blocker — tokenizer.py
+- [x] Blocker — Refactor: move files into src/llama3/model/, convert to relative imports
+- [x] Blocker — tokenizer.py
 - [ ] Unit 8 — upload_to_hub.py
 - [ ] Unit 9 — Documentation
