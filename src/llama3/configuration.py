@@ -82,6 +82,9 @@ class Llama3Config(PretrainedConfig):
             0.0 for deterministic behaviour.
         use_cache: Whether the model returns past_key_values for KV caching. Set True
             for inference, may be set False during training to reduce memory pressure.
+        output_hidden_states: Whether the model returns the hidden state tensor after
+            each decoder layer. Useful for probing or intermediate representation
+            extraction. Default False.
         tie_word_embeddings: Whether the input embedding table and the LM head share
             weights. False for Llama 3.
     """
@@ -111,6 +114,7 @@ class Llama3Config(PretrainedConfig):
         rope_scaling: dict | None = None,
         attention_dropout: float = 0.0,
         use_cache: bool = True,
+        output_hidden_states: bool = False,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
@@ -154,5 +158,6 @@ class Llama3Config(PretrainedConfig):
             max_position_embeddings=max_position_embeddings,
             rope_scaling=rope_scaling,
             tie_word_embeddings=tie_word_embeddings,
+            output_hidden_states=output_hidden_states,
             **kwargs,
         )

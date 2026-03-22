@@ -1,7 +1,7 @@
 # Implementation Plan: advanced-transformers-lib — Llama 3 Baseline
 
 ## Status
-**Current state:** Units 1 and 2 verified. Unit 3 (mlp.py) in progress.
+**Current state:** Units 1–6 verified (plus type_aliases blocker). Unit 7 (Llama3ForCausalLM) next.
 
 ---
 
@@ -322,7 +322,7 @@ are standard config attributes — no reason to couple the type to our specific 
 
 ### Unit 4 — attention.py
 
-**What:** `Llama3Attention` — Grouped Query Attention with causal masking and KV cache support.
+**What:** `GroupedQueryAttention` — Grouped Query Attention with causal masking and KV cache support.
 
 **Why GQA:** At 128K context, the KV cache dominates memory. With 8 KV heads and 32 query heads (8B
 model), the KV cache is 4× smaller than standard MHA. This was the primary architectural motivation —
@@ -350,9 +350,14 @@ kernel automatically selects FlashAttention when hardware and dtype support it, 
 standard attention otherwise. This delivers efficiency without an additional dependency and uses a
 well-tested PyTorch builtin rather than a custom kernel.
 
-**Causal masking:** `is_causal=True` passed to SDPA during prefill (processing the full input
-sequence). During cached generation (single new token attending over full cached history), no mask is
-needed — the new token is always the last position.
+**Causal masking:** Strictly causal — no external attention mask parameter. `is_causal=True` passed
+to SDPA during prefill (q_len > 1). During cached generation (q_len == 1), `is_causal=False` —
+the new token is always the last position and may attend to the full history without a mask.
+
+**attention_scaling:** `RotaryEmbedding.forward` returns an `attention_scaling` factor (1.0 for
+default/linear, != 1.0 for YaRN). This is applied by passing `scale=attention_scaling/sqrt(head_dim)`
+to SDPA, which replaces the default `1/sqrt(head_dim)` scaling. This correctly adjusts attention
+magnitude for scaling types that manipulate frequency structure.
 
 **KV cache format:** Tuple of `(key_states, value_states)` per layer, passed as `past_key_values`.
 Classic HF format, broadly compatible. On each forward pass, new K/V are concatenated with cached
@@ -363,16 +368,32 @@ K/V along the sequence dimension before attention is computed.
 - `num_attention_heads % num_key_value_heads == 0` — checked defensively at runtime
 - GQA correctness: with `num_key_value_heads < num_attention_heads`, output shape is correct and KV
   expansion is occurring (verified by inspecting expanded tensor shapes)
-- Causal masking: attention weight matrix is lower-triangular (token i attends only to positions ≤ i)
+- Causal masking: future tokens do not influence past token outputs — verified by confirming that
+  modifying tokens at positions > t leaves the output at position t unchanged
 - KV cache: output at position t with cache equals output at position t from a full forward pass over
   the complete sequence up to t
 - No bias on any projection
 
 ---
 
+### Blocker — type_aliases.py
+
+**Why:** The KV cache type `tuple[list[torch.Tensor], list[torch.Tensor]]` is repeated
+across attention.py and decoder_layer.py, and model.py will need `list[KVCache]`. Without
+named aliases this becomes unreadable. Centralising them is required before Unit 6.
+
+**Aliases:**
+- `KVCache = tuple[list[Tensor], list[Tensor]]` — single-layer cache
+- `ModelKVCache = list[KVCache]` — full model cache (one entry per decoder layer)
+
+**Testing:** Type aliases have no runtime behaviour. Verification is that all existing
+tests continue to pass after the refactor.
+
+---
+
 ### Unit 5 — decoder_layer.py
 
-**What:** `Llama3DecoderLayer` — a single transformer block: pre-norm attention followed by pre-norm
+**What:** `DecoderLayer` — a single transformer block: pre-norm attention followed by pre-norm
 MLP, with residual connections.
 
 **Why pre-norm:** Normalising the sublayer *input* (not output) keeps the residual stream
@@ -382,8 +403,10 @@ scale use pre-norm.
 
 **Structure:**
 ```
-h   = x + Attention(RMSNorm(x), ...)
-out = h + MLP(RMSNorm(h))
+normed = RMSNorm(x)
+h      = x + Attention(normed, ...)
+normed = RMSNorm(h)
+out    = h + MLP(normed)
 ```
 
 Two independent `torch.nn.RMSNorm` instances — one before attention, one before MLP. They learn
@@ -398,50 +421,80 @@ implementation detail; sharing them would be wrong.
 
 ---
 
-### Unit 6 — model.py
+### Unit 6 — model.py (Llama3Model)
 
-**What:** `Llama3Model` (transformer backbone) and `Llama3ForCausalLM` (backbone + LM head).
-This unit satisfies the HuggingFace AutoClass contract.
+**What:** `Llama3Model` — the pure transformer backbone. No LM head, no loss, no HF generation
+machinery. A clean, testable unit that can be verified before the HF wrapper is added.
 
-**Why two classes:** `Llama3Model` is the pure transformer backbone, reusable for any task head.
-`Llama3ForCausalLM` adds the language modelling head and loss computation. This separation matches HF
-conventions and is the correct division of responsibility.
+**Why separate from Llama3ForCausalLM:** The backbone is independently verifiable. Mixing in the
+HF contract, weight tying, and loss computation before the backbone is confirmed correct makes
+failures harder to diagnose. Verify the foundation first.
 
-**Llama3Model:**
-- Token embedding: `vocab_size × hidden_size`
-- Stack of `num_hidden_layers` decoder layers
-- Final `torch.nn.RMSNorm` — the stack output is normalised before projection to logits
-- Returns last hidden state; optionally all hidden states, attention weights, past_key_values
+**Structure:**
+- Token embedding: `nn.Embedding(vocab_size, hidden_size)`
+- Stack of `num_hidden_layers` `DecoderLayer` instances
+- Final `torch.nn.RMSNorm` — the stack output is normalised before any projection
 
-**Llama3ForCausalLM:**
+**Returns a dict** with:
+- `"last_hidden_state"`: output of the final decoder layer, shape `(batch, seq, hidden_size)`
+- `"past_key_values"`: `ModelKVCache | None`
+- `"hidden_states"`: tuple of per-layer outputs if `config.output_hidden_states` is True, else None
+
+**output_hidden_states:** `PretrainedConfig` already has `output_hidden_states: bool = False` as a
+standard attribute (set via `**kwargs` in our `super().__init__()`). No new config parameter needed —
+but it must be explicitly declared in `Llama3Config.__init__` so it is visible and documented. This
+requires a small config blocker before implementation.
+
+**HF contract (minimal for this unit):**
+- Inherits `PreTrainedModel`
+- `config_class = Llama3Config`
+- `base_model_prefix = "model"`
+- `post_init()` called at end of `__init__`
+
+**Invariants that must hold (tested):**
+- Output `"last_hidden_state"` shape: `(batch, seq, hidden_size)`
+- KV cache: hidden state at position t with cache matches full forward at that position
+- `output_hidden_states=True` returns one tensor per layer plus the embedding output
+- `output_hidden_states=False` returns None for hidden_states
+
+---
+
+### Unit 7 — model.py (Llama3ForCausalLM)
+
+**What:** `Llama3ForCausalLM` — HF wrapper around `Llama3Model`. Adds the LM head, weight tying,
+loss computation, and the full HF AutoClass contract.
+
+**Structure:**
 - Contains `Llama3Model` as `self.model`
 - LM head: `nn.Linear(hidden_size, vocab_size, bias=False)`
 - `tie_word_embeddings`: if True, LM head weight is shared with the embedding table
-- `forward()`: runs model, projects to logits, computes cross-entropy loss if labels provided
-  (labels are shifted by one — each token predicts the next)
-- Returns `CausalLMOutputWithPast`
+
+**forward():**
+- Runs `self.model`, projects last hidden state to logits
+- Computes cross-entropy loss if labels provided (labels shifted by one — each token predicts next)
+- Returns a plain **dict** (not `CausalLMOutputWithPast`) with keys: `"logits"`, `"loss"`,
+  `"past_key_values"`, `"hidden_states"`. Using a dict avoids importing HF dataclass machinery
+  and keeps the return type readable.
 
 **HF contract:**
 - Inherits `PreTrainedModel` and `GenerationMixin`
 - `config_class = Llama3Config`
 - `base_model_prefix = "model"`
-- `_no_split_modules = ["Llama3DecoderLayer"]`
+- `_no_split_modules = ["DecoderLayer"]`
 - `supports_gradient_checkpointing = True`
-- `post_init()` called at end of `__init__` (required for HF gradient checkpointing machinery)
-- `_init_weights` is NOT overridden — PyTorch default initialisation stands. The paper reports no
-  specific initialisation scheme; replicating HF's normal-distribution override would add something
-  with no basis in the synthesis.
+- `post_init()` called at end of `__init__`
+- `_init_weights` is NOT overridden — PyTorch default initialisation stands
 
 **Invariants that must hold (tested):**
-- Output logits shape: `(batch, seq, vocab_size)`
+- Output `"logits"` shape: `(batch, seq, vocab_size)`
 - Loss computed correctly when labels provided (cross-entropy, next-token prediction)
-- KV cache: generation with cache produces identical logits to full forward at the current position
+- KV cache: generation with cache produces identical logits to full forward at current position
 - `save_pretrained` / `from_pretrained` round-trip: all weights identical
 - `AutoModelForCausalLM.from_config(config)` instantiates without error
 
 ---
 
-### Unit 7 — upload_to_hub.py
+### Unit 8 — upload_to_hub.py
 
 **What:** Standalone script that makes the architecture available on HuggingFace Hub so a researcher
 can instantiate a fresh model with no checkpoint.
@@ -477,7 +530,7 @@ revisited at the start of the relevant unit.
 |---|----------|----------|--------|
 | 1 | `model_type` | `"llama3_baseline"` | Confirmed by user |
 | 2 | Attention kernel | `torch.nn.functional.scaled_dot_product_attention` | Confirmed by user |
-| 3 | KV cache format | Tuple of `(key, value)` per layer | Confirmed by user |
+| 3 | KV cache format | List of tensor chunks per layer (`KVCache`), concatenated once at attention time | Revised from original tuple-per-layer; avoids O(N²) copies |
 | 4 | YaRN scaling | Handled natively by HF's `ROPE_INIT_FUNCTIONS` — no placeholder needed | Resolved: all scaling types supported via HF |
 | 5 | `intermediate_size` | Direct config parameter | Confirmed by user |
 
@@ -494,9 +547,10 @@ current unit, resolve and verify the blocker, then return.
 
 - [x] Unit 1 — configuration.py
 - [x] Unit 2 — rope.py
-- [ ] Unit 3 — mlp.py  ← in progress
-- [ ] Unit 3 — mlp.py
-- [ ] Unit 4 — attention.py
-- [ ] Unit 5 — decoder_layer.py
-- [ ] Unit 6 — model.py
-- [ ] Unit 7 — upload_to_hub.py
+- [x] Unit 3 — mlp.py
+- [x] Unit 4 — attention.py
+- [x] Unit 5 — decoder_layer.py
+- [x] Blocker — type_aliases.py
+- [x] Unit 6 — model.py (Llama3Model)
+- [ ] Unit 7 — model.py (Llama3ForCausalLM)
+- [ ] Unit 8 — upload_to_hub.py

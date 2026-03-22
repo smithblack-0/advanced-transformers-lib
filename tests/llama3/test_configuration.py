@@ -90,6 +90,15 @@ class TestParameterStorage:
         config = small_config(use_cache=False)
         assert config.use_cache is False
 
+    def test_output_hidden_states_defaults_false(self):
+        """output_hidden_states must default to False — opt-in, not opt-out."""
+        config = small_config()
+        assert config.output_hidden_states is False
+
+    def test_output_hidden_states_stored(self):
+        config = small_config(output_hidden_states=True)
+        assert config.output_hidden_states is True
+
     def test_tie_word_embeddings_stored(self):
         config = small_config(tie_word_embeddings=True)
         assert config.tie_word_embeddings is True
@@ -181,4 +190,5 @@ class TestSerialisation:
         assert restored.max_position_embeddings == original.max_position_embeddings
         assert restored.attention_dropout == original.attention_dropout
         assert restored.use_cache == original.use_cache
+        assert restored.output_hidden_states == original.output_hidden_states
         assert restored.tie_word_embeddings == original.tie_word_embeddings
