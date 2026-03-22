@@ -664,13 +664,13 @@ Development:
 
 * Highly LLM assisted; consult job.md for original prompt, plan.md for history and details.
 * Intended to make an easily usable Llama3 baseline to tweak for further research.
-*  
+* Decision to use GPTNeo.
 
 legal:
 
 MAIN: repo under mit license
 
-In llama3: 
+In llama3 Legal.md: 
 
 * This is released under the MIT license. 
 * The model has been built by a clean room technique:
