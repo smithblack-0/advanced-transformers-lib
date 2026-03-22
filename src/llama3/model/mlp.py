@@ -10,7 +10,7 @@ to propagate than a plain two-matrix FFN. It requires three weight matrices inst
 of two, which is why intermediate_size in Llama 3 is set lower than the 4× multiplier
 typical of two-matrix FFNs — the total parameter count remains comparable.
 
-SiLU is used as the gate activation because LLama3 commited to SwiGLU specifically
+SiLU is used as the gate activation because Llama 3 committed to SwiGLU specifically
 — a fixed architectural choice.
 """
 

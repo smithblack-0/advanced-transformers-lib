@@ -1,3 +1,4 @@
+
 """Tests for RotaryEmbedding.
 
 Each test verifies a specific invariant documented in the plan. The grouping mirrors

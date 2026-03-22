@@ -96,7 +96,7 @@ class Llama3Config(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size: int = 128000,
+        vocab_size: int = 50277,
         hidden_size: int = 784,
         intermediate_size: int = 1568,
         num_hidden_layers: int = 24,

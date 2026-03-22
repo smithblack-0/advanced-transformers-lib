@@ -111,14 +111,16 @@ advanced-transformers-lib/
 └── tests/
     └── llama3/
         ├── __init__.py
-        ├── test_configuration.py
-        ├── test_rope.py
-        ├── test_mlp.py
-        ├── test_attention.py
-        ├── test_decoder_layer.py
-        ├── test_model.py
-        ├── test_huggingface.py
-        └── test_tokenizer.py
+        └── model/
+            ├── __init__.py
+            ├── test_configuration.py
+            ├── test_rope.py
+            ├── test_mlp.py
+            ├── test_attention.py
+            ├── test_decoder_layer.py
+            ├── test_model.py
+            ├── test_huggingface.py
+            └── test_tokenizer.py
 ```
 
 **Why this granularity:** One file per major responsibility. Each file has a clear, independent reason
@@ -573,7 +575,7 @@ files are present and correct in `src/llama3/model/` so that `upload_folder` inc
 `AutoTokenizer.from_pretrained` succeeds after upload.
 
 **Why GPT-NeoX (`EleutherAI/gpt-neox-20b`):** Byte-level BPE — no UNK tokens, all Unicode handled
-without fallback. 50,280-token vocabulary: large enough for modern use without the embedding
+without fallback. 50,277-token vocabulary: large enough for modern use without the embedding
 parameter cost of 128K+ vocabularies at small hidden sizes. Apache 2.0 license, not gated. Trained
 on The Pile, giving broader corpus diversity than alternatives at this vocabulary scale.
 
@@ -588,7 +590,7 @@ wrong class.
 **Invariants that must hold:**
 - After this module runs, tokenizer files are present in `src/llama3/model/`
 - `tokenizer_config.json` correctly identifies the fast tokenizer class
-- Vocab size is 50,280
+- Vocab size is 50,277
 - Encode/decode round-trips correctly (text → ids → text is lossless for standard input)
 
 **Testing:** `tests/llama3/model/test_tokenizer.py`. Tests requiring network access must be marked
@@ -624,6 +626,9 @@ script body.
 do so accidentally.
 
 **Invariants that must hold (success conditions):**
+
+When the upload script runs:
+
 - `AutoConfig.from_pretrained("namespace/repo", trust_remote_code=True)` returns a valid
   `Llama3Config`
 - `AutoModelForCausalLM.from_config(config, trust_remote_code=True)` instantiates `Llama3ForCausalLM`
@@ -631,6 +636,7 @@ do so accidentally.
 - `AutoTokenizer.from_pretrained("namespace/repo")` returns a working tokenizer
 - A model card is visible on the Hub repository page
 - The Hub repository contains no weight files
+- Changes propogate into the huggingface directory.
 
 **Testing:** Hub interaction requires a live connection and cannot be unit tested. Manual
 verification against a test namespace is the appropriate strategy: run the script, then confirm all
@@ -658,9 +664,13 @@ Development:
 
 * Highly LLM assisted; consult job.md for original prompt, plan.md for history and details.
 * Intended to make an easily usable Llama3 baseline to tweak for further research.
-* 
+*  
 
 legal:
+
+MAIN: repo under mit license
+
+In llama3: 
 
 * This is released under the MIT license. 
 * The model has been built by a clean room technique:
@@ -683,7 +693,7 @@ revisited at the start of the relevant unit.
 | 3 | KV cache format | List of tensor chunks per layer (`KVCache`), concatenated once at attention time | Revised from original tuple-per-layer; avoids O(N²) copies |
 | 4 | YaRN scaling | Handled natively by HF's `ROPE_INIT_FUNCTIONS` — no placeholder needed | Resolved: all scaling types supported via HF |
 | 5 | `intermediate_size` | Direct config parameter | Confirmed by user |
-| 6 | Tokenizer | GPT-NeoX (`EleutherAI/gpt-neox-20b`), 50,280 vocab, Apache 2.0 | Confirmed by user |
+| 6 | Tokenizer | GPT-NeoX (`EleutherAI/gpt-neox-20b`), 50,277 vocab, Apache 2.0 | Confirmed by user |
 | 7 | Hub upload mechanism | `upload_folder` from `src/llama3/model/` directly to Hub root — no copying, no manifest | Confirmed by user |
 | 8 | Hub authentication | `huggingface-cli login` — token stored locally, nothing in code | Confirmed by user |
 | 9 | `_tied_weights_keys` | Deliberately absent — direct assignment is sufficient | Confirmed by user |
