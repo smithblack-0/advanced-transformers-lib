@@ -24,9 +24,9 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from src.llama3.attention import GroupedQueryAttention
-from src.llama3.mlp import SwiGLUMLP
-from src.llama3.type_aliases import KVCache
+from .attention import GroupedQueryAttention
+from .mlp import SwiGLUMLP
+from .type_aliases import KVCache
 
 
 class DecoderLayer(nn.Module):

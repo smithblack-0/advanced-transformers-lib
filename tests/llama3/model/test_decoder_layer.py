@@ -6,8 +6,8 @@ attention and MLP are correctly integrated (output feeds through both paths).
 
 import torch
 
-from src.llama3.configuration import Llama3Config
-from src.llama3.decoder_layer import DecoderLayer
+from src.llama3.model.configuration import Llama3Config
+from src.llama3.model.decoder_layer import DecoderLayer
 
 
 # ---------------------------------------------------------------------------

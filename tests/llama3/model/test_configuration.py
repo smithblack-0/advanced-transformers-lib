@@ -10,7 +10,7 @@ here — we test that our config correctly passes parameters through to HF's sys
 
 import pytest
 
-from src.llama3.configuration import Llama3Config
+from src.llama3.model.configuration import Llama3Config
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +53,11 @@ class TestInstantiation:
         """auto_map must be set so HuggingFace trust_remote_code can find the classes."""
         assert "AutoConfig" in Llama3Config.auto_map
         assert "AutoModelForCausalLM" in Llama3Config.auto_map
+
+    def test_auto_map_points_to_correct_files(self):
+        """auto_map paths must match the actual file layout used on the Hub."""
+        assert Llama3Config.auto_map["AutoConfig"] == "configuration.Llama3Config"
+        assert Llama3Config.auto_map["AutoModelForCausalLM"] == "huggingface.Llama3ForCausalLM"
 
     def test_head_dim_computed_when_not_provided(self):
         """head_dim is derived from hidden_size // num_attention_heads when not set."""

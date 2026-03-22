@@ -13,8 +13,8 @@ than absolute position.
 import pytest
 import torch
 
-from src.llama3.configuration import Llama3Config
-from src.llama3.rope import RotaryEmbedding, _rotate_half
+from src.llama3.model.configuration import Llama3Config
+from src.llama3.model.rope import RotaryEmbedding, _rotate_half
 
 
 # ---------------------------------------------------------------------------

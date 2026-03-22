@@ -22,8 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
-from src.llama3.rope import RotaryEmbedding
-from src.llama3.type_aliases import KVCache
+from .rope import RotaryEmbedding
+from .type_aliases import KVCache
 
 
 class GroupedQueryAttention(nn.Module):

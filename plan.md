@@ -1,7 +1,7 @@
 # Implementation Plan: advanced-transformers-lib — Llama 3 Baseline
 
 ## Status
-**Current state:** Units 1–6 verified (plus type_aliases blocker). Unit 7 (Llama3ForCausalLM) next.
+**Current state:** Units 1–7 verified. Blockers A and B resolved. Blocker Refactor next.
 
 ---
 
@@ -95,14 +95,19 @@ A component without passing tests is not complete regardless of how correct it a
 advanced-transformers-lib/
 ├── src/
 │   └── llama3/
-│       ├── __init__.py
-│       ├── configuration.py      # Unit 1
-│       ├── rope.py               # Unit 2
-│       ├── mlp.py                # Unit 3
-│       ├── attention.py          # Unit 4
-│       ├── decoder_layer.py      # Unit 5
-│       ├── model.py              # Unit 6
-│       └── upload_to_hub.py      # Unit 7
+│       ├── model/                  ← WYSIWYG: contents uploaded flat to Hub root
+│       │   ├── __init__.py
+│       │   ├── configuration.py    # Unit 1
+│       │   ├── rope.py             # Unit 2
+│       │   ├── mlp.py              # Unit 3
+│       │   ├── attention.py        # Unit 4
+│       │   ├── decoder_layer.py    # Unit 5
+│       │   ├── model.py            # Unit 6
+│       │   ├── huggingface.py      # Unit 7
+│       │   ├── type_aliases.py     # Blocker
+│       │   └── README.md           # Model card — pushed to Hub root as README.md
+│       ├── upload_to_hub.py        # Unit 8
+│       └── tokenizer.py            # Blocker
 └── tests/
     └── llama3/
         ├── __init__.py
@@ -111,13 +116,16 @@ advanced-transformers-lib/
         ├── test_mlp.py
         ├── test_attention.py
         ├── test_decoder_layer.py
-        └── test_model.py
+        ├── test_model.py
+        ├── test_huggingface.py
+        └── test_tokenizer.py
 ```
 
 **Why this granularity:** One file per major responsibility. Each file has a clear, independent reason
 to exist. The decoder layer and model are separate because a decoder layer can be verified in isolation
-before being composed into a full model stack. `upload_to_hub.py` is separate because it is an
-operational concern, not architecture.
+before being composed into a full model stack. `upload_to_hub.py` and `tokenizer.py` are separate
+because they are operational concerns, not architecture. The `model/` subfolder is the WYSIWYG Hub
+distribution unit — its contents are uploaded flat to the Hub repository root via `upload_folder`.
 
 **RMSNorm:** `torch.nn.RMSNorm` is used directly wherever normalisation is needed. There is nothing to
 implement. At each point of use, a comment explains why RMSNorm was chosen over LayerNorm: it omits
@@ -431,19 +439,18 @@ HF contract, weight tying, and loss computation before the backbone is confirmed
 failures harder to diagnose. Verify the foundation first.
 
 **Structure:**
-- Token embedding: `nn.Embedding(vocab_size, hidden_size)`
 - Stack of `num_hidden_layers` `DecoderLayer` instances
 - Final `torch.nn.RMSNorm` — the stack output is normalised before any projection
+- No token embedding — the backbone is modality-agnostic; it accepts pre-embedded hidden states.
+  Token embedding lives on `Llama3ForCausalLM`. This is the correct HF convention.
+
+**forward() input:** `inputs_embeds: torch.Tensor` of shape `(batch, seq_len, hidden_size)` —
+not token IDs. The caller is responsible for embedding tokens before calling the backbone.
 
 **Returns a dict** with:
 - `"last_hidden_state"`: output of the final decoder layer, shape `(batch, seq, hidden_size)`
 - `"past_key_values"`: `ModelKVCache | None`
 - `"hidden_states"`: tuple of per-layer outputs if `config.output_hidden_states` is True, else None
-
-**output_hidden_states:** `PretrainedConfig` already has `output_hidden_states: bool = False` as a
-standard attribute (set via `**kwargs` in our `super().__init__()`). No new config parameter needed —
-but it must be explicitly declared in `Llama3Config.__init__` so it is visible and documented. This
-requires a small config blocker before implementation.
 
 **HF contract (minimal for this unit):**
 - Inherits `PreTrainedModel`
@@ -454,27 +461,34 @@ requires a small config blocker before implementation.
 **Invariants that must hold (tested):**
 - Output `"last_hidden_state"` shape: `(batch, seq, hidden_size)`
 - KV cache: hidden state at position t with cache matches full forward at that position
-- `output_hidden_states=True` returns one tensor per layer plus the embedding output
+- `output_hidden_states=True` returns one tensor per layer plus the inputs_embeds
 - `output_hidden_states=False` returns None for hidden_states
 
 ---
 
-### Unit 7 — model.py (Llama3ForCausalLM)
+### Unit 7 — huggingface.py (Llama3ForCausalLM)
 
 **What:** `Llama3ForCausalLM` — HF wrapper around `Llama3Model`. Adds the LM head, weight tying,
 loss computation, and the full HF AutoClass contract.
 
+**Why separate from model.py:** The backbone (model.py) and the HF contract wrapper are distinct
+responsibilities. The backbone transforms tokens to representations; the wrapper owns vocabulary
+projection, loss, generation, and the AutoClass/save/load contract. One file per responsibility.
+
 **Structure:**
+- Token embedding: `nn.Embedding(vocab_size, hidden_size)` — lives here, not on the backbone
 - Contains `Llama3Model` as `self.model`
 - LM head: `nn.Linear(hidden_size, vocab_size, bias=False)`
-- `tie_word_embeddings`: if True, LM head weight is shared with the embedding table
+- `tie_word_embeddings`: if True, `lm_head.weight` is directly assigned to `embed_tokens.weight`
+  after `post_init()`. Both are `(vocab_size, hidden_size)` — same shape, no transpose needed.
+  No `_tied_weights_keys` — not required; direct assignment is sufficient.
 
 **forward():**
-- Runs `self.model`, projects last hidden state to logits
+- Embeds `input_ids` via `self.embed_tokens`, passes `inputs_embeds` to `self.model`
+- Projects last hidden state to logits via `self.lm_head`
 - Computes cross-entropy loss if labels provided (labels shifted by one — each token predicts next)
 - Returns a plain **dict** (not `CausalLMOutputWithPast`) with keys: `"logits"`, `"loss"`,
-  `"past_key_values"`, `"hidden_states"`. Using a dict avoids importing HF dataclass machinery
-  and keeps the return type readable.
+  `"past_key_values"`, `"hidden_states"`.
 
 **HF contract:**
 - Inherits `PreTrainedModel` and `GenerationMixin`
@@ -483,7 +497,7 @@ loss computation, and the full HF AutoClass contract.
 - `_no_split_modules = ["DecoderLayer"]`
 - `supports_gradient_checkpointing = True`
 - `post_init()` called at end of `__init__`
-- `_init_weights` is NOT overridden — PyTorch default initialisation stands
+- `_init_weights` overridden to no-op (Blocker B) — PyTorch constructor defaults stand
 
 **Invariants that must hold (tested):**
 - Output `"logits"` shape: `(batch, seq, vocab_size)`
@@ -494,30 +508,166 @@ loss computation, and the full HF AutoClass contract.
 
 ---
 
-### Unit 8 — upload_to_hub.py
+### Blocker A — embed_tokens on Llama3ForCausalLM
 
-**What:** Standalone script that makes the architecture available on HuggingFace Hub so a researcher
-can instantiate a fresh model with no checkpoint.
+**What:** Move `embed_tokens` from `Llama3Model` to `Llama3ForCausalLM`. `Llama3Model` becomes
+a pure transformer stack that accepts hidden states `(batch, seq_len, hidden_size)` rather than
+token IDs. This is the correct HF convention: the backbone is modality-agnostic; the token
+interface lives on the task wrapper.
+
+**Consequence for weight tying:** With both `embed_tokens` and `lm_head` on `Llama3ForCausalLM`,
+tying is a direct assignment `self.lm_head.weight = self.embed_tokens.weight` in `__init__`,
+after `post_init()`. No `_tied_weights_keys` machinery required. Both weights are
+`(vocab_size, hidden_size)` — same shape, no transpose needed.
+
+**Files affected:** `model.py`, `huggingface.py`, `test_model.py`, `test_huggingface.py`.
+
+---
+
+### Blocker B — override _init_weights to no-op
+
+**What:** Override `_init_weights` on both `Llama3Model` and `Llama3ForCausalLM` to a no-op.
+HF's default `_init_weights` silently reinitialises all Linear and Embedding weights with
+`normal(0, 0.02)`, replacing PyTorch's constructor defaults. This is invisible and wrong for
+our use case — we want PyTorch's own initialisations to stand.
+
+**Safety:** PyTorch's module constructors call `reset_parameters()` unconditionally at
+construction time, before HF's `_init_weights` runs. Overriding `_init_weights` to a no-op
+does not suppress that — it only prevents HF's second pass from overwriting it. New heads
+added later still get PyTorch's defaults from their constructors.
+
+**Files affected:** `model.py`, `huggingface.py`.
+
+---
+
+### Blocker — Restructure src/llama3/ into src/llama3/model/ with relative imports
+
+**What:** Move all model source files from `src/llama3/` into `src/llama3/model/`. Move all test
+files from `tests/llama3/` into `tests/llama3/model/` to preserve the mirror invariant. Convert all
+intra-package imports to relative imports (`from .configuration import Llama3Config` etc.).
+
+**Why relative imports are required:** HuggingFace's `trust_remote_code` mechanism downloads the
+contents of the Hub repository root into a local cache directory and adds that directory to
+`sys.path`. In that context there is no `src` or `llama3` package — absolute imports break. Relative
+imports work because `__init__.py` is present in `model/` and Python treats the cache directory as
+a package. This is a prerequisite for the Hub distribution to function correctly.
+
+**Why src/llama3/model/ is the Hub distribution unit:** `upload_folder` uploads the contents of a
+local directory directly to the Hub repository root — no copying, no file manifest to maintain. The
+folder's contents are exactly what researchers receive. This eliminates the possibility of drift
+between the local source and what is on the Hub.
+
+**Invariants that must hold:**
+- All existing tests pass after the move with no changes to test logic — only import paths change
+- `from .X import Y` style imports work correctly within the package
+- The test directory structure mirrors the src directory structure exactly
+
+**Files affected:** All files currently in `src/llama3/`, all files in `tests/llama3/`.
+
+---
+
+### Blocker — tokenizer.py: prepare GPT-NeoX tokenizer for Hub distribution
+
+**What:** New file `src/llama3/tokenizer.py`. Single responsibility: ensure the GPT-NeoX tokenizer
+files are present and correct in `src/llama3/model/` so that `upload_folder` includes them and
+`AutoTokenizer.from_pretrained` succeeds after upload.
+
+**Why GPT-NeoX (`EleutherAI/gpt-neox-20b`):** Byte-level BPE — no UNK tokens, all Unicode handled
+without fallback. 50,280-token vocabulary: large enough for modern use without the embedding
+parameter cost of 128K+ vocabularies at small hidden sizes. Apache 2.0 license, not gated. Trained
+on The Pile, giving broader corpus diversity than alternatives at this vocabulary scale.
+
+**Why separate from upload_to_hub.py:** Tokenizer preparation is a distinct responsibility from Hub
+upload orchestration. One file, one job.
+
+**Known issue:** Loading `PreTrainedTokenizerFast` and calling `save_pretrained` can silently
+downgrade `tokenizer_class` in `tokenizer_config.json` from `"PreTrainedTokenizerFast"` to a slow
+variant. This must be corrected before the files are in place, or `AutoTokenizer` will load the
+wrong class.
+
+**Invariants that must hold:**
+- After this module runs, tokenizer files are present in `src/llama3/model/`
+- `tokenizer_config.json` correctly identifies the fast tokenizer class
+- Vocab size is 50,280
+- Encode/decode round-trips correctly (text → ids → text is lossless for standard input)
+
+**Testing:** `tests/llama3/model/test_tokenizer.py`. Tests requiring network access must be marked
+as such. A bad test is worse than no test — if the correct network-free test strategy is unclear,
+ask before writing.
+
+---
+
+### Unit 8 — upload_to_hub.py: publish architecture and tokenizer to HuggingFace Hub
+
+**What:** Standalone script that publishes the model architecture and tokenizer to a HuggingFace Hub
+repository so researchers can instantiate a freshly initialised model with no checkpoint.
 
 **Why separate:** Operational concern, not architecture. No model code imports this. It runs once per
 release.
 
-**Responsibilities:**
-- Accept the Hub repository name as a command-line argument — never hardcoded
-- Register `Llama3Config` with `AutoConfig` and `Llama3ForCausalLM` with `AutoModelForCausalLM`
-- Push all src files (`configuration.py`, `rope.py`, `mlp.py`, `attention.py`, `decoder_layer.py`,
-  `model.py`) to the Hub repository alongside `config.json`
-- Upload the Llama 3 tokenizer to the same repository
-- Generate and push a model card populated with architectural details. **Whether HuggingFace supports
-  an architecture-only card (without concrete trained weights) is unknown and must be investigated
-  during this unit.** The model card is generated programmatically — architectural details are stored
-  as data, not inline strings.
-- Never upload weights. The script must make it structurally impossible to accidentally upload a
-  checkpoint.
+**Canonical interface — upload_folder:** The contents of `src/llama3/model/` are uploaded directly
+to the Hub repository root via `huggingface_hub.upload_folder`. This is the correct mechanism: it
+produces a single atomic commit, requires no file manifest, and ensures the Hub repository root
+contains exactly what is in the local folder — no more, no less. No other upload mechanism is used
+for the model files.
 
-**Testing:** Hub interaction cannot be unit tested without a live connection. Manual verification is
-appropriate: run against a test namespace, then confirm that the from-config instantiation flow works
-from a fresh environment.
+**Canonical interface — authentication:** The script authenticates via a token stored by
+`huggingface-cli login`. No token appears in code or in the repository. Researchers pulling from
+the Hub need no credentials — all distributed files are public and the GPT-NeoX tokenizer is not
+gated.
+
+**Config section:** Target repository (`REPO_ID`) and any other upload-time settings are declared
+in a clearly marked config section at the top of the script. Nothing is hardcoded deeper in the
+script body.
+
+**No weights:** The script never uploads model weights and must make it structurally impossible to
+do so accidentally.
+
+**Invariants that must hold (success conditions):**
+- `AutoConfig.from_pretrained("namespace/repo", trust_remote_code=True)` returns a valid
+  `Llama3Config`
+- `AutoModelForCausalLM.from_config(config, trust_remote_code=True)` instantiates `Llama3ForCausalLM`
+  with fresh random weights and no errors
+- `AutoTokenizer.from_pretrained("namespace/repo")` returns a working tokenizer
+- A model card is visible on the Hub repository page
+- The Hub repository contains no weight files
+
+**Testing:** Hub interaction requires a live connection and cannot be unit tested. Manual
+verification against a test namespace is the appropriate strategy: run the script, then confirm all
+five invariants above hold from a fresh environment with no local cache.
+
+---
+
+### Unit 9 — Documentation
+
+**What:** Contributor-facing documentation covering development decisions, architectural rationale,
+legal status, and anything a contributor needs to understand the codebase and its history.
+
+**Why separate:** Distinct responsibility from the upload script and model card. This documentation
+is for contributors navigating the codebase, not for researchers instantiating the model. It is not
+pushed to the Hub. The full story is only known after development.
+
+**Success Invariant:**
+
+* Necessary documents are in /src/llama3/model
+* Model cards, etc, updated as needed.
+
+**Conditioning factors**
+
+Development:
+
+* Highly LLM assisted; consult job.md for original prompt, plan.md for history and details.
+* Intended to make an easily usable Llama3 baseline to tweak for further research.
+* 
+
+legal:
+
+* This is released under the MIT license. 
+* The model has been built by a clean room technique:
+  * The human coder has never seen the Llama codebase himself.
+  * A LLM instance did research to produce a synthesis of context into a fresh plan.
+  * That plan was then given to other instances to produce the pieces. Those instances were not allowed to see raw Llama code at any point. Thus there is no possible copyright violation.
+* The tokenizer is GPT-X Neo and thus MIT as well.
 
 ---
 
@@ -533,6 +683,10 @@ revisited at the start of the relevant unit.
 | 3 | KV cache format | List of tensor chunks per layer (`KVCache`), concatenated once at attention time | Revised from original tuple-per-layer; avoids O(N²) copies |
 | 4 | YaRN scaling | Handled natively by HF's `ROPE_INIT_FUNCTIONS` — no placeholder needed | Resolved: all scaling types supported via HF |
 | 5 | `intermediate_size` | Direct config parameter | Confirmed by user |
+| 6 | Tokenizer | GPT-NeoX (`EleutherAI/gpt-neox-20b`), 50,280 vocab, Apache 2.0 | Confirmed by user |
+| 7 | Hub upload mechanism | `upload_folder` from `src/llama3/model/` directly to Hub root — no copying, no manifest | Confirmed by user |
+| 8 | Hub authentication | `huggingface-cli login` — token stored locally, nothing in code | Confirmed by user |
+| 9 | `_tied_weights_keys` | Deliberately absent — direct assignment is sufficient | Confirmed by user |
 
 ---
 
@@ -552,5 +706,11 @@ current unit, resolve and verify the blocker, then return.
 - [x] Unit 5 — decoder_layer.py
 - [x] Blocker — type_aliases.py
 - [x] Unit 6 — model.py (Llama3Model)
-- [ ] Unit 7 — model.py (Llama3ForCausalLM)
+- [x] Unit 7 — huggingface.py (Llama3ForCausalLM)
+- [x] Blocker — auto_map in configuration.py
+- [x] Blocker A — embed_tokens belongs on Llama3ForCausalLM, not Llama3Model
+- [x] Blocker B — override _init_weights to no-op so PyTorch constructor defaults stand
+- [ ] Blocker — Refactor: move files into src/llama3/model/, convert to relative imports
+- [ ] Blocker — tokenizer.py
 - [ ] Unit 8 — upload_to_hub.py
+- [ ] Unit 9 — Documentation

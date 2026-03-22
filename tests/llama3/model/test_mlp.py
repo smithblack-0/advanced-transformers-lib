@@ -6,8 +6,8 @@ projection, and that the gate is genuinely active (not a no-op).
 
 import torch
 
-from src.llama3.configuration import Llama3Config
-from src.llama3.mlp import SwiGLUMLP
+from src.llama3.model.configuration import Llama3Config
+from src.llama3.model.mlp import SwiGLUMLP
 
 
 # ---------------------------------------------------------------------------

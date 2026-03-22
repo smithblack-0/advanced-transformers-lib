@@ -24,11 +24,6 @@ class Llama3Config(PretrainedConfig):
     doing so breaks the library's ability to express different model scales without
     code changes.
 
-    Defaults correspond to a ~123M parameter scale (hidden_size=384, 16 layers,
-    8 attention heads, 2 KV heads, FFN width 1024) chosen as a convenient small
-    baseline for development and testing. Every parameter must be set explicitly
-    when targeting a specific research scale.
-
     RoPE scaling is handled by HuggingFace's rope system. Pass rope_scaling as a dict
     using HF's format (key is ``rope_type``, not ``type``). Supported types:
     ``"linear"``, ``"dynamic"``, ``"yarn"``, ``"longrope"``, ``"llama3"``. HF validates
@@ -96,17 +91,17 @@ class Llama3Config(PretrainedConfig):
     # the local src/ layout — these are the paths used after HF downloads the files.
     auto_map = {
         "AutoConfig": "configuration.Llama3Config",
-        "AutoModelForCausalLM": "model.Llama3ForCausalLM",
+        "AutoModelForCausalLM": "huggingface.Llama3ForCausalLM",
     }
 
     def __init__(
         self,
         vocab_size: int = 128000,
-        hidden_size: int = 384,
-        intermediate_size: int = 1024,
-        num_hidden_layers: int = 16,
-        num_attention_heads: int = 8,
-        num_key_value_heads: int = 2,
+        hidden_size: int = 784,
+        intermediate_size: int = 1568,
+        num_hidden_layers: int = 24,
+        num_attention_heads: int = 16,
+        num_key_value_heads: int = 4,
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-5,
         rope_theta: float = 500000.0,

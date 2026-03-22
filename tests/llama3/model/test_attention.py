@@ -9,8 +9,8 @@ edge cases.
 import torch
 import pytest
 
-from src.llama3.configuration import Llama3Config
-from src.llama3.attention import GroupedQueryAttention
+from src.llama3.model.configuration import Llama3Config
+from src.llama3.model.attention import GroupedQueryAttention
 
 
 # ---------------------------------------------------------------------------
