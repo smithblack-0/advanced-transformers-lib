@@ -1,7 +1,49 @@
 # Implementation Plan: advanced-transformers-lib — Llama 3 Baseline
 
+## What This Document Is
+
+This is the planning and process record for the LLM-assisted implementation of the Llama 3
+baseline. It was the active working document throughout development — every unit was planned
+here before code was written, every decision was recorded here for human review, and every unit
+was verified here before the next began.
+
+It exists for two reasons. First, as a development tool: it allowed work to resume across
+sessions without loss of context. Second, and more importantly, as a trust artifact: it is
+the evidence that this LLM-produced codebase was built under rigorous human supervision.
+
+The process it records:
+
+- Before writing any code for a unit, the plan for that unit was written and reviewed.
+- Each unit was implemented, tested, and verified before the next began.
+- When a blocker arose, it was pushed onto a stack, resolved as its own verified unit, and
+  then the interrupted unit resumed. No blocker was hacked around inline.
+- All significant decisions were surfaced for human review. The human author approved or
+  corrected each one. Autonomous decisions were reported, not hidden.
+
+The checklist below is the visible record that this process was followed for every unit.
+
+## Completion Record
+
+- [x] Unit 1 — configuration.py
+- [x] Unit 2 — rope.py
+- [x] Unit 3 — mlp.py
+- [x] Unit 4 — attention.py
+- [x] Unit 5 — decoder_layer.py
+- [x] Blocker — type_aliases.py
+- [x] Unit 6 — model.py (Llama3Model)
+- [x] Unit 7 — huggingface.py (Llama3ForCausalLM)
+- [x] Blocker — auto_map in configuration.py
+- [x] Blocker A — embed_tokens belongs on Llama3ForCausalLM, not Llama3Model
+- [x] Blocker B — override _init_weights to no-op so PyTorch constructor defaults stand
+- [x] Blocker — Refactor: move files into src/llama3/model/, convert to relative imports
+- [x] Blocker — tokenizer.py
+- [x] Unit 8 — upload_to_hub.py
+- [x] Unit 9 — Documentation
+
+---
+
 ## Status
-**Current state:** Units 1–8 verified. Unit 9 next.
+**Current state:** Units 1–9 verified. Complete.
 
 ---
 
@@ -653,31 +695,55 @@ legal status, and anything a contributor needs to understand the codebase and it
 is for contributors navigating the codebase, not for researchers instantiating the model. It is not
 pushed to the Hub. The full story is only known after development.
 
+**Audiences and what they need:**
+
+- User: knows how to set up the architecture on HuggingFace and instantiate a model. Covered by
+  `documentation.md` (usage and upload steps already present).
+- Developer: knows the `model/` WYSIWYG design, the relative-import constraint and why it exists,
+  and where to find implementation history. Needs a developer section in `documentation.md` and
+  `plan.md` co-located in `src/llama3/`.
+- Legal: can verify the model is safe to use and fork. Needs `Legal.md`.
+
+**Files produced:**
+
+- `src/llama3/documentation.md` — expand existing file with a Developer Notes section: the
+  `model/`-as-Hub-root WYSIWYG design, the relative-import requirement inside `model/` and why,
+  and a pointer to `plan.md` for full implementation history.
+- `src/llama3/Legal.md` — new file: MIT license statement, clean-room synthesis explanation
+  (human coder never read Llama source; LLM synthesised the plan; implementing instances not shown
+  raw Llama code), GPT-NeoX tokenizer under Apache 2.0.
+- `src/llama3/plan.md` — this file, moved from repo root into `src/llama3/`, revised to its
+  final state. The checklist is promoted near the top, preceded by an explanation of what this
+  document is and how it was used: a human-supervised process record for LLM-assisted development,
+  where each unit was planned, implemented, and verified before the next began, with all
+  significant decisions surfaced for human review. The checklist is the visible evidence that this
+  process was followed. This document is the primary trust artifact for the codebase — it is what
+  allows a reviewer to answer "why should I trust LLM-produced code?" with something concrete.
+
 **Success Invariant:**
 
-* Necessary documents are in /src/llama3/model
-* Model cards, etc, updated as needed.
+- A user can follow `documentation.md` to upload and instantiate without reading anything else.
+- A developer can read `documentation.md` and understand the structural quirks before touching code.
+- Anyone can read `Legal.md` and understand why the codebase is safe to use and fork.
+- A reviewer can open `plan.md`, immediately see what process was followed and that it was
+  completed, and then drill into the full implementation history for any unit.
 
 **Conditioning factors**
 
 Development:
 
-* Highly LLM assisted; consult job.md for original prompt, plan.md for history and details.
-* Intended to make an easily usable Llama3 baseline to tweak for further research.
-* Decision to use GPTNeo.
+- Highly LLM-assisted; see `plan.md` for original prompt, history, and decisions.
+- Intended as an easily usable Llama 3 baseline for research variants.
+- Tokenizer choice: GPT-NeoX (`EleutherAI/gpt-neox-20b`) — byte-level BPE, 50,277 vocab,
+  Apache 2.0, trained on The Pile.
 
-legal:
+Legal:
 
-MAIN: repo under mit license
-
-In llama3 Legal.md: 
-
-* This is released under the MIT license. 
-* The model has been built by a clean room technique:
-  * The human coder has never seen the Llama codebase himself.
-  * A LLM instance did research to produce a synthesis of context into a fresh plan.
-  * That plan was then given to other instances to produce the pieces. Those instances were not allowed to see raw Llama code at any point. Thus there is no possible copyright violation.
-* The tokenizer is GPT-X Neo and thus MIT as well.
+- Repo is under MIT license.
+- Clean-room synthesis: the human coder has never read the Llama source. An LLM instance
+  researched and produced the plan; separate instances implemented it without access to raw
+  Llama code. No copyright violation is possible.
+- GPT-NeoX tokenizer is Apache 2.0.
 
 ---
 
@@ -700,27 +766,3 @@ revisited at the start of the relevant unit.
 
 ---
 
-## Session Resume Instructions
-
-Read this file first on session start. The status section at the top reflects actual current state.
-The checklist below is the ground truth for progress — unchecked means not started, in-progress means
-started but not yet verified, checked means verified (tests passing).
-
-Do not begin a new unit while the current one is unverified. If a blocker arises mid-unit, push the
-current unit, resolve and verify the blocker, then return.
-
-- [x] Unit 1 — configuration.py
-- [x] Unit 2 — rope.py
-- [x] Unit 3 — mlp.py
-- [x] Unit 4 — attention.py
-- [x] Unit 5 — decoder_layer.py
-- [x] Blocker — type_aliases.py
-- [x] Unit 6 — model.py (Llama3Model)
-- [x] Unit 7 — huggingface.py (Llama3ForCausalLM)
-- [x] Blocker — auto_map in configuration.py
-- [x] Blocker A — embed_tokens belongs on Llama3ForCausalLM, not Llama3Model
-- [x] Blocker B — override _init_weights to no-op so PyTorch constructor defaults stand
-- [x] Blocker — Refactor: move files into src/llama3/model/, convert to relative imports
-- [x] Blocker — tokenizer.py
-- [x] Unit 8 — upload_to_hub.py
-- [ ] Unit 9 — Documentation

@@ -88,4 +88,30 @@ locally -- run `python src/llama3/tokenizer.py` first.
 
 ## Development Notes
 
-See `plan.md` for the full implementation history and decision log.
+### Repository structure and the WYSIWYG design
+
+`src/llama3/model/` is the Hub distribution unit. Its contents are uploaded directly to the Hub
+repository root by `upload_to_hub.py` using `upload_folder` — no manifest, no copying, no
+transformation. What is in that directory is exactly what researchers receive. This means:
+
+- Source files that belong on the Hub must live inside `model/`.
+- Files outside `model/` (`tokenizer.py`, `upload_to_hub.py`, etc.) are local operational tools
+  and are never uploaded.
+
+### Relative imports inside model/
+
+All Python files inside `model/` must use relative imports (e.g. `from .configuration import
+Llama3Config`), not absolute imports (e.g. `from src.llama3.model.configuration import ...`).
+
+When a researcher calls `AutoConfig.from_pretrained(..., trust_remote_code=True)`, HuggingFace
+downloads the `model/` contents into a local cache directory and adds that directory to `sys.path`.
+In that context there is no `src` or `llama3` package — absolute imports break immediately.
+Relative imports work because `model/` contains `__init__.py` and Python resolves them within
+the package.
+
+Files outside `model/` are never uploaded and may use absolute imports.
+
+### Implementation history
+
+See `plan.md` in this directory for the full implementation history, architectural decisions,
+and the human-supervised process record.
