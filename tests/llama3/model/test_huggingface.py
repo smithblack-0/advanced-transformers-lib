@@ -9,6 +9,7 @@ KV cache at the wrapper level, and the HF save/load round-trip.
 import torch
 import pytest
 from transformers import AutoModelForCausalLM
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from src.llama3.model.configuration import Llama3Config
 from src.llama3.model.huggingface import Llama3ForCausalLM
@@ -34,6 +35,39 @@ def small_config(**kwargs) -> Llama3Config:
 @pytest.fixture
 def model() -> Llama3ForCausalLM:
     return Llama3ForCausalLM(small_config()).eval()
+
+
+# ---------------------------------------------------------------------------
+# Output shape
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Return type and _init_weights
+# ---------------------------------------------------------------------------
+
+class TestReturnType:
+    def test_returns_causal_lm_output_with_past(self, model):
+        """forward() must return CausalLMOutputWithPast, not a plain dict."""
+        out = model(torch.randint(0, 256, (1, 4)))
+        assert isinstance(out, CausalLMOutputWithPast)
+
+    def test_attribute_access_works(self, model):
+        """ModelOutput fields must be accessible as attributes."""
+        out = model(torch.randint(0, 256, (1, 4)))
+        assert out.logits is not None
+
+    def test_init_weights_is_noop(self, model):
+        """_init_weights must not modify weights — PyTorch constructor defaults stand.
+
+        HF's default _init_weights reinitialises all weights with normal(0, 0.02).
+        Our override suppresses this. Verified by calling _init_weights on a linear
+        module and confirming weights are unchanged.
+        """
+        import torch.nn as nn
+        layer = nn.Linear(64, 64, bias=False)
+        original = layer.weight.data.clone()
+        model._init_weights(layer)
+        torch.testing.assert_close(layer.weight.data, original)
 
 
 # ---------------------------------------------------------------------------

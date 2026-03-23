@@ -11,6 +11,7 @@ which is the correct interface.
 
 import torch
 import pytest
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from src.llama3.model.configuration import Llama3Config
 from src.llama3.model.model import Llama3Model
@@ -133,3 +134,33 @@ class TestHiddenStates:
         m = Llama3Model(small_config(output_hidden_states=True)).eval()
         out = m(random_embeds(1, 3, 64))
         assert out["hidden_states"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Return type and _init_weights
+# ---------------------------------------------------------------------------
+
+class TestReturnType:
+    def test_returns_base_model_output_with_past(self, model):
+        """forward() must return BaseModelOutputWithPast, not a plain dict."""
+        out = model(random_embeds(1, 4, model.config.hidden_size))
+        assert isinstance(out, BaseModelOutputWithPast)
+
+    def test_attribute_access_works(self, model):
+        """ModelOutput fields must be accessible as attributes."""
+        out = model(random_embeds(1, 4, model.config.hidden_size))
+        _ = out.last_hidden_state
+        assert out.last_hidden_state is not None
+
+    def test_init_weights_is_noop(self, model):
+        """_init_weights must not modify weights — PyTorch constructor defaults stand.
+
+        HF's default _init_weights reinitialises all weights with normal(0, 0.02).
+        Our override suppresses this. Verified by calling _init_weights on a linear
+        module and confirming weights are unchanged.
+        """
+        import torch.nn as nn
+        layer = nn.Linear(64, 64, bias=False)
+        original = layer.weight.data.clone()
+        model._init_weights(layer)
+        torch.testing.assert_close(layer.weight.data, original)
