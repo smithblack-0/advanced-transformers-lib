@@ -18,7 +18,7 @@ model from config. Override any parameter at instantiation time.
 
 > **Important:** `trust_remote_code=True` is required. It downloads the architecture
 > source files from the Hub and imports them into your Python process. Review the
-> source at [{repo_id}](https://huggingface.co/{repo_id}) before use.
+> source at [smithblack-0/llama3_baseline](https://huggingface.co/smithblack-0/llama3_baseline) before use.
 
 ## Usage
 
@@ -27,7 +27,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 # Pull architecture config -- override any parameter at instantiation time
 config = AutoConfig.from_pretrained(
-    "{repo_id}",
+    "smithblack-0/llama3_baseline",
     trust_remote_code=True,
     num_hidden_layers=16,  # example override
 )
@@ -36,7 +36,7 @@ config = AutoConfig.from_pretrained(
 model = AutoModelForCausalLM.from_config(config)
 
 # Load tokenizer
-tokenizer = AutoTokenizer.from_pretrained("{repo_id}")
+tokenizer = AutoTokenizer.from_pretrained("smithblack-0/llama3_baseline")
 
 # Save and reload after training
 model.save_pretrained("./checkpoint")
@@ -45,7 +45,18 @@ model = AutoModelForCausalLM.from_pretrained("./checkpoint", trust_remote_code=T
 
 ## Default Configuration
 
-{config_table}
+| Parameter | Default |
+|-----------|---------|
+| `vocab_size` | 50277 |
+| `hidden_size` | 784 |
+| `intermediate_size` | 1568 |
+| `num_hidden_layers` | 24 |
+| `num_attention_heads` | 16 |
+| `num_key_value_heads` | 4 |
+| `head_dim` | 49 |
+| `max_position_embeddings` | 8192 |
+| `rope_theta` | 500000.0 |
+| `Parameters (default config)` | 204.3M |
 
 ## License
 

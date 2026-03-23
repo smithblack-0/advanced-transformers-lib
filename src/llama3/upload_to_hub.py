@@ -18,9 +18,9 @@ from pathlib import Path
 
 from huggingface_hub import upload_folder
 
-from .model.configuration import Llama3Config
-from .model.huggingface import Llama3ForCausalLM
-from .tokenizer import prepare_tokenizer
+from src.llama3.model.configuration import Llama3Config
+from src.llama3.model.huggingface import Llama3ForCausalLM
+from src.llama3.tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
 
