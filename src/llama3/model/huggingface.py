@@ -87,6 +87,32 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, value: nn.Linear) -> None:
         self.lm_head = value
 
+    def _reorder_cache(
+        self, past_key_values: ModelKVCache, beam_idx: torch.Tensor
+    ) -> ModelKVCache:
+        """Reorder the KV cache to match beam reordering during beam search.
+
+        GenerationMixin calls this after pruning and reordering beams at each
+        step. beam_idx[i] is the old batch position whose cache should move to
+        position i. Applying this index-select to every tensor's batch dimension
+        keeps the cache consistent with the reordered beam hypotheses.
+
+        Args:
+            past_key_values: Full-model KV cache, one KVCache per decoder layer.
+            beam_idx: 1-D tensor of shape (batch * num_beams,) mapping new batch
+                positions to old ones.
+
+        Returns:
+            Reordered ModelKVCache with the same structure.
+        """
+        return [
+            (
+                [k[beam_idx] for k in key_chunks],
+                [v[beam_idx] for v in value_chunks],
+            )
+            for key_chunks, value_chunks in past_key_values
+        ]
+
     def forward(
         self,
         input_ids: torch.Tensor,

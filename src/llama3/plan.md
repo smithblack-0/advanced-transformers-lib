@@ -40,7 +40,7 @@ The checklist below is the visible record that this process was followed for eve
 - [x] Unit 8 — upload_to_hub.py
 - [x] Unit 9 — Documentation
 - [x] Blocker — forward() return types: plain dict → ModelOutput
-- [ ] Blocker — _reorder_cache for beam search
+- [x] Blocker — _reorder_cache for beam search
 - [ ] Unit 10 — End-to-End Tests
 
 ---
