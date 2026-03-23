@@ -39,7 +39,7 @@ The checklist below is the visible record that this process was followed for eve
 - [x] Blocker — tokenizer.py
 - [x] Unit 8 — upload_to_hub.py
 - [x] Unit 9 — Documentation
-- [ ] Blocker — forward() return types: plain dict → ModelOutput
+- [x] Blocker — forward() return types: plain dict → ModelOutput
 - [ ] Blocker — _reorder_cache for beam search
 - [ ] Unit 10 — End-to-End Tests
 
@@ -801,8 +801,12 @@ tokenizer-to-output pipeline end to end.
 - Greedy generation: `model.generate(input_ids, max_new_tokens=5)` returns shape
   `(batch, input_len + 5)` and all token IDs are in `[0, vocab_size)`
 - Determinism: same input produces identical greedy output across two calls
-- Beam search: `model.generate(input_ids, num_beams=2, max_new_tokens=5)` completes
-  without error (exercises `_reorder_cache`)
+- Beam search correctness: rig the model so one beam dominates. With `num_beams=2` and
+  a clear score gap between beams after the first step, the generation loop will copy the
+  winning beam into both slots via `_reorder_cache`. Verify this happened correctly by
+  checking that both output sequences share the same prefix — meaning the winning beam's
+  history was propagated, not the losing beam's. This catches an inverted index or a
+  wrongly transposed batch dimension, both of which would produce diverging sequences.
 - Gradient flow: `loss.backward()` runs without error and every parameter that should
   have a gradient has one
 - Tokenizer pipeline: text → tokenize → `model.generate()` → decode produces a
