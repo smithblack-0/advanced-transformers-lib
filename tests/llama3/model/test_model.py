@@ -77,7 +77,7 @@ class TestKVCache:
         """past_key_values must be None when use_cache=False."""
         embeds = random_embeds(1, 4, model.config.hidden_size)
         out = model(embeds, use_cache=False)
-        assert out["past_key_values"] is None
+        assert out.past_key_values is None
 
     def test_cached_generation_matches_full_forward(self, model):
         """Hidden state at the final position via cached generation must equal
@@ -113,7 +113,7 @@ class TestHiddenStates:
     def test_output_hidden_states_false_returns_none(self, model):
         embeds = random_embeds(1, 4, model.config.hidden_size)
         out = model(embeds, output_hidden_states=False)
-        assert out["hidden_states"] is None
+        assert out.hidden_states is None
 
     def test_output_hidden_states_true_correct_count(self, model):
         """Must return inputs_embeds plus one tensor per decoder layer."""

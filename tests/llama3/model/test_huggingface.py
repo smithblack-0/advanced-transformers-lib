@@ -50,7 +50,7 @@ class TestOutputShape:
     def test_loss_none_without_labels(self, model):
         ids = torch.randint(0, 256, (1, 4))
         out = model(ids)
-        assert out["loss"] is None
+        assert out.loss is None
 
 
 # ---------------------------------------------------------------------------

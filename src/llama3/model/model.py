@@ -18,13 +18,16 @@ arrives at the top with uncontrolled magnitude. The final norm brings it to a
 well-scaled state before any projection. Without it, the LM head would receive
 signals of arbitrary scale.
 
-Returns a plain dict. The keys are explicit and the contract is visible without
-importing HF output dataclass machinery.
+Returns a BaseModelOutputWithPast. ModelOutput subclasses support both attribute
+access (output.last_hidden_state) and dict-style access (output["last_hidden_state"]),
+satisfying GenerationMixin's attribute access requirements while keeping existing
+code unchanged.
 """
 
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from .configuration import Llama3Config
 from .decoder_layer import DecoderLayer
@@ -75,7 +78,7 @@ class Llama3Model(PreTrainedModel):
         past_key_values: ModelKVCache | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> dict:
+    ) -> BaseModelOutputWithPast:
         """Run the transformer stack over a batch of pre-embedded sequences.
 
         Args:
@@ -94,12 +97,12 @@ class Llama3Model(PreTrainedModel):
                 Overrides ``config.output_hidden_states`` when provided.
 
         Returns:
-            Dict with keys:
-            - ``"last_hidden_state"``: normed backbone output,
+            BaseModelOutputWithPast with fields:
+            - ``last_hidden_state``: normed backbone output,
               shape (batch, seq_len, hidden_size).
-            - ``"past_key_values"``: updated ``ModelKVCache``, or None if
+            - ``past_key_values``: updated ``ModelKVCache``, or None if
               ``use_cache`` is False.
-            - ``"hidden_states"``: tuple of (inputs_embeds, layer_0 output, ...,
+            - ``hidden_states``: tuple of (inputs_embeds, layer_0 output, ...,
               layer_N output) — all before the final norm — or None if
               ``output_hidden_states`` is False. Collected before the final norm
               so each entry reflects the unnormalised residual stream at that depth,
@@ -143,8 +146,8 @@ class Llama3Model(PreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
 
-        return {
-            "last_hidden_state": hidden_states,
-            "past_key_values": present_key_values if use_cache else None,
-            "hidden_states": all_hidden_states,
-        }
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=present_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+        )

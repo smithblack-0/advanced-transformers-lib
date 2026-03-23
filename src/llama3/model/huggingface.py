@@ -20,13 +20,15 @@ Weight tying: when config.tie_word_embeddings is True, lm_head.weight is
 directly assigned to embed_tokens.weight after post_init(). Both matrices are
 shape (vocab_size, hidden_size) — same shape, no transpose needed.
 
-Returns a plain dict rather than a HF output dataclass, consistent with
-Llama3Model. The keys are explicit; nothing is hidden behind a class hierarchy.
+Returns a CausalLMOutputWithPast. ModelOutput subclasses support both attribute
+access (output.logits) and dict-style access (output["logits"]), satisfying
+GenerationMixin's attribute access requirements while keeping existing code unchanged.
 """
 
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .configuration import Llama3Config
 from .model import Llama3Model
@@ -93,7 +95,7 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
         labels: torch.Tensor | None = None,
-    ) -> dict:
+    ) -> CausalLMOutputWithPast:
         """Run the causal language model.
 
         Args:
@@ -114,11 +116,11 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
                 for padding and masked positions.
 
         Returns:
-            Dict with keys:
-            - ``"logits"``: vocabulary scores of shape (batch, seq_len, vocab_size).
-            - ``"loss"``: scalar cross-entropy loss, or None if labels not provided.
-            - ``"past_key_values"``: updated ``ModelKVCache``, or None.
-            - ``"hidden_states"``: per-layer hidden states, or None.
+            CausalLMOutputWithPast with fields:
+            - ``logits``: vocabulary scores of shape (batch, seq_len, vocab_size).
+            - ``loss``: scalar cross-entropy loss, or None if labels not provided.
+            - ``past_key_values``: updated ``ModelKVCache``, or None.
+            - ``hidden_states``: per-layer hidden states, or None.
         """
         inputs_embeds = self.embed_tokens(input_ids)
 
@@ -143,9 +145,9 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
                 shift_labels.view(-1),
             )
 
-        return {
-            "logits": logits,
-            "loss": loss,
-            "past_key_values": backbone_out["past_key_values"],
-            "hidden_states": backbone_out["hidden_states"],
-        }
+        return CausalLMOutputWithPast(
+            logits=logits,
+            loss=loss,
+            past_key_values=backbone_out.past_key_values,
+            hidden_states=backbone_out.hidden_states,
+        )

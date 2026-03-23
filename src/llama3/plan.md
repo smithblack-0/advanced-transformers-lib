@@ -39,11 +39,14 @@ The checklist below is the visible record that this process was followed for eve
 - [x] Blocker — tokenizer.py
 - [x] Unit 8 — upload_to_hub.py
 - [x] Unit 9 — Documentation
+- [ ] Blocker — forward() return types: plain dict → ModelOutput
+- [ ] Blocker — _reorder_cache for beam search
+- [ ] Unit 10 — End-to-End Tests
 
 ---
 
 ## Status
-**Current state:** Units 1–9 verified. Complete.
+**Current state:** Units 1–9 verified. Unit 10 next.
 
 ---
 
@@ -744,6 +747,71 @@ Legal:
   researched and produced the plan; separate instances implemented it without access to raw
   Llama code. No copyright violation is possible.
 - GPT-NeoX tokenizer is Apache 2.0.
+
+---
+
+### Blocker — forward() return types: plain dict → ModelOutput
+
+**Why:** `GenerationMixin.generate()` accesses `outputs.logits` and `outputs.past_key_values`
+as attributes. Both `Llama3Model` and `Llama3ForCausalLM` currently return plain `dict`s,
+which do not support attribute access and will crash immediately when `generate()` is called.
+This must be resolved before Unit 10 tests can run.
+
+**What:** Change `Llama3Model.forward()` to return `BaseModelOutputWithPast` and
+`Llama3ForCausalLM.forward()` to return `CausalLMOutputWithPast`. Both are `ModelOutput`
+subclasses that support dict-style key access (`output["logits"]`) in addition to attribute
+access, so all existing tests continue to pass without modification.
+
+**Files affected:** `src/llama3/model/model.py`, `src/llama3/model/huggingface.py`.
+
+**Testing:** All existing tests in `test_model.py` and `test_huggingface.py` must continue
+to pass after the change. No new tests — correctness of the types is verified by Unit 10.
+
+---
+
+### Blocker — _reorder_cache for beam search
+
+**Why:** `GenerationMixin.generate()` calls `self._reorder_cache(past_key_values, beam_idx)`
+when `num_beams > 1`. Without it, beam search raises `AttributeError`. Greedy decoding is
+unaffected, but beam search is a standard use case that must not be silently broken.
+
+**What:** Implement `_reorder_cache` on `Llama3ForCausalLM`. For each layer's cache, reindex
+the batch dimension of every key and value tensor by `beam_idx`.
+
+**Files affected:** `src/llama3/model/huggingface.py`.
+
+**Testing:** Verified by the beam search test in Unit 10.
+
+---
+
+### Unit 10 — End-to-End Tests
+
+**What:** Tests that verify the model works as a complete system: load, tokenize, generate,
+compute loss, and run a training step. These are the tests a researcher would run to confirm
+the library is actually usable before building on it.
+
+**Why separate:** The existing unit tests verify each component in isolation and confirm KV
+cache correctness at the module level. None of them exercise the HuggingFace generation
+interface (`model.generate()`), gradient flow through the full assembled model, or the
+tokenizer-to-output pipeline end to end.
+
+**Test file:** `tests/llama3/test_end_to_end.py`
+
+**Tests:**
+- Greedy generation: `model.generate(input_ids, max_new_tokens=5)` returns shape
+  `(batch, input_len + 5)` and all token IDs are in `[0, vocab_size)`
+- Determinism: same input produces identical greedy output across two calls
+- Beam search: `model.generate(input_ids, num_beams=2, max_new_tokens=5)` completes
+  without error (exercises `_reorder_cache`)
+- Gradient flow: `loss.backward()` runs without error and every parameter that should
+  have a gradient has one
+- Tokenizer pipeline: text → tokenize → `model.generate()` → decode produces a
+  non-empty string (marked `@pytest.mark.skipif` if tokenizer files absent)
+
+**Invariants that must hold:**
+- `model.generate()` produces valid token sequences for greedy and beam search
+- Gradients flow to all trainable parameters
+- The full tokenizer-to-text pipeline runs without error
 
 ---
 
