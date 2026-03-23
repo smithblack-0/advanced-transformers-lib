@@ -780,7 +780,10 @@ the batch dimension of every key and value tensor by `beam_idx`.
 
 **Files affected:** `src/llama3/model/huggingface.py`.
 
-**Testing:** Verified by the beam search test in Unit 10.
+**Testing:** Unit tests in `test_huggingface.py`: swap verifies correct reorder direction,
+copy verifies beam collapse (beam_idx=[0,0] duplicates entry 0), structure check verifies
+layer count and tensor shapes are preserved. Full pipeline verified by beam search test
+in Unit 10.
 
 ---
 

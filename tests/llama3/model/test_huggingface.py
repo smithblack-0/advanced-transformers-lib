@@ -130,6 +130,65 @@ class TestKVCache:
 
 
 # ---------------------------------------------------------------------------
+# _reorder_cache
+# ---------------------------------------------------------------------------
+
+class TestReorderCache:
+    """Unit tests for _reorder_cache.
+
+    The correctness criterion: after reordering, cache entry i must contain
+    the tensors that were at position beam_idx[i] in the original cache.
+    """
+
+    def _make_cache(self, model: Llama3ForCausalLM, batch_size: int, seq_len: int):
+        """Run a forward pass with a batch and return the resulting KV cache."""
+        ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len))
+        with torch.no_grad():
+            out = model(ids, use_cache=True)
+        return out.past_key_values
+
+    def test_reorder_swaps_entries(self, model):
+        """beam_idx=[1, 0] must swap the two batch entries in every tensor."""
+        cache = self._make_cache(model, batch_size=2, seq_len=4)
+        beam_idx = torch.tensor([1, 0])
+        reordered = model._reorder_cache(cache, beam_idx)
+
+        for (orig_keys, orig_vals), (new_keys, new_vals) in zip(cache, reordered):
+            for orig_k, new_k in zip(orig_keys, new_keys):
+                torch.testing.assert_close(new_k[0], orig_k[1])
+                torch.testing.assert_close(new_k[1], orig_k[0])
+            for orig_v, new_v in zip(orig_vals, new_vals):
+                torch.testing.assert_close(new_v[0], orig_v[1])
+                torch.testing.assert_close(new_v[1], orig_v[0])
+
+    def test_reorder_copies_winning_beam(self, model):
+        """beam_idx=[0, 0] must copy entry 0 into both slots (beam collapse)."""
+        cache = self._make_cache(model, batch_size=2, seq_len=4)
+        beam_idx = torch.tensor([0, 0])
+        reordered = model._reorder_cache(cache, beam_idx)
+
+        for (orig_keys, _), (new_keys, new_vals) in zip(cache, reordered):
+            for orig_k, new_k in zip(orig_keys, new_keys):
+                torch.testing.assert_close(new_k[0], orig_k[0])
+                torch.testing.assert_close(new_k[1], orig_k[0])
+
+    def test_reorder_preserves_structure(self, model):
+        """Output must have the same number of layers and tensor shapes."""
+        cache = self._make_cache(model, batch_size=2, seq_len=4)
+        beam_idx = torch.tensor([1, 0])
+        reordered = model._reorder_cache(cache, beam_idx)
+
+        assert len(reordered) == len(cache)
+        for (orig_keys, orig_vals), (new_keys, new_vals) in zip(cache, reordered):
+            assert len(new_keys) == len(orig_keys)
+            assert len(new_vals) == len(orig_vals)
+            for ok, nk in zip(orig_keys, new_keys):
+                assert nk.shape == ok.shape
+            for ov, nv in zip(orig_vals, new_vals):
+                assert nv.shape == ov.shape
+
+
+# ---------------------------------------------------------------------------
 # Save / load round-trip
 # ---------------------------------------------------------------------------
 
