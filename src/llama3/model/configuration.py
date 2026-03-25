@@ -97,7 +97,7 @@ class Llama3Config(PretrainedConfig):
     def __init__(
         self,
         vocab_size: int = 50277,
-        hidden_size: int = 784,
+        hidden_size: int = 768,
         intermediate_size: int = 1568,
         num_hidden_layers: int = 24,
         num_attention_heads: int = 16,
@@ -128,6 +128,18 @@ class Llama3Config(PretrainedConfig):
                 f"heads to divide evenly across KV head groups."
             )
 
+        # RoPE rotates dimensions in pairs. An odd head_dim has no valid pairing and
+        # produces a cos/sin cache of size head_dim+1 (torch.arange(0, odd, 2) rounds
+        # up), causing a shape mismatch at runtime. Catch it here rather than at
+        # forward-pass time.
+        resolved_head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+        if resolved_head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim must be even (RoPE rotates dimensions in pairs). "
+                f"Got head_dim={resolved_head_dim} from hidden_size={hidden_size} "
+                f"and num_attention_heads={num_attention_heads}."
+            )
+
         # head_dim is normally hidden_size // num_attention_heads but is exposed as a
         # parameter for architectures that decouple head count from head size.
         if head_dim is None:
@@ -156,3 +168,9 @@ class Llama3Config(PretrainedConfig):
             output_hidden_states=output_hidden_states,
             **kwargs,
         )
+
+        # Promote auto_map to an instance attribute so PretrainedConfig.to_dict()
+        # serialises it into config.json. Class-level attributes are not picked up
+        # by to_dict() — only self.__dict__ is serialised. model_type is the sole
+        # exception handled specially by HF; auto_map is not.
+        self.auto_map = type(self).auto_map

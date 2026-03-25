@@ -8,6 +8,7 @@ edge cases.
 
 import torch
 import pytest
+from transformers import DynamicCache
 
 from src.llama3.model.configuration import Llama3Config
 from src.llama3.model.attention import GroupedQueryAttention
@@ -49,20 +50,22 @@ class TestShape:
         config = small_config()
         attn = GroupedQueryAttention(config)
         x, position_ids = make_input(config)
-        out, _ = attn(x, position_ids)
+        out = attn(x, position_ids)
         assert out.shape == x.shape
 
-    def test_kv_cache_is_list_of_chunks(self):
-        """Returned KV cache must be a pair of lists, each containing one chunk tensor."""
+    def test_cache_stores_kv_after_forward(self):
+        """After a forward pass with a cache, the cache must contain K and V for this layer."""
         config = small_config(num_attention_heads=4, num_key_value_heads=2)
         attn = GroupedQueryAttention(config)
         x, position_ids = make_input(config, seq=6)
-        _, (k_chunks, v_chunks) = attn(x, position_ids)
-        assert isinstance(k_chunks, list) and len(k_chunks) == 1
-        assert isinstance(v_chunks, list) and len(v_chunks) == 1
-        expected = (2, config.num_key_value_heads, 6, config.head_dim)
-        assert k_chunks[0].shape == expected
-        assert v_chunks[0].shape == expected
+        cache = DynamicCache()
+        attn(x, position_ids, cache=cache, layer_idx=0)
+
+        # The cache should now hold layer 0's K and V.
+        assert len(cache.layers) == 1
+        expected_shape = (2, config.num_key_value_heads, 6, config.head_dim)
+        assert cache.layers[0].keys.shape == expected_shape
+        assert cache.layers[0].values.shape == expected_shape
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +112,7 @@ class TestHeadConfigurations:
         config = small_config(num_attention_heads=4, num_key_value_heads=4)
         attn = GroupedQueryAttention(config)
         x, position_ids = make_input(config)
-        out, _ = attn(x, position_ids)
+        out = attn(x, position_ids)
         assert out.shape == x.shape
 
     def test_mqa_is_valid(self):
@@ -117,7 +120,7 @@ class TestHeadConfigurations:
         config = small_config(num_attention_heads=4, num_key_value_heads=1)
         attn = GroupedQueryAttention(config)
         x, position_ids = make_input(config)
-        out, _ = attn(x, position_ids)
+        out = attn(x, position_ids)
         assert out.shape == x.shape
 
 
@@ -140,12 +143,12 @@ class TestCausalMasking:
         seq = 6
         x, position_ids = make_input(config, batch=1, seq=seq)
 
-        out_original, _ = attn(x, position_ids)
+        out_original = attn(x, position_ids)
 
         # Replace the last two tokens with different values.
         x_modified = x.clone()
         x_modified[:, 4:, :] = torch.randn_like(x_modified[:, 4:, :])
-        out_modified, _ = attn(x_modified, position_ids)
+        out_modified = attn(x_modified, position_ids)
 
         # Outputs at positions 0..3 must be identical.
         torch.testing.assert_close(out_original[:, :4, :], out_modified[:, :4, :])
@@ -169,28 +172,32 @@ class TestKVCache:
 
         x = torch.randn(1, 4, config.hidden_size)
         pos_full = torch.arange(4).unsqueeze(0)
-        out_full, _ = attn(x, pos_full)
+        out_full = attn(x, pos_full)
 
         # Single-token prefill then generate the remaining 3 tokens one at a time.
-        _, kv = attn(x[:, :1, :], torch.tensor([[0]]))
+        cache = DynamicCache()
+        attn(x[:, :1, :], torch.tensor([[0]]), cache=cache, layer_idx=0)
         for t in range(1, 4):
-            out_t, kv = attn(x[:, t:t+1, :], torch.tensor([[t]]), past_key_value=kv)
+            out_t = attn(x[:, t:t+1, :], torch.tensor([[t]]), cache=cache, layer_idx=0)
             torch.testing.assert_close(out_t, out_full[:, t:t+1, :])
 
-    def test_cache_grows_by_one_per_step(self):
-        """Each generation step must append exactly one chunk to the cache."""
+    def test_cache_grows_after_each_step(self):
+        """Each generation step must increase the cached sequence length by one."""
         config = small_config(num_attention_heads=4, num_key_value_heads=2)
         attn = GroupedQueryAttention(config)
         attn.eval()
         torch.manual_seed(6)
 
         x = torch.randn(1, 5, config.hidden_size)
-        _, kv = attn(x[:, :2, :], torch.arange(2).unsqueeze(0))
-        assert len(kv[0]) == 1  # prefill produces one chunk
+        cache = DynamicCache()
+
+        # Prefill 2 tokens.
+        attn(x[:, :2, :], torch.arange(2).unsqueeze(0), cache=cache, layer_idx=0)
+        assert cache.get_seq_length(0) == 2
 
         for step in range(3):
-            _, kv = attn(x[:, 2+step:3+step, :], torch.tensor([[2+step]]), past_key_value=kv)
-            assert len(kv[0]) == step + 2  # one more chunk each step
+            attn(x[:, 2+step:3+step, :], torch.tensor([[2+step]]), cache=cache, layer_idx=0)
+            assert cache.get_seq_length(0) == 3 + step
 
     def test_cached_generation_matches_full_forward(self):
         """Cached generation must produce identical outputs to a full forward pass.
@@ -208,19 +215,20 @@ class TestKVCache:
 
         # Full forward over all 4 tokens.
         pos_full = torch.arange(4).unsqueeze(0)
-        out_full, _ = attn(x, pos_full)
+        out_full = attn(x, pos_full)
 
         # Prefill on first 2 tokens.
+        cache = DynamicCache()
         pos_prefill = torch.arange(2).unsqueeze(0)
-        _, kv = attn(x[:, :2, :], pos_prefill)
+        attn(x[:, :2, :], pos_prefill, cache=cache, layer_idx=0)
 
         # Cached step: token 2.
         pos_2 = torch.tensor([[2]])
-        out_2, kv = attn(x[:, 2:3, :], pos_2, past_key_value=kv)
+        out_2 = attn(x[:, 2:3, :], pos_2, cache=cache, layer_idx=0)
 
         # Cached step: token 3.
         pos_3 = torch.tensor([[3]])
-        out_3, _ = attn(x[:, 3:4, :], pos_3, past_key_value=kv)
+        out_3 = attn(x[:, 3:4, :], pos_3, cache=cache, layer_idx=0)
 
         torch.testing.assert_close(out_2, out_full[:, 2:3, :])
         torch.testing.assert_close(out_3, out_full[:, 3:4, :])

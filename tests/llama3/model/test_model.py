@@ -1,17 +1,20 @@
 """Tests for Llama3Model.
 
-Verifies the invariants documented in plan.md for Unit 6. Tests are scoped to
-the backbone only — decoder layer and attention correctness are covered by their
-own unit tests and are not replicated here.
+Verifies the invariants documented in plan.md. Tests are scoped to the backbone
+only — decoder layer and attention correctness are covered by their own unit tests
+and are not replicated here.
 
 The backbone accepts pre-embedded inputs (inputs_embeds), not token IDs. Tests
 construct random float tensors of shape (batch, seq_len, hidden_size) directly,
 which is the correct interface.
+
+Llama3Model is a plain nn.Module. It returns a plain dict. No HF lifecycle
+machinery (post_init, _init_weights, save/load) is present or tested here.
 """
 
 import torch
 import pytest
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers import DynamicCache
 
 from src.llama3.model.configuration import Llama3Config
 from src.llama3.model.model import Llama3Model
@@ -64,21 +67,41 @@ class TestOutputShape:
 
 
 # ---------------------------------------------------------------------------
+# Return type
+# ---------------------------------------------------------------------------
+
+class TestReturnType:
+    def test_returns_dict(self, model):
+        """forward() must return a plain dict, not a HF ModelOutput subclass."""
+        out = model(random_embeds(1, 4, model.config.hidden_size))
+        assert type(out) is dict
+
+    def test_dict_has_expected_keys(self, model):
+        """Output dict must contain exactly the documented keys."""
+        out = model(random_embeds(1, 4, model.config.hidden_size))
+        assert set(out.keys()) == {"last_hidden_state", "past_key_values", "hidden_states"}
+
+
+# ---------------------------------------------------------------------------
 # KV cache
 # ---------------------------------------------------------------------------
 
 class TestKVCache:
-    def test_use_cache_true_returns_one_entry_per_layer(self, model):
-        """past_key_values must contain one KVCache per decoder layer."""
+    def test_with_cache_returns_populated_cache(self, model):
+        """When a DynamicCache is provided, it must be returned populated with
+        one entry per decoder layer.
+        """
         embeds = random_embeds(1, 4, model.config.hidden_size)
-        out = model(embeds, use_cache=True)
+        cache = DynamicCache()
+        out = model(embeds, past_key_values=cache)
+        assert out["past_key_values"] is cache
         assert len(out["past_key_values"]) == model.config.num_hidden_layers
 
-    def test_use_cache_false_returns_none(self, model):
-        """past_key_values must be None when use_cache=False."""
+    def test_without_cache_returns_none(self, model):
+        """When no cache is provided, past_key_values must be None in the output."""
         embeds = random_embeds(1, 4, model.config.hidden_size)
-        out = model(embeds, use_cache=False)
-        assert out.past_key_values is None
+        out = model(embeds)
+        assert out["past_key_values"] is None
 
     def test_cached_generation_matches_full_forward(self, model):
         """Hidden state at the final position via cached generation must equal
@@ -91,16 +114,15 @@ class TestKVCache:
         embeds = random_embeds(1, 5, model.config.hidden_size)
 
         with torch.no_grad():
-            full_hs = model(embeds, use_cache=False)["last_hidden_state"]
+            full_hs = model(embeds)["last_hidden_state"]
 
         with torch.no_grad():
-            prefill = model(embeds[:, :-1, :], use_cache=True)
+            prefill = model(embeds[:, :-1, :], past_key_values=DynamicCache())
 
         with torch.no_grad():
             step = model(
                 embeds[:, -1:, :],
                 past_key_values=prefill["past_key_values"],
-                use_cache=True,
             )
 
         torch.testing.assert_close(step["last_hidden_state"][:, 0, :], full_hs[:, -1, :])
@@ -114,7 +136,7 @@ class TestHiddenStates:
     def test_output_hidden_states_false_returns_none(self, model):
         embeds = random_embeds(1, 4, model.config.hidden_size)
         out = model(embeds, output_hidden_states=False)
-        assert out.hidden_states is None
+        assert out["hidden_states"] is None
 
     def test_output_hidden_states_true_correct_count(self, model):
         """Must return inputs_embeds plus one tensor per decoder layer."""
@@ -128,39 +150,3 @@ class TestHiddenStates:
         out = model(embeds, output_hidden_states=True)
         for hs in out["hidden_states"]:
             assert hs.shape == (1, 4, model.config.hidden_size)
-
-    def test_config_output_hidden_states_respected(self):
-        """output_hidden_states from config is used when not passed explicitly."""
-        m = Llama3Model(small_config(output_hidden_states=True)).eval()
-        out = m(random_embeds(1, 3, 64))
-        assert out["hidden_states"] is not None
-
-
-# ---------------------------------------------------------------------------
-# Return type and _init_weights
-# ---------------------------------------------------------------------------
-
-class TestReturnType:
-    def test_returns_base_model_output_with_past(self, model):
-        """forward() must return BaseModelOutputWithPast, not a plain dict."""
-        out = model(random_embeds(1, 4, model.config.hidden_size))
-        assert isinstance(out, BaseModelOutputWithPast)
-
-    def test_attribute_access_works(self, model):
-        """ModelOutput fields must be accessible as attributes."""
-        out = model(random_embeds(1, 4, model.config.hidden_size))
-        _ = out.last_hidden_state
-        assert out.last_hidden_state is not None
-
-    def test_init_weights_is_noop(self, model):
-        """_init_weights must not modify weights — PyTorch constructor defaults stand.
-
-        HF's default _init_weights reinitialises all weights with normal(0, 0.02).
-        Our override suppresses this. Verified by calling _init_weights on a linear
-        module and confirming weights are unchanged.
-        """
-        import torch.nn as nn
-        layer = nn.Linear(64, 64, bias=False)
-        original = layer.weight.data.clone()
-        model._init_weights(layer)
-        torch.testing.assert_close(layer.weight.data, original)

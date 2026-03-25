@@ -33,7 +33,7 @@ config = AutoConfig.from_pretrained(
 )
 
 # Instantiate with fresh random weights -- no checkpoint required
-model = AutoModelForCausalLM.from_config(config)
+model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained("smithblack-0/llama3_baseline")
@@ -48,15 +48,14 @@ model = AutoModelForCausalLM.from_pretrained("./checkpoint", trust_remote_code=T
 | Parameter | Default |
 |-----------|---------|
 | `vocab_size` | 50277 |
-| `hidden_size` | 784 |
+| `hidden_size` | 768 |
 | `intermediate_size` | 1568 |
 | `num_hidden_layers` | 24 |
 | `num_attention_heads` | 16 |
 | `num_key_value_heads` | 4 |
-| `head_dim` | 49 |
+| `head_dim` | 48 |
 | `max_position_embeddings` | 8192 |
 | `rope_theta` | 500000.0 |
-| `Parameters (default config)` | 204.3M |
 
 ## License
 

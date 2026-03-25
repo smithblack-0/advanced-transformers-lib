@@ -33,7 +33,7 @@ config = AutoConfig.from_pretrained(
 )
 
 # Instantiate with fresh random weights -- no checkpoint required
-model = AutoModelForCausalLM.from_config(config)
+model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained("{repo_id}")

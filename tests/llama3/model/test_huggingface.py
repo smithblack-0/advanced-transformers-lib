@@ -172,54 +172,112 @@ class TestReorderCache:
 
     The correctness criterion: after reordering, cache entry i must contain
     the tensors that were at position beam_idx[i] in the original cache.
+
+    DynamicCache.reorder_cache() modifies the cache in place, so snapshots
+    must be taken before calling _reorder_cache.
     """
 
     def _make_cache(self, model: Llama3ForCausalLM, batch_size: int, seq_len: int):
-        """Run a forward pass with a batch and return the resulting KV cache."""
+        """Run a forward pass with a batch and return the resulting DynamicCache."""
         ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len))
         with torch.no_grad():
             out = model(ids, use_cache=True)
         return out.past_key_values
 
     def test_reorder_swaps_entries(self, model):
-        """beam_idx=[1, 0] must swap the two batch entries in every tensor."""
+        """beam_idx=[1, 0] must swap the two batch entries in every K and V tensor."""
         cache = self._make_cache(model, batch_size=2, seq_len=4)
-        beam_idx = torch.tensor([1, 0])
-        reordered = model._reorder_cache(cache, beam_idx)
 
-        for (orig_keys, orig_vals), (new_keys, new_vals) in zip(cache, reordered):
-            for orig_k, new_k in zip(orig_keys, new_keys):
-                torch.testing.assert_close(new_k[0], orig_k[1])
-                torch.testing.assert_close(new_k[1], orig_k[0])
-            for orig_v, new_v in zip(orig_vals, new_vals):
-                torch.testing.assert_close(new_v[0], orig_v[1])
-                torch.testing.assert_close(new_v[1], orig_v[0])
+        # Snapshot before reorder — reorder_cache modifies in place.
+        orig_keys = [layer.keys.clone() for layer in cache.layers]
+        orig_vals = [layer.values.clone() for layer in cache.layers]
+
+        beam_idx = torch.tensor([1, 0])
+        model._reorder_cache(cache, beam_idx)
+
+        for orig_k, layer in zip(orig_keys, cache.layers):
+            torch.testing.assert_close(layer.keys[0], orig_k[1])
+            torch.testing.assert_close(layer.keys[1], orig_k[0])
+        for orig_v, layer in zip(orig_vals, cache.layers):
+            torch.testing.assert_close(layer.values[0], orig_v[1])
+            torch.testing.assert_close(layer.values[1], orig_v[0])
 
     def test_reorder_copies_winning_beam(self, model):
         """beam_idx=[0, 0] must copy entry 0 into both slots (beam collapse)."""
         cache = self._make_cache(model, batch_size=2, seq_len=4)
-        beam_idx = torch.tensor([0, 0])
-        reordered = model._reorder_cache(cache, beam_idx)
 
-        for (orig_keys, _), (new_keys, new_vals) in zip(cache, reordered):
-            for orig_k, new_k in zip(orig_keys, new_keys):
-                torch.testing.assert_close(new_k[0], orig_k[0])
-                torch.testing.assert_close(new_k[1], orig_k[0])
+        orig_keys = [layer.keys.clone() for layer in cache.layers]
+
+        beam_idx = torch.tensor([0, 0])
+        model._reorder_cache(cache, beam_idx)
+
+        for orig_k, layer in zip(orig_keys, cache.layers):
+            torch.testing.assert_close(layer.keys[0], orig_k[0])
+            torch.testing.assert_close(layer.keys[1], orig_k[0])
 
     def test_reorder_preserves_structure(self, model):
-        """Output must have the same number of layers and tensor shapes."""
+        """Output must be the same cache object with unchanged layer count and shapes."""
         cache = self._make_cache(model, batch_size=2, seq_len=4)
-        beam_idx = torch.tensor([1, 0])
-        reordered = model._reorder_cache(cache, beam_idx)
+        num_layers = len(cache.layers)
+        orig_shapes_k = [layer.keys.shape for layer in cache.layers]
+        orig_shapes_v = [layer.values.shape for layer in cache.layers]
 
-        assert len(reordered) == len(cache)
-        for (orig_keys, orig_vals), (new_keys, new_vals) in zip(cache, reordered):
-            assert len(new_keys) == len(orig_keys)
-            assert len(new_vals) == len(orig_vals)
-            for ok, nk in zip(orig_keys, new_keys):
-                assert nk.shape == ok.shape
-            for ov, nv in zip(orig_vals, new_vals):
-                assert nv.shape == ov.shape
+        beam_idx = torch.tensor([1, 0])
+        returned = model._reorder_cache(cache, beam_idx)
+
+        # Must return the same object (modified in place, not a copy).
+        assert returned is cache
+        assert len(cache.layers) == num_layers
+        for shape, layer in zip(orig_shapes_k, cache.layers):
+            assert layer.keys.shape == shape
+        for shape, layer in zip(orig_shapes_v, cache.layers):
+            assert layer.values.shape == shape
+
+
+# ---------------------------------------------------------------------------
+# Config defaults
+# ---------------------------------------------------------------------------
+
+class TestConfigDefaults:
+    def test_config_output_hidden_states_respected(self):
+        """output_hidden_states from config must be used when not passed explicitly.
+
+        Config resolution lives in Llama3ForCausalLM.forward(), which reads
+        config.output_hidden_states as the default. Verified by constructing a model
+        with output_hidden_states=True in the config and confirming hidden_states are
+        returned without passing the flag at call time.
+        """
+        from src.llama3.model.configuration import Llama3Config
+        config = Llama3Config(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            vocab_size=256,
+            output_hidden_states=True,
+        )
+        m = Llama3ForCausalLM(config).eval()
+        with torch.no_grad():
+            out = m(torch.randint(0, 256, (1, 4)))
+        assert out.hidden_states is not None
+
+    def test_config_use_cache_respected(self):
+        """use_cache from config must be used when not passed explicitly."""
+        from src.llama3.model.configuration import Llama3Config
+        config = Llama3Config(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            vocab_size=256,
+            use_cache=False,
+        )
+        m = Llama3ForCausalLM(config).eval()
+        with torch.no_grad():
+            out = m(torch.randint(0, 256, (1, 4)))
+        assert out.past_key_values is None
 
 
 # ---------------------------------------------------------------------------

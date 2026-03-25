@@ -23,10 +23,10 @@ subtraction, is faster than LayerNorm, and proved more stable at scale.
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
+from transformers.cache_utils import Cache
 
 from .attention import GroupedQueryAttention
 from .mlp import SwiGLUMLP
-from .type_aliases import KVCache
 
 
 class DecoderLayer(nn.Module):
@@ -51,23 +51,22 @@ class DecoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
-        past_key_value: KVCache | None = None,
-    ) -> tuple[torch.Tensor, KVCache]:
+        cache: Cache | None = None,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
         """Apply one decoder block to the input.
 
         Args:
             x: Input of shape (batch, seq_len, hidden_size).
             position_ids: Absolute positions of shape (batch, seq_len).
-            past_key_value: KV cache from prior steps, or None during prefill.
+            cache: HuggingFace Cache object for KV accumulation, or None when
+                caching is disabled. Passed through to attention unchanged.
+            layer_idx: Cache slot index for this layer. Each layer has its own
+                index so they accumulate independently within the shared cache.
 
         Returns:
-            Tuple of:
-            - Output tensor of shape (batch, seq_len, hidden_size).
-            - Updated KV cache to pass to the next step.
+            Output tensor of shape (batch, seq_len, hidden_size).
         """
-        attn_out, present_key_value = self.attention(
-            self.attn_norm(x), position_ids, past_key_value
-        )
+        attn_out = self.attention(self.attn_norm(x), position_ids, cache, layer_idx)
         h = x + attn_out
-        out = h + self.mlp(self.mlp_norm(h))
-        return out, present_key_value
+        return h + self.mlp(self.mlp_norm(h))

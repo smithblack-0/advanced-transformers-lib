@@ -19,7 +19,6 @@ from pathlib import Path
 from huggingface_hub import upload_folder
 
 from src.llama3.model.configuration import Llama3Config
-from src.llama3.model.huggingface import Llama3ForCausalLM
 from src.llama3.tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
@@ -31,12 +30,11 @@ _CARD_TEMPLATE = Path(__file__).parent / "model_card.md"
 # -----------------------------------------------------------------------------
 
 
-def _render_config_table(config: Llama3Config, param_str: str) -> str:
+def _render_config_table(config: Llama3Config) -> str:
     """Render a markdown table of default configuration parameters.
 
     Args:
         config: Llama3Config providing the values to tabulate.
-        param_str: Pre-formatted parameter count string (e.g. "190.4M").
 
     Returns:
         Markdown table string ready for insertion into the architecture card.
@@ -51,7 +49,6 @@ def _render_config_table(config: Llama3Config, param_str: str) -> str:
         ("head_dim", config.head_dim),
         ("max_position_embeddings", config.max_position_embeddings),
         ("rope_theta", config.rope_theta),
-        ("Parameters (default config)", param_str),
     ]
     lines = ["| Parameter | Default |", "|-----------|---------|"]
     for name, value in rows:
@@ -62,8 +59,9 @@ def _render_config_table(config: Llama3Config, param_str: str) -> str:
 def _render_card(config: Llama3Config, repo_id: str) -> str:
     """Render the architecture card by filling placeholders in model_card.md.
 
-    Reads the static template, computes values only resolvable at upload time
-    (parameter count, config defaults), and substitutes the named placeholders.
+    Reads the static template, substitutes the repo_id and config defaults table.
+    Parameter count is deliberately omitted — this is a configurable architecture,
+    not a fixed pretrained model, so no single count is meaningful.
 
     Args:
         config: Llama3Config providing default parameter values.
@@ -72,13 +70,7 @@ def _render_card(config: Llama3Config, repo_id: str) -> str:
     Returns:
         Rendered markdown string ready to write as README.md.
     """
-    param_count = sum(p.numel() for p in Llama3ForCausalLM(config).parameters())
-    param_str = (
-        f"{param_count / 1e6:.1f}M"
-        if param_count < 1e9
-        else f"{param_count / 1e9:.2f}B"
-    )
-    config_table = _render_config_table(config, param_str)
+    config_table = _render_config_table(config)
     template = _CARD_TEMPLATE.read_text(encoding="utf-8")
     return template.format(repo_id=repo_id, config_table=config_table)
 

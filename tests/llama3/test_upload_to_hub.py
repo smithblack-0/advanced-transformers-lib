@@ -29,26 +29,21 @@ def small_config(**kwargs) -> Llama3Config:
 class TestRenderConfigTable:
     def test_contains_header_row(self):
         """Table must include a markdown header row."""
-        table = _render_config_table(small_config(), "1.0M")
+        table = _render_config_table(small_config())
         assert "| Parameter | Default |" in table
 
     def test_contains_separator_row(self):
         """Table must include a markdown separator row."""
-        table = _render_config_table(small_config(), "1.0M")
+        table = _render_config_table(small_config())
         assert "|-----------|---------|" in table
 
     def test_config_values_present(self):
         """Each config parameter value must appear in the rendered table."""
         config = small_config()
-        table = _render_config_table(config, "1.0M")
+        table = _render_config_table(config)
         assert str(config.hidden_size) in table
         assert str(config.num_hidden_layers) in table
         assert str(config.vocab_size) in table
-
-    def test_param_str_present(self):
-        """The pre-formatted parameter count string must appear in the table."""
-        table = _render_config_table(small_config(), "42.7M")
-        assert "42.7M" in table
 
 
 # ---------------------------------------------------------------------------

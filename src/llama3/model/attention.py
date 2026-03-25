@@ -12,6 +12,12 @@ Attention is computed via torch.nn.functional.scaled_dot_product_attention (SDPA
 which selects FlashAttention when hardware and dtype allow, falling back to standard
 attention otherwise. No custom kernel or additional dependency required.
 
+KV caching is handled via HuggingFace's Cache protocol. The cache owns K/V storage and
+accumulation; attention only calls cache.update() to store new projections and retrieve
+the full accumulated history. This cleanly separates attention computation from cache
+management: different Cache subclasses (DynamicCache, StaticCache, custom research
+variants) can be dropped in without touching the attention logic.
+
 No bias on any projection — a fixed architectural constant of this model.
 """
 
@@ -21,9 +27,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
+from transformers.cache_utils import Cache
 
 from .rope import RotaryEmbedding
-from .type_aliases import KVCache
 
 
 class GroupedQueryAttention(nn.Module):
@@ -74,26 +80,24 @@ class GroupedQueryAttention(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
-        past_key_value: KVCache | None = None,
-    ) -> tuple[torch.Tensor, KVCache]:
+        cache: Cache | None = None,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
         """Apply grouped query attention to the input.
 
         Args:
             x: Input of shape (batch, seq_len, hidden_size).
             position_ids: Absolute positions of shape (batch, seq_len). Used by
                 RoPE to rotate Q and K at the correct frequencies.
-            past_key_value: KV cache as a pair of lists — (key_chunks, value_chunks)
-                — where each chunk is a tensor of shape
-                (batch, num_kv_heads, chunk_seq_len, head_dim). Chunks are
-                appended rather than concatenated at each step; concatenation
-                happens once at attention-compute time, avoiding repeated full-cache
-                copies. None during prefill; provided during cached generation.
+            cache: HuggingFace Cache object for KV accumulation, or None when
+                caching is disabled (``use_cache=False``). When provided,
+                ``cache.update(k, v, layer_idx)`` stores the new K/V and returns
+                the full accumulated key and value tensors for this layer.
+            layer_idx: Which slot in the cache to read and write. Each decoder
+                layer has its own index so they accumulate independently.
 
         Returns:
-            Tuple of:
-            - Output tensor of shape (batch, seq_len, hidden_size).
-            - Updated KV cache as (key_chunks, value_chunks). Always returned so
-              the caller can feed it back in at the next step.
+            Output tensor of shape (batch, seq_len, hidden_size).
         """
         batch, seq_len, _ = x.shape
 
@@ -107,41 +111,30 @@ class GroupedQueryAttention(nn.Module):
         # value != 1.0 that corrects attention magnitude after frequency manipulation.
         q, k, attention_scaling = self.rope(q, k, position_ids)
 
-        # Append the new K/V chunk to the cache lists. Concatenation across all
-        # chunks happens once below, immediately before attention is computed.
-        # This avoids copying the entire accumulated cache on every generation step.
-        if past_key_value is not None:
-            past_k_chunks, past_v_chunks = past_key_value
-            k_chunks = past_k_chunks + [k]
-            v_chunks = past_v_chunks + [v]
-        else:
-            k_chunks = [k]
-            v_chunks = [v]
-        present_key_value = (k_chunks, v_chunks)
+        # is_causal must be determined BEFORE cache.update() so it reflects the
+        # pre-update sequence length. After update, the cache contains the current
+        # tokens, and get_seq_length() would be non-zero even on the first prefill.
+        #
+        # is_causal=True during prefill (no prior history): the full Q×K matrix
+        # requires a lower-triangular mask so each token attends only to itself
+        # and earlier positions.
+        #
+        # is_causal=False during cached generation (q_len=1, k_len=full_history):
+        # a lower-triangular mask on a (1, k_len) matrix would allow the query to
+        # attend only to position 0 — incorrect. Causality is already enforced by
+        # what is in the cache; no mask needed.
+        is_causal = cache is None or cache.get_seq_length(layer_idx) == 0
 
-        # Concatenate all chunks into a single tensor for attention.
-        k_full = torch.cat(k_chunks, dim=2)
-        v_full = torch.cat(v_chunks, dim=2)
+        if cache is not None:
+            k_full, v_full = cache.update(k, v, layer_idx)
+        else:
+            k_full, v_full = k, v
 
         # Expand KV heads to align with query heads for GQA.
         # Each KV head is repeated num_groups times so SDPA sees matching head counts.
         if self.num_groups > 1:
             k_full = k_full.repeat_interleave(self.num_groups, dim=1)
             v_full = v_full.repeat_interleave(self.num_groups, dim=1)
-
-        # There is a significant complication when using KV caching with SDPA's
-        # is_causal flag. is_causal=True tells SDPA to apply a lower-triangular mask
-        # to the raw (q_len, k_len) attention matrix. During prefill this is correct:
-        # q_len == k_len and each token must attend only to itself and earlier positions.
-        #
-        # During cached generation, q_len=1 but k_len=total_history. A lower-triangular
-        # mask on a (1, k_len) matrix allows the query only to attend to position 0 of
-        # the key sequence — every other cached position is masked out. That is wrong.
-        #
-        # The fix is is_causal=False for cached steps. No mask is needed: the cache
-        # only contains keys from past positions, so causality is already enforced by
-        # what is in the cache, not by a mask.
-        is_causal = past_key_value is None
 
         attn_output = F.scaled_dot_product_attention(
             q, k_full, v_full,
@@ -158,4 +151,4 @@ class GroupedQueryAttention(nn.Module):
             .view(batch, seq_len, self.num_heads * self.head_dim)
         )
 
-        return self.o_proj(attn_output), present_key_value
+        return self.o_proj(attn_output)

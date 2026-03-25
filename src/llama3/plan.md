@@ -41,12 +41,16 @@ The checklist below is the visible record that this process was followed for eve
 - [x] Unit 9 — Documentation
 - [x] Blocker — forward() return types: plain dict → ModelOutput
 - [x] Blocker — _reorder_cache for beam search
-- [ ] Unit 10 — End-to-End Tests
+- [x] Blocker — Integration Tests
+- [x] Blocker — DynamicCache compatibility
+- [x] Blocker — model.py pure torch refactor
+- [x] Unit 10 — End-to-End Tests
+- [ ] Unit 11 — Audit
 
 ---
 
 ## Status
-**Current state:** Units 1–9 verified. Unit 10 next.
+**Current state:** Units 1–10 verified. 114 local tests + 6 network tests pass. Unit 11 (Audit) next.
 
 ---
 
@@ -122,7 +126,7 @@ Tests are first-class artifacts. They are written alongside the implementation, 
 A component without passing tests is not complete regardless of how correct it appears.
 
 **Rules:**
-- Each src file has a corresponding test file mirroring the structure under `tests/llama3/`
+- Each src file has a corresponding test file mirroring dsfthe structure under `tests/llama3/`
 - Unit tests verify each component in isolation
 - Integration tests verify that combinations of components work together — they do not replicate the
   detail of unit tests
@@ -787,38 +791,243 @@ in Unit 10.
 
 ---
 
+### Blocker — Integration Tests
+
+**Why:** Unit 10 tests the full user journey from the Hub. Before that journey can be
+verified, we need confidence that the assembled model works locally — that `generate()` runs,
+gradients flow, and local AutoClass instantiation succeeds. These are distinct
+responsibilities: one verifies the assembled system in isolation; the other verifies the Hub
+distribution path. Mixing them into a single unit blurs focus and makes failures harder to
+attribute.
+
+**What:** Local tests (no network) that verify the three use cases with a locally
+constructed model. Any bugs discovered here (e.g. in generation or gradient flow) are
+resolved as new blockers before Unit 10 begins.
+
+**Test file:** `tests/llama3/test_end_to_end.py` — integration tests live here alongside
+the end-to-end tests, separated into distinct classes.
+
+**Tests:**
+- **Generatable:** `model.generate(input_ids, max_new_tokens=5)` returns shape
+  `(batch, input_len + 5)` and all token IDs are in `[0, vocab_size)`. Same input produces
+  identical output across two calls (determinism).
+- **Beam search:** `generate()` with `num_beams=2`, `use_cache=True` vs `use_cache=False`
+  produce identical output. With `use_cache=False` correct by construction; with
+  `use_cache=True` any `_reorder_cache` bug causes divergence.
+- **Trainable:** `loss.backward()` runs without error and every parameter that should have
+  a gradient has one.
+- **HF-loadable:** `AutoModelForCausalLM.from_config(config)` instantiates correctly after
+  local registration.
+
+**Invariants that must hold:**
+- `model.generate()` runs without error and produces valid token IDs
+- Gradients flow to all trainable parameters
+- Local AutoClass instantiation succeeds
+
+---
+
 ### Unit 10 — End-to-End Tests
 
-**What:** Tests that verify the model works as a complete system: load, tokenize, generate,
-compute loss, and run a training step. These are the tests a researcher would run to confirm
-the library is actually usable before building on it.
+**What:** Tests that verify the full user journey starting from the Hub. The starting point
+is always the Hub — never a locally constructed model. These replicate exactly what a
+researcher does when they pull and use this library.
 
-**Why separate:** The existing unit tests verify each component in isolation and confirm KV
-cache correctness at the module level. None of them exercise the HuggingFace generation
-interface (`model.generate()`), gradient flow through the full assembled model, or the
-tokenizer-to-output pipeline end to end.
+**Why separate from integration tests:** Integration tests confirm the assembled model
+works. End-to-end tests confirm the Hub distribution path works: that the files on the Hub
+are correct, that `trust_remote_code` loads the right classes, and that the resulting model
+is usable. A passing integration suite does not imply a passing end-to-end suite.
+
+**Three use cases:**
+1. **HuggingFace-loadable** — config and model load from Hub via AutoClass
+2. **Generatable** — Hub-loaded model produces valid output from `generate()`
+3. **Trainable** — Hub-loaded model computes loss and gradients flow
 
 **Test file:** `tests/llama3/test_end_to_end.py`
 
-**Tests:**
-- Greedy generation: `model.generate(input_ids, max_new_tokens=5)` returns shape
-  `(batch, input_len + 5)` and all token IDs are in `[0, vocab_size)`
-- Determinism: same input produces identical greedy output across two calls
-- Beam search correctness: rig the model so one beam dominates. With `num_beams=2` and
-  a clear score gap between beams after the first step, the generation loop will copy the
-  winning beam into both slots via `_reorder_cache`. Verify this happened correctly by
-  checking that both output sequences share the same prefix — meaning the winning beam's
-  history was propagated, not the losing beam's. This catches an inverted index or a
-  wrongly transposed batch dimension, both of which would produce diverging sequences.
-- Gradient flow: `loss.backward()` runs without error and every parameter that should
-  have a gradient has one
-- Tokenizer pipeline: text → tokenize → `model.generate()` → decode produces a
-  non-empty string (marked `@pytest.mark.skipif` if tokenizer files absent)
+**Tests (`@pytest.mark.network`):**
+- **Loadable:** `AutoConfig.from_pretrained(HUB_REPO, trust_remote_code=True)` and
+  `AutoModelForCausalLM.from_config(config)` succeed. The resulting model is a
+  `Llama3ForCausalLM` instance.
+- **Generatable:** Load model from Hub, call `model.generate(input_ids, max_new_tokens=5)`,
+  confirm output shape and all token IDs are in `[0, vocab_size)`.
+- **Trainable:** Load model from Hub, run a forward pass with labels, call
+  `loss.backward()`, confirm loss is finite and gradients exist on all trainable parameters.
 
 **Invariants that must hold:**
-- `model.generate()` produces valid token sequences for greedy and beam search
+- Hub load path produces a correct, usable `Llama3ForCausalLM` instance
+- `model.generate()` produces valid token sequences
 - Gradients flow to all trainable parameters
-- The full tokenizer-to-text pipeline runs without error
+
+---
+
+### Unit 11 — Audit
+
+**What:** A first-principles review asking whether the codebase actually satisfies the
+purpose stated in job.md. Not a verification that implementation matches plan — the plan
+itself could be wrong. The auditor reads job.md, reasons independently about what must
+be true for this system to work as described, and then examines the code with that
+question in mind.
+
+**The governing question:** A researcher wants to pull a configurable Llama 3-style
+architecture from the Hub, instantiate it with fresh weights, and train or generate
+from it. Does this codebase actually deliver that? Not in theory — in practice, with
+the actual code as written.
+
+**What the auditor must not do:** Use this plan as a checklist. The plan governed
+construction and may share its blind spots. The auditor's value comes from reasoning
+independently about what could be subtly wrong — mismatches between stated intent and
+actual behaviour, assumptions that are never validated, contracts that are partially
+satisfied, things that work in the tests but would fail in a researcher's hands.
+
+**Output:** A written findings report. Each finding is classified as:
+- **Defect** — a violation of job.md's requirements; must be resolved before the audit
+  is complete
+- **Observation** — a deviation from intent or best practice that does not strictly
+  violate a requirement; surfaced for human review
+- **Clean** — no issues found in this area
+
+The audit is complete when all defects are resolved and the user has reviewed all
+observations.
+
+---
+
+### Blocker — DynamicCache compatibility
+
+**Why:** `GenerationMixin.generate()` passes a `DynamicCache` object as `past_key_values`
+on the first forward call. Our `Llama3Model.forward()` indexes `past_key_values[i]` by
+layer, which raises `TypeError: 'DynamicCache' object is not subscriptable`. This blocks
+all generate()-dependent integration tests.
+
+**Root cause and design decision:** `DynamicCache` is not subscriptable — our model's
+`past_key_values[i]` indexing fails. The fix adopts `DynamicCache` natively.
+`cache.update(new_k, new_v, layer_idx)` is the only documented interface: it stores the
+new K/V and returns `(full_k, full_v)` — the full accumulated history for that layer.
+Because the full K/V is needed for attention and is only available after projections,
+`update()` must be called inside attention.py.
+
+**Separation of concerns:** `huggingface.py` decides which Cache type to instantiate.
+The model accepts any Cache object and calls `update()` on it — no knowledge of the
+specific subclass. Future research swaps the cache type in huggingface.py only.
+
+**New interface — attention.py:**
+`GroupedQueryAttention.forward(hidden_states, position_ids, cache=None, layer_idx=0)`
+- `cache`: any `Cache` subclass, or None when `use_cache=False`.
+- `layer_idx`: identifies which cache slot to read/write via `cache.update()`.
+- After computing projections: if cache is provided,
+  `full_k, full_v = cache.update(k, v, layer_idx)`; else `full_k, full_v = k, v`.
+- `is_causal`: `cache is None or cache.get_seq_length(layer_idx) == 0` — True on
+  prefill (no history yet), False on cached decode steps.
+- Returns `output` only. Cache is updated in place; K/V need not be returned.
+
+**New interface — decoder_layer.py:**
+`DecoderLayer.forward(hidden_states, position_ids, cache=None, layer_idx=0)`
+- Threads `cache` and `layer_idx` into attention. Returns `hidden_states` only.
+
+**New interface — model.py:**
+`Llama3Model.forward(inputs_embeds, ..., past_key_values=None)`
+- `past_key_values`: a `Cache` object or None. Threaded through to every layer.
+- `position_ids`: when None and cache is provided, computed from
+  `past_key_values.get_seq_length()`. This correctly offsets RoPE positions during
+  cached generation.
+- Iterates layers passing `cache=past_key_values, layer_idx=i`.
+- `use_cache=True`: returns the same cache object as `past_key_values` — updated in
+  place by each layer's attention call.
+- `use_cache=False`: passes `None` as cache, returns `None` for `past_key_values`.
+
+**New interface — huggingface.py:**
+- `use_cache=True` and `past_key_values is None`: creates
+  `DynamicCache(config=self.config)` before calling the model.
+- `use_cache=True` and cache already provided: passes it through unchanged.
+- `use_cache=False`: passes None.
+- `_reorder_cache`: calls `past_key_values.reorder_cache(beam_idx)` and returns the
+  cache object. DynamicCache handles beam reordering internally.
+
+**type_aliases.py:** Delete. `KVCache` and `ModelKVCache` described the chunk-list
+format, which no longer exists anywhere in the package.
+
+**Files affected:**
+- `src/llama3/model/attention.py`
+- `src/llama3/model/decoder_layer.py`
+- `src/llama3/model/model.py`
+- `src/llama3/model/huggingface.py`
+- `src/llama3/model/type_aliases.py` — deleted
+- `tests/llama3/model/test_attention.py`
+- `tests/llama3/model/test_decoder_layer.py`
+- `tests/llama3/model/test_model.py`
+- `tests/llama3/model/test_huggingface.py`
+
+**Invariants that must hold (tested):**
+- All existing invariants from Units 4–7 continue to hold under the new interface
+- KV cache correctness: output at position t with cache equals output from a full forward
+  pass — verified in `test_attention.py`, `test_model.py`, and `test_huggingface.py`
+- `model.generate()` runs without error and returns valid token IDs
+- `_reorder_cache` correctly delegates to `DynamicCache.reorder_cache()`
+
+---
+
+### Blocker — model.py pure torch refactor
+
+**Why:** `Llama3Model` should have no HF lifecycle concerns. It is a pure transformer
+stack — it takes tensors and returns tensors. Cache creation is a generation contract
+decision; `use_cache` is a generation flag; `BaseModelOutputWithPast` is a HF container
+type; `PreTrainedModel` brings save/load and `_init_weights` lifecycle machinery. None
+of these belong on the backbone. All generation and HF contract concerns belong on
+`Llama3ForCausalLM`. This was the original design intent, missed during earlier units.
+
+**`model.py` changes:**
+- Base class: `PreTrainedModel` → `nn.Module`
+- Remove `config_class`, `base_model_prefix` class attributes
+- Remove `_init_weights` override and `post_init()` call
+- Remove `use_cache` parameter entirely — no flag, no DynamicCache import or creation
+- Forward signature: `forward(inputs_embeds, position_ids=None, past_key_values=None, output_hidden_states=None)`
+- If `past_key_values` is not None, pass it to layers and return it (updated in place).
+  If None, pass None to layers and return None. No flags, no decisions.
+- Return type: plain `dict` with keys `"last_hidden_state"`, `"past_key_values"`,
+  `"hidden_states"`. `Llama3Model` has no dependency on HF output types.
+- Remove `from transformers import PreTrainedModel, BaseModelOutputWithPast`
+- Keep `from transformers.cache_utils import Cache` for the type annotation only.
+
+**`huggingface.py` changes:**
+- `use_cache` and `output_hidden_states` config resolution both live here. Before
+  calling the backbone:
+  - `use_cache = use_cache if use_cache is not None else self.config.use_cache`
+  - `output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states`
+  - `use_cache=True` and `past_key_values is None` → create `DynamicCache()`
+  - `use_cache=False` → set `past_key_values = None` (ignore any provided cache)
+- Access backbone output via dict keys: `backbone_out["last_hidden_state"]`,
+  `backbone_out["past_key_values"]`, `backbone_out["hidden_states"]`.
+- Both config fields remain live: config sets the default, per-call argument overrides it.
+
+**`test_model.py` changes:**
+- Remove `test_returns_base_model_output_with_past` — the return type is now dict.
+- Remove `test_init_weights_is_noop` — `_init_weights` is gone with `PreTrainedModel`.
+- Remove `test_attribute_access_works` — plain dicts don't support attribute access;
+  replace with `test_dict_keys_present` verifying the expected keys are in the output.
+- `test_use_cache_true_returns_one_entry_per_layer` → renamed and rewritten: pass a
+  `DynamicCache()` explicitly as `past_key_values`; verify it comes back populated with
+  `num_hidden_layers` entries.
+- `test_use_cache_false_returns_none` → rewritten: pass no cache; verify
+  `out["past_key_values"]` is None.
+- `test_cached_generation_matches_full_forward` → updated to pass DynamicCache explicitly
+  and use dict access throughout.
+- `test_output_hidden_states_*` tests → updated to use dict access.
+- `test_config_output_hidden_states_respected` → moved to `test_huggingface.py`; the
+  config resolution now lives in `huggingface.py`, not `model.py`.
+
+**Invariants that must hold (tested):**
+- `Llama3Model` has no import from `transformers` except `Cache` for type hints
+- Return value is a plain dict with keys `"last_hidden_state"`, `"past_key_values"`,
+  `"hidden_states"`
+- With cache provided: output at position t matches full forward — KV cache correctness
+  unchanged
+- With no cache provided: `past_key_values` is None in output
+- All existing integration tests continue to pass (the change is internal to the backbone;
+  `huggingface.py` owns all HF contract concerns)
+
+**Files affected:**
+- `src/llama3/model/model.py`
+- `src/llama3/model/huggingface.py`
+- `tests/llama3/model/test_model.py`
 
 ---
 
@@ -831,7 +1040,7 @@ revisited at the start of the relevant unit.
 |---|----------|----------|--------|
 | 1 | `model_type` | `"llama3_baseline"` | Confirmed by user |
 | 2 | Attention kernel | `torch.nn.functional.scaled_dot_product_attention` | Confirmed by user |
-| 3 | KV cache format | List of tensor chunks per layer (`KVCache`), concatenated once at attention time | Revised from original tuple-per-layer; avoids O(N²) copies |
+| 3 | KV cache format | Originally chunk-list per layer; superseded by DynamicCache blocker — cache now lives entirely in `huggingface.py`, model receives plain concatenated tensors | Revised: DynamicCache compatibility blocker |
 | 4 | YaRN scaling | Handled natively by HF's `ROPE_INIT_FUNCTIONS` — no placeholder needed | Resolved: all scaling types supported via HF |
 | 5 | `intermediate_size` | Direct config parameter | Confirmed by user |
 | 6 | Tokenizer | GPT-NeoX (`EleutherAI/gpt-neox-20b`), 50,277 vocab, Apache 2.0 | Confirmed by user |

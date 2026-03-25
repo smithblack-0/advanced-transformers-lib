@@ -5,6 +5,7 @@ attention and MLP are correctly integrated (output feeds through both paths).
 """
 
 import torch
+from transformers import DynamicCache
 
 from src.llama3.model.configuration import Llama3Config
 from src.llama3.model.decoder_layer import DecoderLayer
@@ -47,7 +48,7 @@ class TestShape:
         config = small_config()
         layer = DecoderLayer(config)
         x, position_ids = make_input(config)
-        out, _ = layer(x, position_ids)
+        out = layer(x, position_ids)
         assert out.shape == x.shape
 
 
@@ -86,7 +87,7 @@ class TestResidualConnections:
             torch.nn.init.zeros_(proj.weight)
 
         x, position_ids = make_input(config, batch=1, seq=4)
-        out, _ = layer(x, position_ids)
+        out = layer(x, position_ids)
 
         # Output must not be zero — x flows through the residual.
         assert not torch.all(out == 0)
@@ -102,7 +103,7 @@ class TestResidualConnections:
             torch.nn.init.zeros_(proj.weight)
 
         x, position_ids = make_input(config, batch=1, seq=4)
-        out, _ = layer(x, position_ids)
+        out = layer(x, position_ids)
 
         assert not torch.all(out == 0)
 
@@ -118,16 +119,15 @@ class TestResidualConnections:
         torch.manual_seed(0)
 
         x, position_ids = make_input(config, batch=1, seq=4)
-        out_with_residual, _ = layer(x, position_ids)
+        out_with_residual = layer(x, position_ids)
 
         # Patch: replace forward with a version that drops the residual additions.
-        def no_residual_forward(x, position_ids, past_key_value=None):
-            attn_out, kv = layer.attention(layer.attn_norm(x), position_ids, past_key_value)
+        def no_residual_forward(x, position_ids, cache=None, layer_idx=0):
+            attn_out = layer.attention(layer.attn_norm(x), position_ids, cache, layer_idx)
             h = attn_out  # no residual
-            out = layer.mlp(layer.mlp_norm(h))  # no residual
-            return out, kv
+            return layer.mlp(layer.mlp_norm(h))  # no residual
 
-        out_no_residual, _ = no_residual_forward(x, position_ids)
+        out_no_residual = no_residual_forward(x, position_ids)
 
         assert not torch.allclose(out_with_residual, out_no_residual)
 
@@ -138,7 +138,7 @@ class TestResidualConnections:
 
 class TestIntegration:
     def test_kv_cache_passes_through(self):
-        """KV cache returned from the layer must be usable in the next step."""
+        """KV cache updated during the layer must be usable in the next step."""
         config = small_config()
         layer = DecoderLayer(config)
         layer.eval()
@@ -146,12 +146,13 @@ class TestIntegration:
 
         x = torch.randn(1, 4, config.hidden_size)
         pos_full = torch.arange(4).unsqueeze(0)
-        out_full, _ = layer(x, pos_full)
+        out_full = layer(x, pos_full)
 
         # Prefill first 2 tokens, then generate tokens 2 and 3 with cache.
-        _, kv = layer(x[:, :2, :], torch.arange(2).unsqueeze(0))
-        out_2, kv = layer(x[:, 2:3, :], torch.tensor([[2]]), past_key_value=kv)
-        out_3, _  = layer(x[:, 3:4, :], torch.tensor([[3]]), past_key_value=kv)
+        cache = DynamicCache()
+        layer(x[:, :2, :], torch.arange(2).unsqueeze(0), cache=cache, layer_idx=0)
+        out_2 = layer(x[:, 2:3, :], torch.tensor([[2]]), cache=cache, layer_idx=0)
+        out_3 = layer(x[:, 3:4, :], torch.tensor([[3]]), cache=cache, layer_idx=0)
 
         torch.testing.assert_close(out_2, out_full[:, 2:3, :])
         torch.testing.assert_close(out_3, out_full[:, 3:4, :])
