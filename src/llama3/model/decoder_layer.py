@@ -53,6 +53,7 @@ class DecoderLayer(nn.Module):
         position_ids: torch.Tensor,
         cache: Cache | None = None,
         layer_idx: int = 0,
+        causal_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply one decoder block to the input.
 
@@ -63,10 +64,12 @@ class DecoderLayer(nn.Module):
                 caching is disabled. Passed through to attention unchanged.
             layer_idx: Cache slot index for this layer. Each layer has its own
                 index so they accumulate independently within the shared cache.
+            causal_mask: Optional boolean attention mask of shape
+                (1, 1, seq_len, kv_len). Passed through to attention unchanged.
 
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size).
         """
-        attn_out = self.attention(self.attn_norm(x), position_ids, cache, layer_idx)
+        attn_out = self.attention(self.attn_norm(x), position_ids, cache, layer_idx, causal_mask)
         h = x + attn_out
         return h + self.mlp(self.mlp_norm(h))

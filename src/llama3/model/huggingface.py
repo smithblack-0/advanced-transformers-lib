@@ -82,15 +82,19 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
         pass
 
     def get_input_embeddings(self) -> nn.Embedding:
+        """Return the token embedding matrix. Required by PreTrainedModel for weight tying and resize_token_embeddings."""
         return self.embed_tokens
 
     def set_input_embeddings(self, value: nn.Embedding) -> None:
+        """Replace the token embedding matrix. Required by PreTrainedModel for weight tying and resize_token_embeddings."""
         self.embed_tokens = value
 
     def get_output_embeddings(self) -> nn.Linear:
+        """Return the LM head. Required by PreTrainedModel for weight tying and resize_token_embeddings."""
         return self.lm_head
 
     def set_output_embeddings(self, value: nn.Linear) -> None:
+        """Replace the LM head. Required by PreTrainedModel for weight tying and resize_token_embeddings."""
         self.lm_head = value
 
     def _reorder_cache(
@@ -131,7 +135,8 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
         Args:
             input_ids: Token indices of shape (batch, seq_len).
             position_ids: Absolute positions of shape (batch, seq_len). Passed
-                through to the backbone; generated automatically if None.
+                through to the backbone. When use_cache=True and this is None,
+                derived from cache_position.
             past_key_values: A HuggingFace Cache object from a prior step, or
                 None. When use_cache=True and this is None, a fresh DynamicCache
                 is created here before calling the backbone.
@@ -147,21 +152,28 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
                 is applied internally. Positions with label value -100 are
                 ignored by cross-entropy, following the HuggingFace convention
                 for padding and masked positions.
-            cache_position: Accepted for GenerationMixin compatibility in newer
-                HuggingFace versions. Not used — position tracking is handled
-                internally via position_ids.
+            cache_position: 1-D integer tensor of shape (seq_len,) giving the
+                absolute position of each input token in the full sequence.
+                Provided by GenerationMixin during generate(). When use_cache=True
+                and this is None, it is derived from the current cache length.
             **kwargs: Additional keyword arguments passed by GenerationMixin
-                (e.g. return_dict, attention_mask). Accepted and ignored for
-                forward compatibility. We always return CausalLMOutputWithPast
-                regardless of return_dict.
+                (e.g. return_dict). Accepted and ignored for forward compatibility.
+                We always return CausalLMOutputWithPast regardless of return_dict.
 
         Returns:
             CausalLMOutputWithPast with fields:
             - ``logits``: vocabulary scores of shape (batch, seq_len, vocab_size).
+              Always present.
             - ``loss``: scalar cross-entropy loss, or None if labels not provided.
             - ``past_key_values``: the updated Cache object, or None.
             - ``hidden_states``: per-layer hidden states, or None.
         """
+        if kwargs.get("attention_mask") is not None:
+            raise ValueError(
+                "attention_mask is not supported. This model does not support padding masks. "
+                "For training on variable-length sequences, use right-padding with -100 labels."
+            )
+
         # Resolve both flags against config defaults. Config sets the default;
         # per-call arguments override it. Both fields in Llama3Config remain live.
         use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -180,12 +192,47 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
             past_key_values = None
 
         inputs_embeds = self.embed_tokens(input_ids)
+        batch, seq_len, _ = inputs_embeds.shape
+
+        # For training (use_cache=False), positions are always 0..seq_len-1.
+        # This is not inference from state — it is a trivial fact about a
+        # non-cached forward pass. The backbone requires explicit position_ids.
+        if not use_cache and position_ids is None:
+            position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(batch, -1)
+
+        causal_mask = None
+        if use_cache:
+            # cache_position is GenerationMixin's responsibility. If it is absent,
+            # positions are unknown and any mask or RoPE encoding we produce would be
+            # silently wrong — potentially corrupting a checkpoint. Crash immediately.
+            if cache_position is None:
+                raise ValueError(
+                    "cache_position must be provided when use_cache=True. "
+                    "GenerationMixin supplies this automatically during generate(). "
+                    "If calling forward() directly with use_cache=True, pass cache_position explicitly."
+                )
+
+            # Derive position_ids for RoPE from cache_position when not provided.
+            # This is a valid computation: cache_position is the authoritative source
+            # of absolute sequence positions, and position_ids is its batch-expanded form.
+            if position_ids is None:
+                position_ids = cache_position.unsqueeze(0).expand(batch, -1)
+
+            # Build the causal attention mask. For each query at absolute position p,
+            # it may attend to all keys at positions 0..p. k_len is the full sequence
+            # length after this step: one past the last query position.
+            k_len = int(cache_position[-1].item()) + 1
+            k_positions = torch.arange(k_len, device=inputs_embeds.device)
+            # mask[q, k] = True when key position k is within the causal horizon of query q.
+            # Shape: (1, 1, seq_len, k_len) — broadcast over batch and head dimensions.
+            causal_mask = (k_positions[None, :] <= cache_position[:, None]).unsqueeze(0).unsqueeze(0)
 
         backbone_out = self.model(
             inputs_embeds,
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_hidden_states=output_hidden_states,
+            causal_mask=causal_mask,
         )
 
         logits = self.lm_head(backbone_out["last_hidden_state"])

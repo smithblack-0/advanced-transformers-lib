@@ -115,3 +115,23 @@ Files outside `model/` are never uploaded and may use absolute imports.
 
 See `plan.md` in this directory for the full implementation history, architectural decisions,
 and the human-supervised process record.
+
+---
+
+## Design Decisions and Deviations
+
+### Tokenizer
+
+The specification requires the Llama 3 tokenizer. The GPT-NeoX tokenizer
+(`EleutherAI/gpt-neox-20b`, Apache 2.0) was substituted because the Llama 3 tokenizer
+is gated behind a license agreement, making it unsuitable for a freely distributable
+research baseline. Researchers who require exact Llama 3 tokenisation must substitute
+it themselves.
+
+### Padding and sequence packing
+
+Right-padding is the only supported training configuration. This model does not accept
+an `attention_mask` parameter — passing one raises `ValueError`. Left-padded batches
+or packed sequences without explicit position management will produce silently wrong
+representations because position encoding is applied from position 0 regardless of
+padding layout. Use right-padding with `-100` labels on pad positions.

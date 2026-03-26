@@ -40,6 +40,17 @@ def make_input(
     return x, position_ids
 
 
+def make_causal_mask(cache_position: torch.Tensor, k_len: int) -> torch.Tensor:
+    """Build a boolean causal mask of shape (1, 1, q_len, k_len).
+
+    True at (q, k) means query q may attend to key k. Equivalent to the
+    lower-right aligned causal mask: key position k is within the causal
+    horizon of query q when k <= cache_position[q].
+    """
+    k_positions = torch.arange(k_len)
+    return (k_positions[None, :] <= cache_position[:, None]).unsqueeze(0).unsqueeze(0)
+
+
 # ---------------------------------------------------------------------------
 # Shape
 # ---------------------------------------------------------------------------
@@ -164,6 +175,10 @@ class TestKVCache:
 
         This is the smallest valid prefill and exercises is_causal=True with a 1×1
         attention matrix, which is a trivially causal case.
+
+        Decode steps receive an explicit causal mask because is_causal=True is only
+        correct for square Q×K matrices. When q_len=1 and k_len>1, PyTorch's built-in
+        is_causal uses upper-left alignment and produces wrong results.
         """
         config = small_config(num_attention_heads=4, num_key_value_heads=2)
         attn = GroupedQueryAttention(config)
@@ -178,7 +193,10 @@ class TestKVCache:
         cache = DynamicCache()
         attn(x[:, :1, :], torch.tensor([[0]]), cache=cache, layer_idx=0)
         for t in range(1, 4):
-            out_t = attn(x[:, t:t+1, :], torch.tensor([[t]]), cache=cache, layer_idx=0)
+            past_len = cache.get_seq_length(0)
+            k_len = past_len + 1
+            mask = make_causal_mask(torch.tensor([t]), k_len)
+            out_t = attn(x[:, t:t+1, :], torch.tensor([[t]]), cache=cache, layer_idx=0, causal_mask=mask)
             torch.testing.assert_close(out_t, out_full[:, t:t+1, :])
 
     def test_cache_grows_after_each_step(self):
@@ -196,7 +214,10 @@ class TestKVCache:
         assert cache.get_seq_length(0) == 2
 
         for step in range(3):
-            attn(x[:, 2+step:3+step, :], torch.tensor([[2+step]]), cache=cache, layer_idx=0)
+            t = 2 + step
+            past_len = cache.get_seq_length(0)
+            mask = make_causal_mask(torch.tensor([t]), k_len=past_len + 1)
+            attn(x[:, t:t+1, :], torch.tensor([[t]]), cache=cache, layer_idx=0, causal_mask=mask)
             assert cache.get_seq_length(0) == 3 + step
 
     def test_cached_generation_matches_full_forward(self):
@@ -204,6 +225,9 @@ class TestKVCache:
 
         Runs a 2-token prefill followed by 2 cached generation steps, then verifies
         each cached output matches the corresponding position in a full 4-token forward.
+
+        Decode steps receive an explicit causal mask (see test_single_token_prefill
+        for the reason). The mask is constructed here as it would be in huggingface.py.
         """
         config = small_config(num_attention_heads=4, num_key_value_heads=2)
         attn = GroupedQueryAttention(config)
@@ -213,22 +237,46 @@ class TestKVCache:
         batch = 1
         x = torch.randn(batch, 4, config.hidden_size)
 
-        # Full forward over all 4 tokens.
+        # Full forward over all 4 tokens — no mask, is_causal=True, square Q×K.
         pos_full = torch.arange(4).unsqueeze(0)
         out_full = attn(x, pos_full)
 
-        # Prefill on first 2 tokens.
+        # Prefill on first 2 tokens — no mask, is_causal=True, square Q×K.
         cache = DynamicCache()
         pos_prefill = torch.arange(2).unsqueeze(0)
         attn(x[:, :2, :], pos_prefill, cache=cache, layer_idx=0)
 
-        # Cached step: token 2.
+        # Cached step: token 2. k_len = 3 (2 cached + 1 new).
         pos_2 = torch.tensor([[2]])
-        out_2 = attn(x[:, 2:3, :], pos_2, cache=cache, layer_idx=0)
+        mask_2 = make_causal_mask(torch.tensor([2]), k_len=3)
+        out_2 = attn(x[:, 2:3, :], pos_2, cache=cache, layer_idx=0, causal_mask=mask_2)
 
-        # Cached step: token 3.
+        # Cached step: token 3. k_len = 4 (3 cached + 1 new).
         pos_3 = torch.tensor([[3]])
-        out_3 = attn(x[:, 3:4, :], pos_3, cache=cache, layer_idx=0)
+        mask_3 = make_causal_mask(torch.tensor([3]), k_len=4)
+        out_3 = attn(x[:, 3:4, :], pos_3, cache=cache, layer_idx=0, causal_mask=mask_3)
 
         torch.testing.assert_close(out_2, out_full[:, 2:3, :])
         torch.testing.assert_close(out_3, out_full[:, 3:4, :])
+
+
+    def test_causal_mask_parameter_is_used(self):
+        """An explicit causal_mask must govern attention when provided.
+
+        Passes a mask that blocks all attention (all False) and verifies the output
+        differs from the unmasked case. This confirms the parameter is wired through
+        to SDPA and not silently ignored.
+        """
+        config = small_config(num_attention_heads=4, num_key_value_heads=2)
+        attn = GroupedQueryAttention(config)
+        attn.eval()
+        torch.manual_seed(42)
+
+        x, position_ids = make_input(config, batch=1, seq=4)
+        out_no_mask = attn(x, position_ids)
+
+        # All-False mask: no token may attend to any key.
+        all_blocked = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
+        out_masked = attn(x, position_ids, causal_mask=all_blocked)
+
+        assert not torch.allclose(out_no_mask, out_masked)

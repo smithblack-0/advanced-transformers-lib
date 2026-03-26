@@ -39,9 +39,9 @@ class GroupedQueryAttention(nn.Module):
     sharing a single KV head. Before attention is computed, K and V are expanded
     by repeating each KV head across its group of query heads.
 
-    The forward pass is strictly causal — no external attention mask parameter.
-    Causal masking is handled differently for prefill vs. cached generation; see
-    the forward docstring for the reasoning.
+    The forward pass is strictly causal. An optional pre-built boolean attention
+    mask can be threaded in from the caller; when absent, SDPA's native
+    ``is_causal`` mode applies — correct for full-sequence training.
 
     Args:
         config: Model config. Must expose ``num_attention_heads``,
@@ -82,6 +82,7 @@ class GroupedQueryAttention(nn.Module):
         position_ids: torch.Tensor,
         cache: Cache | None = None,
         layer_idx: int = 0,
+        causal_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply grouped query attention to the input.
 
@@ -95,6 +96,13 @@ class GroupedQueryAttention(nn.Module):
                 the full accumulated key and value tensors for this layer.
             layer_idx: Which slot in the cache to read and write. Each decoder
                 layer has its own index so they accumulate independently.
+            causal_mask: Optional boolean attention mask of shape
+                (1, 1, seq_len, kv_len), where True indicates a position that
+                should be attended to. When None, SDPA's built-in ``is_causal``
+                mode is used, which is correct for full-sequence training
+                (square Q×K matrix). When provided, ``is_causal`` is disabled
+                and the explicit mask governs attention — required for any
+                generation pattern where Q and K lengths differ.
 
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size).
@@ -111,20 +119,6 @@ class GroupedQueryAttention(nn.Module):
         # value != 1.0 that corrects attention magnitude after frequency manipulation.
         q, k, attention_scaling = self.rope(q, k, position_ids)
 
-        # is_causal must be determined BEFORE cache.update() so it reflects the
-        # pre-update sequence length. After update, the cache contains the current
-        # tokens, and get_seq_length() would be non-zero even on the first prefill.
-        #
-        # is_causal=True during prefill (no prior history): the full Q×K matrix
-        # requires a lower-triangular mask so each token attends only to itself
-        # and earlier positions.
-        #
-        # is_causal=False during cached generation (q_len=1, k_len=full_history):
-        # a lower-triangular mask on a (1, k_len) matrix would allow the query to
-        # attend only to position 0 — incorrect. Causality is already enforced by
-        # what is in the cache; no mask needed.
-        is_causal = cache is None or cache.get_seq_length(layer_idx) == 0
-
         if cache is not None:
             k_full, v_full = cache.update(k, v, layer_idx)
         else:
@@ -138,8 +132,9 @@ class GroupedQueryAttention(nn.Module):
 
         attn_output = F.scaled_dot_product_attention(
             q, k_full, v_full,
+            attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
+            is_causal=causal_mask is None,
             scale=attention_scaling / math.sqrt(self.head_dim),
         )
 

@@ -50,8 +50,7 @@ class RotaryEmbedding(nn.Module):
 
     Args:
         config: Model config. Must expose ``rope_theta``, ``rope_parameters`` (set by
-            HF's RotaryEmbeddingConfigMixin), and ``head_dim`` (or ``hidden_size`` and
-            ``num_attention_heads`` to derive it).
+            HF's RotaryEmbeddingConfigMixin), and ``head_dim``.
         device: Optional device for initial buffer placement. Buffers move with the
             model on ``.to()`` / ``.cuda()`` calls.
 
@@ -79,12 +78,9 @@ class RotaryEmbedding(nn.Module):
         if self.rope_type == "default":
             # Standard RoPE: inv_freq = 1 / theta^(2i / head_dim).
             # Not in ROPE_INIT_FUNCTIONS, so computed directly.
-            head_dim = getattr(config, "head_dim", None) or (
-                config.hidden_size // config.num_attention_heads
-            )
             inv_freq = 1.0 / (
                 config.rope_theta
-                ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+                ** (torch.arange(0, config.head_dim, 2, dtype=torch.float32, device=device) / config.head_dim)
             )
             self.attention_scaling: float = 1.0
         else:

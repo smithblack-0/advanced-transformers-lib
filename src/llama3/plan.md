@@ -45,12 +45,19 @@ The checklist below is the visible record that this process was followed for eve
 - [x] Blocker — DynamicCache compatibility
 - [x] Blocker — model.py pure torch refactor
 - [x] Unit 10 — End-to-End Tests
-- [ ] Unit 11 — Audit
+- [x] Unit 11 — Audit
 
 ---
 
 ## Status
-**Current state:** Units 1–10 verified. 114 local tests + 6 network tests pass. Unit 11 (Audit) next.
+**Current state:** Units 1–11 verified. 124 local tests + 6 network tests pass (130 total).
+
+Audit changes landed:
+- rope.py: `config.head_dim` direct — removed `getattr` fallback
+- attention.py: `causal_mask` parameter replaces internal `is_causal` logic; SDPA uses `is_causal = causal_mask is None`
+- decoder_layer.py / model.py: `causal_mask` threaded through
+- huggingface.py: mask built when `use_cache=True`, `cache_position` wired to `position_ids`, `attention_mask` rejected with ValueError, docstrings added
+- Tests: all decode-step tests updated with explicit causal masks; new tests for mask wiring, attention_mask rejection, cache_position contract enforcement, multi-token re-prompt, and fixed loss masking test; all training-path forward calls explicitly pass use_cache=False
 
 ---
 
@@ -87,6 +94,11 @@ reflect actual state at all times so work can be resumed after a session break w
 
 **Plan first within each unit.** At the start of each unit, confirm file granularity, list what will
 be implemented, and identify any decision points before writing code.
+
+**Close the testing gap.** When a defect is found — in audit or anywhere else — the resolution is not
+complete until two questions are answered: (1) what invariant did the existing tests fail to enforce,
+and (2) what test change closes that gap? The fix and the test correction are a single unit of work.
+A defect resolved without closing the testing gap is not verified — it is just patched.
 
 ---
 

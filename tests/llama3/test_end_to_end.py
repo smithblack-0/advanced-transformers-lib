@@ -102,7 +102,7 @@ class TestIntegrationTrainable:
         """loss.backward() must complete without error on the full assembled model."""
         m = Llama3ForCausalLM(small_config()).train()
         ids = torch.randint(0, 256, (1, 4))
-        out = m(ids, labels=ids)
+        out = m(ids, labels=ids, use_cache=False)
         out.loss.backward()
 
     def test_all_params_have_gradients(self):
@@ -114,7 +114,7 @@ class TestIntegrationTrainable:
         """
         m = Llama3ForCausalLM(small_config()).train()
         ids = torch.randint(0, 256, (1, 4))
-        out = m(ids, labels=ids)
+        out = m(ids, labels=ids, use_cache=False)
         out.loss.backward()
         for name, param in m.named_parameters():
             if param.requires_grad:
@@ -241,7 +241,7 @@ class TestE2ETrainable:
     def test_loss_backward_runs(self, model):
         """loss.backward() must complete without error on a Hub-loaded model."""
         ids = torch.randint(0, model.config.vocab_size, (1, 4))
-        out = model(ids, labels=ids)
+        out = model(ids, labels=ids, use_cache=False)
         out.loss.backward()
 
     def test_all_params_have_gradients(self, model):
@@ -253,7 +253,7 @@ class TestE2ETrainable:
         caused silent fallback to a stub).
         """
         ids = torch.randint(0, model.config.vocab_size, (1, 4))
-        out = model(ids, labels=ids)
+        out = model(ids, labels=ids, use_cache=False)
         out.loss.backward()
         for name, param in model.named_parameters():
             if param.requires_grad:

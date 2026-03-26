@@ -65,20 +65,19 @@ class Llama3Model(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor,
         past_key_values: Cache | None = None,
         output_hidden_states: bool = False,
+        causal_mask: torch.Tensor | None = None,
     ) -> dict:
         """Run the transformer stack over a batch of pre-embedded sequences.
 
         Args:
             inputs_embeds: Pre-embedded input of shape (batch, seq_len, hidden_size).
-            position_ids: Absolute positions of shape (batch, seq_len). When None,
-                positions are generated automatically starting from the end of any
-                cached sequence. This offset is required for correctness during
-                cached generation: RoPE frequencies are position-dependent, so each
-                new token must carry the position it actually occupies in the full
-                sequence, not position 0.
+            position_ids: Absolute positions of shape (batch, seq_len). Required.
+                Must be provided explicitly by the caller — this module does not
+                infer positions from cache state. The caller owns the mapping from
+                tokens to sequence positions.
             past_key_values: A Cache object carrying the accumulated K/V history from
                 prior forward passes, or None. When provided, each decoder layer writes
                 new K/V into its slot and reads back the full accumulated history. The
@@ -87,6 +86,10 @@ class Llama3Model(nn.Module):
             output_hidden_states: When True, the output dict includes a tuple of
                 per-layer hidden states: (inputs_embeds, layer_0_out, ..., layer_N_out),
                 collected before the final norm.
+            causal_mask: Optional boolean attention mask of shape
+                (1, 1, seq_len, kv_len). Threaded unchanged into every decoder
+                layer. When None, each layer uses SDPA's native ``is_causal``
+                mode (correct for full-sequence training).
 
         Returns:
             Plain dict with keys:
@@ -98,23 +101,11 @@ class Llama3Model(nn.Module):
               else None. Collected before the final norm so each entry reflects the
               unnormalised residual stream at that depth.
         """
-        batch, seq_len, _ = inputs_embeds.shape
-
-        if position_ids is None:
-            # During cached generation, new tokens must be positioned after all
-            # previously cached tokens. get_seq_length(0) returns the number of
-            # tokens already stored for layer 0 — all layers hold the same count
-            # because they were all updated together on previous steps.
-            past_seq_len = past_key_values.get_seq_length(0) if past_key_values is not None else 0
-            position_ids = torch.arange(
-                past_seq_len, past_seq_len + seq_len, device=inputs_embeds.device
-            ).unsqueeze(0).expand(batch, -1)
-
         hidden_states = inputs_embeds
         all_hidden_states = (hidden_states,) if output_hidden_states else None
 
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, position_ids, cache=past_key_values, layer_idx=i)
+            hidden_states = layer(hidden_states, position_ids, cache=past_key_values, layer_idx=i, causal_mask=causal_mask)
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 

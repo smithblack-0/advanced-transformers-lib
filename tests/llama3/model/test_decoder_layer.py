@@ -11,6 +11,16 @@ from src.llama3.model.configuration import Llama3Config
 from src.llama3.model.decoder_layer import DecoderLayer
 
 
+def make_causal_mask(cache_position: torch.Tensor, k_len: int) -> torch.Tensor:
+    """Build a boolean causal mask of shape (1, 1, q_len, k_len).
+
+    Required for decode steps where q_len < k_len — is_causal=True is only
+    correct for square Q×K matrices.
+    """
+    k_positions = torch.arange(k_len)
+    return (k_positions[None, :] <= cache_position[:, None]).unsqueeze(0).unsqueeze(0)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -149,10 +159,14 @@ class TestIntegration:
         out_full = layer(x, pos_full)
 
         # Prefill first 2 tokens, then generate tokens 2 and 3 with cache.
+        # Decode steps require explicit causal masks — is_causal=True is wrong
+        # for non-square Q×K (see test_attention.py for the full explanation).
         cache = DynamicCache()
         layer(x[:, :2, :], torch.arange(2).unsqueeze(0), cache=cache, layer_idx=0)
-        out_2 = layer(x[:, 2:3, :], torch.tensor([[2]]), cache=cache, layer_idx=0)
-        out_3 = layer(x[:, 3:4, :], torch.tensor([[3]]), cache=cache, layer_idx=0)
+        mask_2 = make_causal_mask(torch.tensor([2]), k_len=3)
+        out_2 = layer(x[:, 2:3, :], torch.tensor([[2]]), cache=cache, layer_idx=0, causal_mask=mask_2)
+        mask_3 = make_causal_mask(torch.tensor([3]), k_len=4)
+        out_3 = layer(x[:, 3:4, :], torch.tensor([[3]]), cache=cache, layer_idx=0, causal_mask=mask_3)
 
         torch.testing.assert_close(out_2, out_full[:, 2:3, :])
         torch.testing.assert_close(out_3, out_full[:, 3:4, :])
