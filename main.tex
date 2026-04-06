@@ -1,0 +1,828 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{url}
+\usepackage{authblk}
+\usepackage{float}
+\usepackage{setspace}
+\usepackage{natbib}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\title{A Design Law for Routed Head Sparse Attention: Trading Parameters for Long-Sequence Performance}
+\author{[Author Name(s)]}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+
+Sparse attention is usually framed as a computational concession: a way to make long contexts cheaper while preserving as much dense-attention quality as possible. This paper studies a different possibility in a concrete base-MoSA setting. We ask whether MoSA-style routing can be used not only to reduce cost, but to buy better long-sequence performance by increasing routed attention capacity. We investigate this question through a controlled case study over four effective routing operating points, reported as $K/L \in \{1.0, 0.8, 0.5, 0.2\}$ under comparable isotoken pretraining conditions and evaluated on RULER. Here $L$ denotes total routed head capacity and $K$ the effective per-token active-head budget induced by the MoSA routing process under the study's reporting convention. Across this sweep, we observe a monotone improvement in long-context performance as routed capacity increases and the effective activation ratio decreases. We organize this finding as a design law for MoSA-style sparse attention: within a beneficial regime, the maximum usable sequence length at a fixed quality target scales approximately with $L/K$. The paper's contribution is a study of that law, not a new attention mechanism. We explain the law, give analytical reasoning for why it should exist, derive empirical predictions from it, and then evaluate those predictions in a base-MoSA case study. The resulting picture recasts MoSA-style sparse attention as more than an efficiency device. In the measured regime, it functions as a practical scaling mechanism for long-sequence competence.
+\end{abstract}
+
+
+% DevNotes:
+%
+% Need to more tightly integrate into the entmax line of reasoning and distinguish from it. More background? 
+%
+
+\section{Introduction}
+
+Long-sequence performance remains one of the central unresolved limitations of modern attention architectures; as sequence length grows, attention must discriminate among an increasingly large set of candidate tokens, and performance correspondingly degrades. While existing sparse-attention methods such as LSH, recurrent formulations, and SSMs have enabled computationally operational architectures in the long sequence regime, the ability to extract an acceptable level of task performance at arbitrarily long sequence length remains elusive. 
+
+The \emph{Mixture of Sparse Attention} formulation by Pi\k{e}kos et al (MoSA)~\cite{piekos2025mosa} is one such formulation in the long line of long-sequence computational research. Pi\k{e}kos used a form of expert-choice head selection to have expert heads attend only to a sparse subset of input tokens. This produced significant performance gains over several more conventional alternatives. However underexplored within the original paper are the consequences sparsification of attention had on the tradeoffs that can be made between long-sequence task performance and the assignment of parameters per head. At a purely \emph{conceptual} level an architecture such as MoSA is distributing the epistemological responsibility of attending to $N$ tokens among $L$ expert heads. It should thus follow that  \emph{conceptually} each head is responsible for $\approx \frac{N}{L}$ tokens. Assurances that models will train to use this capacity are another matter entirely.
+
+This paper studies a potential approach to attacking this underexplored consequence. We find that for the right architectural class,a mixture of attention sparsity can be used not merely to reduce cost, but to change the scaling laws of long-sequence performance itself. Beginning from the observation that sparsely distributing tokens among attention experts reduces the attended tokens per head, we argue that there exists a regime under which the novel Token-Choice Sparse Routed Attention formulation can trade parameters directly for improved long-sequence performance at a theoretically guaranteed at-least-linear rate. 
+
+We offer the following contributions:
+
+\begin{itemize}
+    \item The presentation and applicable conditions and limitations of the \emph{SRAM Design Law} and the ontology of \emph{Token-Choice Sparse Routed Attention Mixtures}, accompanied by the formal proof of its existence in the appendix and the limitations on its applicability.
+    \item The introduction of the \emph{Mixture of Sparse Routed Attention Heads} (MoSRAH) attention layer for concrete exploration of the theorem, its practical implementation as part of the Sparse Hybrid Routed Attention Mixture (SHRAM) layer, its heritage within the mixture of experts and sparse attention traditions, and the distributed consequences of this heritage.
+    \item An empirical study of the MoSRAH layer contrasting long-sequence performance and assigned parameters to verify or refute the applicability of the performance law. 
+\end{itemize}
+
+\section{Background}
+\label{sec:background}
+
+We briefly survey several distinct threads of research within the transformer literature. Standard self-attention, as introduced by Vaswani et al.~\cite{vaswani2017attention}, uses a query to attend over a set of keys, and is central to auto-regressive decoders.
+
+Attention derives much of its expressive power from permitting each token to compare against a large candidate set of contextual tokens. This same property, however, makes long-sequence processing difficult: full self-attention scales as $\mathcal{O}(N^2)$ in sequence length, motivating a large literature on sparse-attention methods that restrict the set of candidate interactions in order to reduce both the computational and representational burden of long-context modeling~\cite{kitaev2020reformer,roy2021routing,liu2020LostInTheMiddle}.
+
+In parallel with the long-sequence developments, Mixture-of-Experts architectures showed that parameter count can be increased dramatically without activating all parameters on every input, using learned routing and load-balancing mechanisms to distribute computation selectively across experts~\cite{shazeer2017outrageously,fedus2022switch}. The development of mixture-of-experts arguably enabled the rise of the modern large-scale LLM. More recently MegaBlocks introduced the terms "Permutation" and "Unpermutation" for the step of placing tokens into tensors with a per-expert index to perform a fused GEMM \cite{gale2023megablocks}. The usage of the term "Expert Packing" to refer to this occurred within the context of an Nvidia technical exploration \cite{alvarez2025wideepnvl72}.
+
+The possibility of fusing these threads was brought into explicit focus by Pi\k{e}kos et al.~in \emph{Mixture of Sparse Attention}.(MoSA)~\cite{piekos2025mosa}. MoSA applied expert-choice routing to sparse attention itself: Given N tokens each head chose k=64 tokens to attend to and attended only within this smaller subset; RoPE and other such necessary details were adjusted appropriately to support the revised paradigm. A separate subset of heads applied sliding window attention to capture short range connections. Of significance for the upcoming discussion is the decision of MoSA to use a hybrid local-global attention system in which a number of local attention heads worked along the MoSA operator sparse heads to complete attention. Notably, MoSA used an expert-choice rather than token choice formulation. While theoretical guarantees may exist, we were unable to find laws compatible with this formulation directly.
+
+\section{Theory}
+\label{sec:theory}
+
+\subsection{The Token-Choice Sparse Routed Attention Mixture}
+
+A \textbf{token-choice sparse routed attention mixture} model belongs to a family of attention layers characterized by the following invariants. 
+
+\begin{itemize}
+    \item There exists an underlying attention formulation primitive $A(\tilde{x}_h)$ acting on an input token representation $\tilde{x_h}$.
+    \item This formulation is replicated into indexed but individually attention suboperators $A_h(\tilde{x}_h)$ over $L$ distinct experts where, critically, each replication is independently reinitialized and has independent parameters.
+    \item Each input token is routed by token choice into a fixed finite number $K$ of selected experts; routing uses additional parameters for each additional possible router.
+    \item This routing induces, for each expert $h$, a packed subset representation $\tilde{x}_h$ consisting only of those tokens routed to that expert.
+    \item Attention is evaluated only within these packed expert-local subsets.
+    \item The expert-local responses are recombined to produce the final token outputs.
+\end{itemize}
+
+Satisfaction of all these conditions at a conceptual level by a given concrete implementation are sufficient to classify a layer as a member of the family. It should, however, be emphasized that what is needed for applicability is for a conceptual decomposition to exist that mathematically matches this description. Indeed, even the Vaswani formulation can be said to be compatible with this definition in the reduction of no sparsity whatsoever and routing response is such that all tokens are always assigned to all experts (heads). An interesting consequence is thus that even Vaswani attention is a form of mixture in a routing limit.\cite{vaswani2017attention, wang2023interpretability} \footnote{The viewpoint that makes this work is to view attention as a set of independent heads that always start from the embedding, independently project into a bottlenecked head representation $x_h$, attend within it, project back to the main embedding width, then add up the results from each head. This satisfies the invariants, with the heads representing experts}
+
+The truly interesting properties of TC-SRAM formulations begin to emerge, however, when sparsity of routing is allowed. If there is a total of $N$ tokens to be processed, then by simple arithmetic there are $NK$ tokens after routing to assign and process. It follows by simple arithmetic the average tokens attended to within a particular expert bucket $\tilde{x}_h$ is given by
+
+\[
+\approx \frac{NK}{L}
+\]
+
+This thus indicates that for these formulations increasing the number of heads $L$ while holding the number of heads chosen $K$ fixed must necessarily reduce the average tokens attended to within each expert bucket $x_h$.
+
+\subsection{Design Law}
+
+The central theoretical locus of focus within this work is that a load-balanced TC-SRAM layer -- such as the upcoming MoSRAH attention layer -- is \emph{theoretically bounded to have a regime of operation in which parameters can be traded directly for long-sequence task performance at at least a linear rate}. The formal statement of this effect is as follows. 
+
+\begin{quote}
+\begin{theorem}[SRAM Design Law]
+\label{theorem}
+Let $\tau$ denote an arbitrary average long-sequence \emph{task}\footnote{as opposed to computational performance} performance target. Let $K$ be the number of heads selected per token and let $L$ be the total number of heads instantiated by a TC-SRAM attention layer. Let $\Omega$ be the total parameters allocated to those heads, at fixed per-head budget $k$, so that $\Omega=Lk$. Additionally let the TC-SRAM layer have near-perfect load balancing such that the tokens in $\tilde{x}_h$ scale roughly as $\approx \frac{NK}{L}$. Let additional parameters be introduced for routing on any additional token-choice route.
+
+Then there exists a sparsity regime in the long-sequence asymptotic limit
+\[
+1 > \frac{K}{L} > r
+\qquad\text{for some } 1>r>0,
+\]
+in which the minimum supported sequence frontier of the test architecture satisfies
+\[
+N_\tau(\Omega,K) \ge d_\tau \frac{\Omega}{K} + b_\tau,
+\]
+where $d_\tau$ and $b_\tau$ depend on the architectural configuration and the sequence distribution under consideration.
+\end{theorem}
+\end{quote}
+
+The fully formal derivation of the theorem is available in appendix \ref{app:proof} but a brief semi-formal summary of it is as follows. 
+
+\begin{quote}
+If a load-balanced model sparsely divides $N$ tokens $K$ times among $L$ heads, then the tokens per head is on average $\frac{NK}{L}$. Suppose attention is performed on this group; then attention difficulty now decreases with increasing $L$. However, the routing process itself can cause performance degradation; in fact in the infinite-head limit load-balancing assigns one token per head and thus no attention occurs at all. In tension however whenever we add heads we use more parameters thus adding more capacity. Since attention becomes computationally sparse at long sequence lengths regardless of if it is dense or sparsely implemented, there is lots of degrees of freedom to rearrange the computation. Thus this extra capacity will be beneficial to a point until the penalty of sparsity outweighs the benefits of additional capacity.
+\end{quote}
+
+
+\section{Design}
+\label{sec:design}
+
+Theorem \ref{theorem} predicts a regime in which additional parameters can be traded for improved long-sequence task performance, but only if the resulting layer actually realizes the conditions under which that tradeoff becomes available. We therefore designed the Sparse Hybrid Token Routed Attention Mixture (SHRAM) layer and its sparse routed subcomponent, the Mixture of Sparse Routed Attention Heads (MoSRAH), specifically to probe this regime.
+
+\subsection{Success Conditions}
+\label{sec:design_success}
+
+Three design conditions had to be satisfied to begin meaningful exploration of theorem \ref{theorem}. The first two were theoretically imposed by the design law itself:
+
+\begin{itemize}
+    \item Attention had to remain performant as the number of available heads increased, so that added sparsity did not immediately destroy task performance.
+    \item Attention had to be executed in a repacked expert-choice formulation, ensuring that the average sequence length per expert decreased as routing sparsity increased.
+\end{itemize}
+
+The third condition was empirical rather than theoretical. In the autoregressive setting studied here, token importance is strongly localized, so a purely sparse routed layer risked prematurely discarding short-range structure. For this reason, attention in the decoder cell was executed as a hybrid
+\[
+H(x) = h_l(x) + h_s(x),
+\]
+where $h_l$ is a local sliding-window attention path preserving nearby-token behavior and $h_s$ is the sparse routed component responsible for realizing the theorem-conditioned tradeoff. The resulting hybrid layer is referred to as a \emph{Sparse Hybrid Token Routed Attention Mixture} (SHRAM) layer and is loaded with the MoSRAH sparse attention sublayer.
+
+\subsection{Mixture of Sparse Routed Attention Heads}
+\label{sec:design_mosrah}
+
+The \emph{Mixture of Sparse Routed Attention Heads} (MoSRAH), $h_s$, was defined specifically to satisfy the success conditions applied to the sparse routed component. Its novelty comes from pairing a mathematically TC-SRAM-compatible token-choice routing process with an expert-choice attention execution path that capitalizes computationally on the sparsity induced by routing. In this way, MoSRAH provides a concrete witness architecture in which the structural tradeoff predicted by theorem \ref{theorem} can be explored empirically.
+
+\subsection{Layer Structure}
+\label{sec:design_structure}
+
+Writing the routing process as $R$, the expert-choice packing map as $E$, the token-choice unpacking map as $E_*^{-1}$, and the Bottlenecked Ensemble Attention process as $G$, the MoSRAH forward pass is given by Algorithm \ref{alg:mosrah}.
+
+\begin{algorithm}[H]
+\caption{MoSRAH Forward Pass}
+\label{alg:mosrah}
+\begin{algorithmic}[1]
+\Require Input sequence $x \in \mathbb{R}^{B \times N \times d}$
+\State $(I, P) \gets R(x)$ \Comment{Token-choice routing}
+\State $\tilde{x} \gets E(x, I)$ \Comment{Pack into expert-choice form}
+\State $y \gets G(\tilde{x})$ \Comment{Attention over packed experts}
+\State $\tilde{y} \gets E_*^{-1}(y, I)$ \Comment{Restore token-choice ordering}
+\State $o \gets \sum_{k=1}^{K} \tilde{y}_k P_k$ \Comment{Weighted reduction}
+\State \Return $o$
+\end{algorithmic}
+\end{algorithm}
+
+Here $I \in \mathbb{Z}^{B \times N \times K}$ denotes the selected heads per token, $P \in \mathbb{R}^{B \times N \times K}$ the corresponding routing probabilities, $\tilde{x} \in \mathbb{R}^{B \times L \times T \times d}$ the packed expert-choice representation, and $\tilde{y} \in \mathbb{R}^{B \times N \times K \times d}$ the restored token-choice responses prior to reduction. Routing, expert-choice packing, and the Bottlenecked Ensemble Attention formulation are deferred to the Architecture Appendix, \ref{app:architecture}.
+
+This architecture was deliberately engineered such that the transition from the token-choice form at $x, I$ to the expert-choice form $\tilde{x}$ the expected reduction in average token length $\approx \frac{NK}{L}$ occurs as desired while well load-balanced.
+
+\subsection{RoPE}
+
+A few RoPE concerns were necessary to ensure the benefits from shortening attention lengths could actually be exploited. Rotary Positional Encoding can make attention between tokens represent semantically related tokens as remote in practice simply due to the distance between them. 
+
+To accommodate this, the RoPE in MoSRAH was designed to operate in one of two modes. Either it was fed the packed main sequence position, or it operated on the sequence position of the packed state. This allowed the same RoPE implementation to handle both cases. The RoPE formulation was adjusted for long-range extrapolation by YaRN. Exact details can be viewed in appendix \ref{app:rope}
+
+\section{Methodology}
+
+The hypothesis was explored by examining varying level of sparsity in the same base model and checking for evidence of more beneficial long-sequence asymptotic behavior. Almost all hyperparameter were identical across all variations, with only the number of total heads allowed to vary. 
+
+\subsection{Experimental Design}
+
+Theorem \ref{theorem} would be strongly supported if at the same performance level the spacing between predicted sequences lengths varied largely linearly with the number of parameters under isotoken conditions. Unfortunately, long range benchmarks such as RULER instead test the performance level at a given sequence length. To accommodate this, we instead fit power laws to the score then use the predicted sequence length at the given score and MoSRAH parameters to extrapolate supported sequence length at a single common performance level. 
+
+The last checkpoint of pretraining for each model at each seed and each size was examined using RULER at context lengths of of 4k, 8k, 16k, 32k, and 64k; this formed data triplets of sequence length, head parameters, and score. This was then fit per-model-size to the power $score = A*N^{k}+B$ where $N$ is the sequence length and A, k, B are coefficients of the fit. Following this, a range of scores were selected for analysis based on stability of fit,  their associated $N's$ predicted, and a quadratic fit of $N = a\Omega^2 + b\Omega + c$ was performed. Evidence was sought of a region with positive slope, with positive or negative curvature, within the first quadrant. This will be discussed more concretely in results.
+
+\subsection{Hyperparameter Tuning}
+
+The  hyperparameter that was tuned was whether to use the semantic or main sequence form of rope \footnote{In the semantic form of rope, positional encoding is configured to respond based on distance within a head, not main sequence position. In theory, this may allow semantically related but temporarially distant tokens to still attend}. We pretrained two models at the $r=0.5$ sparsity levels in the manner described in subsection \ref{methodology:hyperparameters} before the main pretraining runs ran. These tested the two variation, and the [variation] was selected for main usage. 
+
+No other form of tuning could be executed due to resource limitations\footnote{A pretraining budget of 80\$ is small}. Instead, the majority of the hyperparameters were chosen from the literature in terms of strong, common, stable defaults. Alongside this, whenever models at multiple scales needed to be compared the worst case configuration was always taken such that the larger models would be trained in the worse configuration \footnote{for instance the learning rate was always equal to the control value's rate, despite the fact that increasing the number of parameters in a MoE usually requires reducing the learning rate for optimal performance.} This was used to ensure any gain from the SRAM effect had to be real.
+
+\subsection{Model Hyperparameters}
+\label{methodology:hyperparameters}
+
+[DEVELOPMENT NOTE [STRIP BEFORE PUBLISHING]: Exact parameters may need to vary. The invariant is we have to have the control model somewhere in the 180M-220M range. Exceeding 220M will invalidate the kaplan pretraining numbers and should be considered very carefully before usage.]
+
+The SHRAM layer was located at every location an attention layer would be located in a Llama3 model. The sliding window attention mechanism used a total of 16 heads with head embedding width of 16 and a window size of 128. The MoSRAH layers also each chose $K=16$ heads at head embedding width of 16. The total number of MoSRAH heads were tested at amount of $L$ = 16, 32, and 64  for sparsity ratios of 1.0, 0.5, and 0.25 respectively. SHRAM was specified such that its subcomponents divided compute roughly equally between the local attention formulation and the long-range MoSRAH layers. 
+
+All models were trained at an embedding width of 512, with 12 total decoder layers. A vocabulary size of 50277 was utilized to correlate with the chosen GPT-X Neo BPE tokenizer. A prenorm architecture with RMSNorm was used between all major layers in the style of Llama3. SwiGLU layers were executed at hidden widths of 1366. \footnote{This is the standard $\mathrm{embedding\_width}*\frac{8/3}$ applied at 512}
+
+Dropout was not used, and all long-sequence extrapolation was done using RoPE formulations operating in YaRN extrapolation mode.
+
+\subsection{Pretraining}
+
+Pretrainined was executed on all models under torch Automatic Mixed Precision in hybrid float32/bfloat16 format at isotoken conditions. 
+
+Pretraining occurred using the FineWeb-Edu dataset at the seeds of 44, 45, and 46. \cite{penedo2024fineweb} A total of $\approx 655\mathrm{M}$ tokens were processed over the course of 5000 batches. \cite{kaplan2020scaling} \footnote{This exceeds the Kaplan recommendations applicable to the small-sized control model}. Due to the small model size no epochs needed to be repeated. 
+
+The AdamW optimizer was used for training at a learning rate of 6e-4 and betas of $\beta_1=0.9$ and $\beta_2 = 0.99$. Weight decay was set to a strength of  $1e-1$. Gradient clipping occurred at a value of 1.0. A cosine annealing schedule from 6e-4 to 6e-5 was used with a warmup period of 500 batches. \cite{radford2019language}. The main loss was cross-entropy configured for causal next-token-prediction in a teacher-forced configuration. The auxiliary loss for load balancing was weighed by 1e-2 before addition to the main loss following which backpropagation occurred. \cite{fedus2021switch}
+
+Checkpoints were taken at every 1000 batches. Evaluation loss, accuracy, perplexity, wall time delta, and the MaxVio\footnote{Consult appendix \ref{app:maxvio} for more details on this definition, or alternatively the original source at Wang\cite{wang2024auxiliarylossfree}} load balancing metric was taken every 200 batches. Due to the limited resources available anomaly recovery\footnote{Consult appendix \ref{app:anomaly_recovery} for a clear definition} was utilized to not waste any pretraining run. Any observation of a gradient norm above 1.5 resulted in a permanent halving of the effective learning rate. A MaxVio score exceeding 0.5 correspondingly permanently doubled the load balancing rate for the rest of training. This was [Used/Not Used]. 
+
+Training occurred on [Hardware] for [Time]. LLMs were used to code portions of the SHRAM model under strong correctness contracts and with continuous human monitoring and auditing, and all code is freely available for review. Consult appendix \ref{app:code} for details.
+
+
+\section{Results}
+\label{sec:results}
+
+[TODO]
+
+\section{Discussion}
+\label{sec:discussion}
+
+[TODO]
+
+\section{Limitations}
+
+[TODO]
+
+\section{Conclusions}
+
+[TODO]
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\appendix
+
+
+\section{Theorem Justification}
+\label{app:proof}
+
+We wish to justify theorem \ref{theorem}. Theorem \ref{theorem} is a scientific theorem intended to apply to a specific class of models. Such theorem have two primary responsibilities that must be satisfied to become useful. 
+
+\begin{itemize}
+    \item \textbf{Deductive closure inside a formal model}: Based on formal assumptions the conclusions follow logically without error. This ensures a theorem is true.
+    \item \textbf{Justification of the Assumptions}: There is reason to believe the assumptions are true in the world, so the conclusion follows. This ensures a theorem is useful.
+\end{itemize}
+
+Both conditions must be satisfied for this theorem to be both true and useful.
+ 
+\subsection{Necessary Definitions}
+
+We begin our formal derivation with definitions
+
+Let a control model $A$ exist with $L=K$, and a corresponding test model $A'$ in which $L\ge K$ is allowed to vary while the number of selected heads per token remains fixed at $K$; all other hyperparameter remain isomorphic. Under load balancing, a sequence of length $N$ presented to the test construction assigns on average
+
+\begin{equation}
+\frac{NK}{L}
+\end{equation}
+
+tokens to each active head. Since this sequence is attended to the architectural effect of increasing $L$ at fixed $K$ is therefore not denser attention per token, but a smaller effective discrimination burden per active head.
+
+Let the average long-sequence task penalty of the test construction be modeled as a function of two contributions: the \emph{average}\footnote{More formally, this would be a function representing the expected burden of all sequences of length n} burden of discriminating over the effective set seen by each active head, and the additional average distortion introduced by routed implementation. Writing these as $f$ and $g$ respectively, we may express the task penalty at sequence length $N$ as
+
+\begin{equation}
+P(N;L,K)=f(\frac{NK}{L})+g(N;L,K).
+\end{equation}
+
+
+For a fixed task target $\tau$, define $N_\tau(L,K)$ to be the largest sequence length whose average task penalty does not exceed $\tau$. We note before proceeding that given a control formulation $A$ processing a sequence of length $M$, and test a test form length $N$ the performance of $A'$ exceeds $A$ precisely when
+
+\begin{equation}
+\label{beneficial}
+f(\frac{NK}{L})+g(N;L,K) \leq f(M)+g(M;K,K)
+\end{equation}
+
+\subsection{Idealized Penalty Comparison Under Load-Balanced Routing}
+
+To proceed, we must establish a linear relationship between the quantities under consideration which can be used to recover the stated theorem. Presume for the moment the adoption of an \emph{rewarding routing penalty} in which it is the case that $g(N;L,K) \leq g(M;K,K)$. If this condition is satisfied then inequality \ref{beneficial} can be weakened to form the relationship.
+
+\begin{equation}
+\label{weakened_inequality}
+f(NK/L) \leq f(M)
+\end{equation}
+
+It is empirically known the penalty with sequence length when using attention is strictly monotonically increasing. We define that $f$ absorbs this behavior, as it was assigned to be the attention penalty. Since $f$ is strictly monotonically increasing this implies equation \ref{weakened_inequality} is satisfied for all $L \geq K$ when $M=N$; this means it is always beneficial to take the test version at the same sequence lengths under the rewarding routing penalty assumption. This does not, however, establish the needed linear relationship.
+
+To accomplish this, we examine the relationship between $N$ and $M$ as we drive equation \ref{weakened_inequality} under the premise it is at equality. From the guarantee of strict monotonic increase we note this immediately implies that $\frac{NK}{L} = M$. Rearranging we are able to now assert a relationship on sequence length on how much longer a test sequence $N$ can be then a control sequence $M$ can be while having at least the same performance as $M$
+
+\begin{equation}
+\label{boundary}
+N = \frac{ML}{K}
+\end{equation}
+
+Letting $\tau$ again represent an idealized performance target, and letting the value of $M$ be defined by it as $M=a_\tau$, we  now arrive at the core equality driving the bounds of theorem \ref{theorem}.  
+
+\begin{equation}
+\label{driver}
+N_\tau(K, L) =  a_\tau \frac{L}{K}
+\end{equation}
+
+Returning again to equation \ref{weakened_inequality}, we note to produce this equation we weakened inequality \ref{beneficial} under the assumption $g(N;L,K) \leq g(M;K,K)$. Retaining the rewarding routing penalty assumption, we return again to equation \ref{driver} and consider what would have happened if we had not weakened \ref{weakened_inequality}. If we had not done so, then the reward from the extra parameters in $g(N;L,K)$ may have allowed $N$ to become even larger before equivalence was reached. Therefore, once again strengthening \ref{weakened_inequality} while retaining the idealized penalty assumption must result in a minimum supported sequence length that is greater than or equal to our bounds.
+
+\begin{equation}
+\label{bounding_condition}
+N_\tau(K, L) \geq  a_\tau \frac{L}{K} + b_\tau
+\end{equation}
+
+An additional term $b_\tau \leq 0$ is included to take up any error in the approximation as well producing the conservative inequality. The minor substitution $\Omega = Lk$, combined with a rename of $k*a_\tau=d_\tau$, then largely completes the recovery of theorem \ref{theorem}, with the notable exception of the bounds. We now proceed to justify empirical relevance of the theory and recover the last remaining portion of the theorem: the boundary $1>\frac{K}{L}>r$
+
+This concludes the fully formal portions of the justification.
+
+\subsection{Empirical Justification of Routing Penalty Behavior}
+
+For a scientific, as opposed to mathematical, theorem to be useful it must be justifiable that the theorem has a corrolation with the world and thus predictions formed with it are valid. We thus introduce the following  empirically justified axioms, and will shortly discuss their justification.
+
+\begin{enumerate}
+    \item $g(N;L,K) \leq g(M;K,K) \quad L \approx K \quad L > K$
+    \item $g(N;L,K) > g(M;K,K) \quad L >> K $
+\end{enumerate}
+
+Attention in it's dense formulation is known both empirically and theoretically to reduce the average connectivity per token with increasing sequence length, a fact that emerges directly from the assignment of a finite amount of probability to an increasing number of tokens. \footnote{More specifically, in its standard formulations attention assigns a probability distribution over all $N$ tokens in the sequence. As $N$ increases, this assignment of focus necessarily becomes increasingly sparse on average}. This is empirically known to ensure the computational is increasing 'sparse' and unfocused with increasing length, with many degrees of freedom as sequence length increases \citep{vasylenko2026longcontextgeneralizationsparseattention}.
+
+In the long-sequence regime attention computation is highly sparse with many degrees of freedom to work with. Let $L \approx K$ with $L$ slightly greater than $K$. Any TC-SRAM model however adds parameters at the same time it adds sparseness, and added parameters add capacity. As attention is already computationally sparse even when executed densely forcing attention to become more sparse simply removes degrees of freedom the model was not using, ensuring there is minimal routing penalty from forcing attention sparseness and a large reward from attending with more parameters. It follows that in this extrema
+
+\begin{equation}
+\label{equation:lower_bound}
+g(N;L,K) \leq g(M;K,K) \quad L \approx K \quad L > K  
+\end{equation}
+
+However, this behavior provably reverses. We continue to presume perfect load balancing. As $L$ grows far beyond $K$, the space of easily separable computations is exhausted and routing begins to fragment; in the extreme of infinite heads, every token is assigned to its own head and no meaningful attention occurs at all. These facts imply that there is a regime in which the relationship has reversed at large enough $L$
+
+\begin{equation}
+\label{equation:upper_bound}
+g(N;L,K) > g(M;K,K) \quad L >> K  
+\end{equation}
+
+Presuming that $g$ is continuous\footnote{Full formalization of continuity is omitted, but discontinuity here would itself amount to an implausible empirical claim about an analogue process} by the observations, it follows using equations \ref{equation:lower_bound} and \ref{equation:upper_bound} that there exists at least one bounded region in which the rewarding routing penalty assumption holds. 
+
+\begin{equation}
+g(N;L,K) \leq g(M;K,K)
+\qquad\text{for some } 1 > \frac{K}{L} > r.
+\end{equation}
+
+This condition may now be plugged into equation \ref{bounding_condition} applying a bounds to it which then completes 
+the derivation of theorem \ref{theorem}. 
+
+\subsection{Usefulness of Theorem}
+
+The existence of a nontrivial large regime of tradeoff in $r$ is not, however, guaranteed at this point. Such a guarantee cannot be made, however, at theorem strength for all models of a TC-SRAM type.
+
+Instead, we can at best use empirical observations -- such as Gupta et al's findings -- to suggest that given the enormous capacity for top-k compression of the attention process there is enough redundant capacity with proper design layers that can exploit the SRAM effect may be possible to create.  \cite{gupta-etal-2021-memory}
+
+Further work thus must be executed empirically in search of such models. Completing this search forms the empirical core of the main paper.
+
+\section{Architecture Details}
+\label{app:architecture}
+
+This appendix records the concrete architectural realization of the SHRAM layer and its sparse routed component, MoSRAH. The local component $h_l$ is standard causal sliding-window attention, so the remaining subsections focus on the sparse routed component $h_s$ and the routing, packing, and Bottlenecked Ensemble Attention (BEA) processes that implement it.
+
+\subsection{Transformer Structure}
+\label{app:transformer_structure}
+
+The broader transformer architecture was intentionally kept boring and close to existing decoder-only practice. At a high level, we followed a LLaMA-style pre-norm decoder stack, replacing the standard self-attention node with the SHRAM layer described in the main text. Token embeddings were applied at the input boundary, a final normalization was applied before the output head, and next-token logits were then predicted in the usual autoregressive fashion.
+
+Each decoder block used the standard pre-norm residual structure. Given hidden state $x$, the block first applies RMSNorm, then the SHRAM attention node, and adds the resulting residual. A second RMSNorm is then applied, followed by a standard two-layer feedforward network, after which the second residual connection is added. In other words, if $\mathcal{H}$ denotes the SHRAM attention layer and $\mathcal{F}$ the feedforward network, the block computes
+\[
+x' = x + \mathcal{H}(\mathrm{RMSNorm}(x)),
+\qquad
+x'' = x' + \mathcal{F}(\mathrm{RMSNorm}(x')).
+\]
+
+No additional architectural novelties were introduced at the transformer level. The intent was to keep the surrounding model well-understood so that the primary experimental variable remained the substitution of the SHRAM attention node for a standard attention mechanism.
+
+\subsubsection{Local Attention Specification}
+\label{app:local_attention}
+
+The local attention component $h_l$ of SHRAM was implemented using FlashAttention in its causal local-window mode. This was intentionally delegated to the library so that masking, causal restriction, and window handling were inherited from a well-tested implementation rather than re-specified manually. The local path therefore functions as a standard sliding-window causal attention operator, with the sparse routed component $h_s$ providing the long-range theorem-facing path.
+
+\subsubsection{Tokenizer and Vocabulary}
+\label{app:tokenizer}
+
+To keep the experimental models small and operationally straightforward, tokenization was based on the GPT-NeoX tokenizer family rather than the full LLaMA tokenizer stack. The vocabulary size was correspondingly reduced to approximately $50{,}000$ tokens. This choice was made for practical small-model experimentation and does not otherwise alter the architectural role of SHRAM within the decoder.
+
+
+\subsection{Routing and Load Balancing}
+\label{app:load_balancing}
+
+Routing and load balancing were intentionally kept boring, in order to keep them predictable and well understood. Routing itself remained a standard logit-based, softmax-then-normalize, Top-$K$ selection process that has been used successfully before in GShard and Switch Transformer \cite{lepikhin2020gshard, fedus2021switch}
+
+Load balancing, however, was executed using the DeepSeek auxiliary-loss-free biasing strategy \cite{wang2024auxiliarylossfree} for additional reliability given the needs of theorem \ref{theorem}. The same underlying imbalance control signal and error definition were retained, but the update was reformulated so that the corresponding bias correction was applied through the main AdamW optimizer rather than through a standalone post-batch SGD update.
+
+\subsubsection{Routing}
+
+Routing was performed using a logit-based projection that introduced additional capacity with additional heads. If the weights of the routing projection are defined as $W_r \in \mathbb{R}^{d \times L}$, then for input $x \in \mathbb{R}^{B \times N \times d}$ the routing sequence first produces dense routing activations
+\[
+R = \mathrm{Softmax}(xW_r, dim=L),
+\]
+with $R \in \mathbb{R}^{B \times N \times L}$.
+
+To support auxiliary-loss-free load balancing, a learned expert-bias term $b \in \mathbb{R}^{L}$ is maintained and applied only to the routing scores used for Top-$K$ selection. Writing the biased routing activations as
+\[
+\hat{R} = \mathrm{Softmax}(xW_r + b, dim=L),
+\]
+the routing sparsification is then performed by the usage of the Top-$K$ operator on $\hat{R}$ to select the top $K$ candidates.\footnote{It should be emphasized that the head embedding widths $h=d/K$ are usually quite small and thus the number of experts chosen fairly large; this contrasts with most MoEs.}
+
+\[
+\mathrm{TopK}(\hat{R}) = I,
+\]
+
+with $I \in \mathbb{Z}^{B \times N \times K}$. The final assigned routing probabilities for reduction are, however, still taken from the original unbiased router output $R$. Writing the selected unbiased routing masses as
+\[
+V = \mathrm{Gather}(R, index=I, dim=L),
+\]
+the assigned routing probabilities for reduction are then defined as
+\[
+P = \frac{V}{\sum_{k=1}^{K} V_k},
+\]
+so that $P \in \mathbb{R}^{B \times N \times K}$.
+
+This sequence of operations produces the assigned routing probabilities $P$ and the routing indices $I$. The bias term $b$ therefore affects which heads are selected, but does not affect the final normalized routing probabilities once those heads have been chosen.
+
+\subsubsection{Load Balancing}
+
+The realized routing frequency of head $l$ is computed from the selected routing indices by scattering $I$ into a Boolean assignment mask $M \in \mathbb{B}^{B \times N \times L}$, where $M_{b,n,l}=1$ exactly when token $n$ in batch $b$ selected head $l$. Since each token selects $K$ heads, the normalized routing frequency is then
+\[
+f_l = \frac{1}{BNK} \sum_{b=1}^{B} \sum_{n=1}^{N} M_{b,n,l}.
+\]
+
+Under perfect load balancing, the ideal routing frequency is $1/L$ for every head. The corresponding imbalance signal is therefore
+\[
+e_l = f_l - \frac{1}{L}.
+\]
+
+Following Wang et al. \cite{wang2024auxiliarylossfree}, the required bias-correction direction is the sign of this error. In the notation of the present paper, the required balancing response is therefore \footnote{Interestingly, It should be noted Wang's mathematical construction is incorrect as stated.  Wang's formulation only works if one is generating gradients that are responded to by gradient descent, due to the additional (-1) applied before performing updates with a SGD formulation. The prose description, however, contains no such error.}
+\[
+\Delta b_l \propto \mathrm{sign}\!\left(f_l - \frac{1}{L}\right).
+\]
+
+\subsubsection{Implementation Concerns}
+
+We decided the implementation must satisfy two primary invariants:
+\begin{itemize}
+    \item it must behave like a normal auxiliary loss under scaling, such that most existing MoE systems are compatible
+    \item It must nonetheless implement DeepSeek-based load balancing as much as possible.
+\end{itemize}
+
+To satisfy this simultaneously a reformulation of DeepSeek load balancing was used. We defined a function with custom gradients that would connect any scaling of an emitted loss from the operator to a scaling of an error gradient defined in the manner of DeepSeek. The framework operator itself is defined as $\mathcal{L}_{\mathrm{load\_balance}}=H(b, f_l)$. $L$ could be inferred from the width of the tensor. The load balancing loss was directly defined as.
+
+\[
+\mathcal{L}_{\mathrm{load\_balance}} = H(b, f) = \sum_{l=1}^{L} \left| f_l - \frac{1}{L} \right|.
+\]
+
+The inclusion of $b$ as part of the definition of the forward operation ensures that graph-based gradient frameworks such as PyTorch and TensorFlow correctly remember that this operator will have gradients. The backwards pass $ H_{backward}(L_{grad})$ was then subsequently defined as
+
+\[
+\Delta b = H_{backward}(L_{grad}) = L_{grad} * \mathrm{sign}(f_l -1/L)
+\]
+
+Any rescaling of losses will show up when the beginning gradient state of a 1.0 scalar is rescaled in $L_{grad}$, providing this necessary property. Operationally, this means the balancing operator consumes the current expert biases together with the realized routing frequencies, emits the above control gradients during training, and then allows the main AdamW optimizer to apply the corresponding update. It allowed the retention of the Switch Transformer standard auxiliary loss to continue to influence training despite the differences to the underlying balancing processes. 
+
+\subsection{Expert Packing and Unpacking Tensor Implementation}
+\label{app:expert_packing}
+
+The central problem of expert packing and unpacking is representational. Routing produces a \emph{token-choice} representation: for each token, the routing tensor $I \in \mathbb{Z}^{B \times N \times K}$ stores the $K$ heads selected for that token. Expert execution instead requires an \emph{expert-choice} representation: for each head, all routed tokens assigned to that head must be placed contiguously. Expert packing is therefore the process of converting the routed selections in $I$ from token-choice order into expert-choice order, while expert unpacking is the reverse process which restores token-choice order after attention has completed.
+
+The core invariant maintained by expert-choice packing and token-choice unpacking is that routed token copies are assigned to the heads that selected them. For a fixed batch $b$ and head $h$, let the routed token copies assigned to head $h$ be indexed as $((n_1,k_1), \dots, (n_T,k_T))$. Then
+
+\[
+I_{b,n_i,k_i}=h \qquad \text{for } i=1,\dots,T,
+\]
+\[
+\tilde{x}_{b,h,i,d}=x_{b,n_i,d},
+\qquad
+\tilde{y}_{b,n_i,k_i,d}=y_{b,h,i,d}.
+\]
+
+This formulation maintains causal ordering so long as the sequence dimension $N$ was originally causally ordered.
+
+There are a number of valid approaches. The approach chosen in our implementation was designed to minimize memory instantiation and flops, and operates by reordering the underlying data-buffers in the tensor. Specifically, indexing tensors $\Pi \in \mathbb{Z}^{B \times NK}$ and its inverse $\Pi^{-1} \in \mathbb{Z}^{B \times NK}$ are constructed that can rearrange our underlying buffers into respectively a (batch, head, token) or (batch, token, chosen\_heads) order, providing capacity to map into and out of expert-choice mode. This auxiliary information is then used to perform the mappings themselves by reordering the underlying databuffers. The same construction with auxiliary information also produces the original token positions expressed within the expert-choice frame, which is required for positional treatments such as RoPE.
+
+\subsubsection{Setup}
+
+The token embeddings $x \in \mathbb{R}^{B \times N \times d}$ need a map capable of converting between a head-major and token-major ordering. Fortunately, $I \in \mathbb{Z}^{B \times N \times K}$ already contains exactly the necessary information. We first flatten along $N, K$ in order to produce a combined token, head ordering which can be rearranged.
+
+\[
+H = \mathrm{Reshape}(I) \in \mathbb{Z}^{B \times NK}.
+\]
+
+At this moment, the flattened databuffer is still in a (batch, token, chosen head) ordering. However, the data inside $H$ are all indices specifying which head was desired within a given token. As a result, it is possible to simply sort using this as a key to learn how to resort such a buffer into a (batch, head, tokens) order.\footnote{Note that it is very important stable sort is used in order to maintain causality.}
+
+\[
+\Pi = \mathrm{StableArgsort}(H) \in \mathbb{Z}^{B \times NK}
+\qquad
+\Pi^{-1} = \mathrm{Argsort}(\Pi) \in \mathbb{Z}^{B \times NK}.
+\]
+
+All of $H$, $\Pi$, and $\Pi^{-1}$ are required auxiliary data for the downstream processes.
+
+\subsubsection{Expert Packing}
+
+Expert packing needs to fulfill two primary dependencies. It needs to produce a packed object $x' \in \mathbb{R}^{B \times L \times T \times d}$, corresponding to the expert-choice tensor $\tilde{x}$ in the main text, with the quirk that this may require extra padding. It must also produce a positional encoding tensor $J \in \mathbb{Z}^{B \times L \times T}$, which is required for the operation of RoPE. An additional auxiliary dependency is to provide any tensors which will be useful during unpacking later.
+
+We first form the token-position object $U$ from an $\mathrm{arange}(N)$ which is then expanded across $B$ and $K$ into a view of $U \in \mathbb{Z}^{B \times N \times K}$. The routed head assignments from $I$ and the routed token positions from $U$ are then flattened, preserving the original router order.
+
+\[
+Z = \mathrm{Reshape}(U) \in \mathbb{Z}^{B \times NK}.
+\]
+
+We then reorder this into the positional order of the tokens once they are packed. This will also shortly provide the basis of the positional encoding representation for RoPE. We can then also immediately extract the necessary embeddings in sorted order as $\tilde{x} \in \mathbb{R}^{B \times NK \times d}$
+
+\[
+\tilde{Z} = \mathrm{Gather}(Z, index=\Pi, dim=NK),
+\]
+\[
+\tilde{x} = \mathrm{Gather}(x, index=\tilde{Z}, dim=N).
+\]
+
+To handle the padding, we will use a mask to insert the extracted data with advanced indexing into zero-filled tensors for the position tensor $J$ and the embeddings $x'$. We first must know the number of nonzero tokens per expert and the maximum number of nonzero tokens. We discover this by counting the number of times a given head was selected per batch, $S \in \mathbb{Z}^{B \times L}$, then selecting the maximum required sequence length, $T \in \mathbb{Z}$.\footnote{Technically full vectorization requires using some striding manipulations since \texttt{bincount} in torch can only count 1d vectors. See the codebase for function \texttt{bincount\_multidimensional} for details on repacking strides so the batch dimension can be flattened too. One could also just use a \texttt{for} loop over the batch dimension if desired.}
+
+\[
+S = \mathrm{BinCount}(H, dim=NK, num\_bins=L)
+\qquad
+T = \mathrm{Maximum}(S).
+\]
+
+This allows the allocation of the necessary output buffers $x'$ and $J$.
+
+\[
+x' \in \mathbb{R}^{B \times L \times T \times d}
+\]
+\[
+J \in \mathbb{Z}^{B \times L \times T}
+\]
+
+What remains to be formed is the mask to perform the transfer. We first define $A_{b,l,t} \in \mathbb{Z}^{B \times L \times T}$ as $A_t=t$.\footnote{This should be implemented as a \texttt{torch.arange(0, T)}, followed by a memory-efficient \texttt{.expand} for broadcasting.} This is then used to generate the transfer mask $M \in (0,1)^{B \times L \times T}$ by selecting the entries that are less than the sequence length for that batch.
+
+\[
+M_{b,l,t} = A_t < S_{b,l}.
+\]
+
+This now has exactly $B \times N \times K$ true entries, and active tokens are left-justified; it is in essence the active token mask. However, it is not directly compatible with $\tilde{x}$ and $\tilde{Z}$. These two tensors are of shape $(B, N \times K, d)$ and $(B, N \times K)$ respectively. As such a small additional reshape is necessary.\footnote{This can safely be executed as a view for memory efficiency.}
+
+\[
+\tilde{Z}' = \mathrm{Reshape}(\tilde{Z}) \in \mathbb{Z}^{B* N * K},
+\qquad
+\tilde{x}' = \mathrm{Reshape}(\tilde{x}) \in \mathbb{R}^{B * N * K \times d}.
+\]
+
+which finally allows a like-to-like insert into the output buffers using advanced indexing
+
+\[
+x'[M] = \tilde{x}',
+\qquad
+J[M] = \tilde{Z}'.
+\]
+
+The output of this packing functionality are $x'$, $J$, and $M$, with $M$ being required for unpacking later. Notably, $M$ could also easily be adapted in other noncausal models to provide masking.
+
+\subsubsection{Expert Unpacking}
+
+Unpacking is a fairly straightforward process of running the inverse of the packing process using the stored context tensors. We begin with $y \in \mathbb{R}^{B \times L \times T \times d}$. We can extract the relevant subset of tokens $D \in \mathbb{R}^{BNK \times d}$ using the mask $M$
+
+\[
+D = y[M].
+\]
+
+We then recover the shape used by $\Pi$ and $\Pi^{-1}$ by reshaping to include a batch dimension
+
+\[
+\tilde{D} = \mathrm{Reshape}(D) \in \mathbb{R}^{B \times NK \times d}.
+\]
+
+This is still, however, in expert-choice ordering; it is currently represented as a flat tensor of active tokens in first $L$ then raggedly $T$. To fix this, an inverse permutation is needed to reach the original ordering. We thus apply the inverse permutation $\Pi^{-1}$ to reorder the underlying content into the needed token-choice ordering.
+
+\[
+\tilde{D}' = \mathrm{Gather}(\tilde{D}, index=\Pi^{-1}, dim=NK).
+\]
+
+At which point a simple reshape produces the unpacked tensor
+
+\[
+\tilde{y} = \mathrm{Reshape}(\tilde{D}') \in \mathbb{R}^{B \times N \times K \times d}.
+\]
+
+\subsection{Bottlenecked Ensemble Attention}
+\label{app:bea}
+
+The Bottlenecked Ensemble Attention (BEA) process is the concrete attention operator applied to the packed expert-choice tensor. It is a mathematically equivalent reformulation of the Vaswani process that is particularly distributable and well-suited for this kind of manipulation. Its primary tradeoff is that, in exchange for this explicit ensemble structure, it requires additional memory to hold headed encodings.\footnote{In a Vaswani formulation, $x$ would be replicated across $L$ heads, independently projected into bottlenecked headed representations, attended within those reduced spaces, projected back to width $d$, and then summed across heads. BEA makes this ensemble structure explicit.}
+
+
+Let $u$ be the headed bottleneck width such that $u=d/K$, and let $\hat{x}$ be $x'$ permuted into $\hat{x} \in \mathbb{R}^{B \times T \times L \times d}$. The query, key, and value projections are then defined by
+\[
+W_Q \in \mathbb{R}^{L \times d \times u}
+\qquad
+W_K \in \mathbb{R}^{L \times d \times u}
+\qquad
+W_V \in \mathbb{R}^{L \times d \times u}
+\]
+\[
+Q' = \hat{x} W_Q
+\qquad
+K' = \hat{x} W_K
+\qquad
+V' = \hat{x} W_V
+\]
+with $Q', K', V' \in \mathbb{R}^{B \times T \times L \times u}$. Permuting back into standard head-major attention layout then gives
+\[
+Q, K, V \in \mathbb{R}^{B \times L \times T \times u}.
+\]
+
+Attention then proceeds as usual, with RoPE consuming the headed queries, keys, and packed position indicator $J$,
+\[
+(\tilde{Q}, \tilde{K}) = \mathrm{RoPE}(Q, K, J),
+\]
+\[
+Z = \mathrm{Softmax}\!\left(\frac{\tilde{Q}\tilde{K}^{\top}}{\sqrt{u}}\right)V.
+\]
+
+The attended bottleneck responses are then projected back to model width by
+\[
+W_O \in \mathbb{R}^{L \times u \times d},
+\qquad
+y = Z W_O,
+\]
+so that $y \in \mathbb{R}^{B \times L \times T \times d}$. This then completes the BEA attention process, which has now attended each head with separate parameters and arrived at the finishing condition consumed by expert unpacking.
+
+Notice that since $Q$, $K$, and $V$ are standard batched headed tensors, fast attention implementations such as FlashAttention remain fully compatible and the body of existing attention literature and techniques remain largely compatible. Causality is maintained sufficiently using a standard triangular mask. However, this formulation is in theory extremely distributable: both $x'$ and the BEA could have been sliced across the head dimension to distribute across multiple devices in a manner analogous to mixture of experts.
+
+\subsection{RoPE Treatment}
+\label{app:rope}
+
+\subsubsection{Theory Concerns}
+
+A few RoPE concerns were necessary to ensure the benefits from shortening attention lengths could actually be exploited. Rotary Positional Encoding can make attention between tokens represent semantically related tokens as remote in practice simply due to the distance between them. Since MoSRAH explicitly attempts to shorten effective attention distance by packing routed tokens into expert-local subsequences, the positional treatment needed to avoid obscuring that shortened structure.
+
+For this reason, the RoPE operator in the present work was treated as an externally fed primitive with interface
+\[
+(\tilde{Q}, \tilde{K}, A_{\mathrm{rope}})=\mathrm{RoPE}(Q,K,P),
+\]
+where $Q,K$ are the headed query and key tensors, $P$ is a supplied position tensor, and $A_{\mathrm{rope}}$ is an attention scaling consumed by the parent attention layer. The choice of $P$ occurred at the calling layer, not inside RoPE itself.
+
+Two position tensors were permitted. In \emph{main-sequence mode}, RoPE was fed the packed original-token position tensor
+\[
+P = J \in \mathbb{Z}^{B \times L \times T},
+\]
+where $J_{b,l,t}$ records the original causal sequence position of the token occupying packed slot $(b,l,t)$. In \emph{semantic-sequence mode}, RoPE was instead fed a synthetically recreated local position tensor
+\[
+P = S \in \mathbb{Z}^{B \times L \times T},
+\qquad
+S_{b,l,t}=t.
+\]
+Thus the same RoPE implementation could be used in both modes. Only the supplied position tensor differed.
+
+Under standard RoPE, the returned attention scale was $A_{\mathrm{rope}}=1$. Under YaRN, the same operator contract was retained, but the internal position-to-phase map was modified and a nontrivial attention scaling $A_{\mathrm{rope}}$ was returned.
+
+\subsubsection{RoPE Mechanics}
+
+Let the headed embedding width be $u$, assumed even, and let
+\[
+Q,K \in \mathbb{R}^{B \times L \times T \times u},
+\qquad
+P \in \mathbb{Z}^{B \times L \times T}.
+\]
+Let the base RoPE frequencies be
+\[
+\theta_d = b^{-2d/u},
+\qquad
+d=0,\dots,\frac{u}{2}-1,
+\]
+with $b=10000$ in the standard formulation.
+
+For a scalar position $p$, define the block-diagonal rotary operator
+\[
+R_{\Theta,p}^{u}
+=
+\bigoplus_{d=0}^{u/2-1}
+\begin{bmatrix}
+\cos(p\theta_d) & -\sin(p\theta_d) \\
+\sin(p\theta_d) & \cos(p\theta_d)
+\end{bmatrix}.
+\]
+RoPE then acts elementwise over the packed tensor coordinates as
+\[
+\tilde{Q}_{b,l,t} = R_{\Theta,P_{b,l,t}}^{u} Q_{b,l,t},
+\qquad
+\tilde{K}_{b,l,t} = R_{\Theta,P_{b,l,t}}^{u} K_{b,l,t},
+\]
+and returns
+\[
+A_{\mathrm{rope}}=1.
+\]
+
+The parent attention layer then consumes the return values as
+\[
+Z = \mathrm{Softmax}\!\left(
+A_{\mathrm{rope}}\frac{\tilde{Q}\tilde{K}^{\top}}{\sqrt{u}}
+\right)V.
+\]
+
+\subsubsection{YaRN Extension}
+
+For long-range extrapolation, the RoPE operator was extended by YaRN \cite{peng2024yarn}. This preserved the external interface
+\[
+(\tilde{Q}, \tilde{K}, A_{\mathrm{rope}})=\mathrm{RoPE}(Q,K,P),
+\]
+but altered the internal frequency schedule and the returned attention scaling. Crucially, the supplied position tensor $P$ was not itself transformed.
+
+Let $C_{\mathrm{train}}$ denote the original pretraining context length, let $C_{\mathrm{target}}$ denote the desired extrapolated context length, and define the extension scale
+\[
+s=\frac{C_{\mathrm{target}}}{C_{\mathrm{train}}}.
+\]
+Following YaRN, define
+\[
+r(d)=\frac{C_{\mathrm{train}}\theta_d}{2\pi},
+\]
+and the ramp function
+\[
+\gamma(r)=
+\begin{cases}
+0, & r<\alpha,\\[4pt]
+1, & r>\beta,\\[4pt]
+\dfrac{r-\alpha}{\beta-\alpha}, & \text{otherwise}.
+\end{cases}
+\]
+The YaRN-adjusted rotary frequencies are then
+\[
+\theta_d'
+=
+\left(1-\gamma(r(d))\right)\frac{\theta_d}{s}
++
+\gamma(r(d))\theta_d.
+\]
+
+Thus low-frequency dimensions are interpolated by the scale $s$, high-frequency dimensions are left unchanged, and the two regimes are linearly blended in between. For the LLaMA family, YaRN recommends
+\[
+\alpha = 1,
+\qquad
+\beta = 32.
+\]
+
+Under YaRN, the rotary operator is therefore computed using $\theta_d'$ in place of $\theta_d$:
+\[
+R_{\Theta',p}^{u}
+=
+\bigoplus_{d=0}^{u/2-1}
+\begin{bmatrix}
+\cos(p\theta_d') & -\sin(p\theta_d') \\
+\sin(p\theta_d') & \cos(p\theta_d')
+\end{bmatrix},
+\]
+so that
+\[
+\tilde{Q}_{b,l,t} = R_{\Theta',P_{b,l,t}}^{u} Q_{b,l,t},
+\qquad
+\tilde{K}_{b,l,t} = R_{\Theta',P_{b,l,t}}^{u} K_{b,l,t}.
+\]
+
+In addition to the modified frequency schedule, YaRN returns a nontrivial attention scaling. Writing attention in the form
+\[
+Z = \mathrm{Softmax}\!\left(
+A_{\mathrm{rope}}\frac{\tilde{Q}\tilde{K}^{\top}}{\sqrt{u}}
+\right)V,
+\]
+YaRN sets
+\[
+A_{\mathrm{rope}}=\frac{1}{t},
+\qquad
+\sqrt{\frac{1}{t}} = 0.1\ln(s)+1.
+\]
+Equivalently,
+\[
+A_{\mathrm{rope}}=\left(0.1\ln(s)+1\right)^2.
+\]
+
+When $s=1$, the YaRN extension reduces to the standard RoPE case, so that $\theta_d'=\theta_d$ and $A_{\mathrm{rope}}=1$.
+
+\section{Training Details}
+
+\subsection{Anomaly Recovery}
+\label{app:anomaly_recovery}
+
+Anomaly recovery is a process of automatically recovering a pretraining run that has become unstable by means of automatically monitoring metrics and choosing more conservative values when training exceeds degradation thresholds. Two forms were used.
+
+\begin{itemize}
+    \item \textbf{Load Balance Recovery}: If the MaxVio score (see \ref{app:maxvio}) rose above 0.5 it was an indication of excessively weak load balancing. The load balancing weight would then become permanently doubled.
+    \item \textbf{Instability Recovery}: If the gradient norms ever exceeded 1.5x the clip threshold, the learning rate was permanently halved. 
+\end{itemize}
+
+In practice, both changes are actually implemented by scaling the loss before use. The load balancing loss could be doubled to perform load balance recovery, while halving the training loss before use is equivalent to halving the learning rate without requiring any sort of scheduling or optimizer adjustments.
+
+\subsection{MaxVio}
+\label{app:maxvio}
+
+Following Wang et al. \cite{wang2024auxiliarylossfree}, we used MaxVio as a scalar summary of routing imbalance. In the notation of the present paper, the realized routing frequency of head $l$ is $f_l$. Perfect load balancing would assign each head a frequency of $\frac{1}{L}$. MaxVio is then defined as the maximum relative overload of any head compared to this ideal balanced frequency.
+
+\[
+\mathrm{MaxVio}
+=
+\max_l
+\frac{f_l - \frac{1}{L}}{\frac{1}{L}}
+=
+L \max_l \left( f_l - \frac{1}{L} \right).
+\]
+
+Thus $\mathrm{MaxVio}=0$ corresponds to perfect load balancing, while larger positive values indicate that at least one head is receiving substantially more traffic than the balanced target. For example, a value of $0.5$ indicates that the most overloaded head received $50\%$ more routed tokens than ideal. In training, this quantity was evaluated at the batch level using the batch-realized routing frequencies $f_l$ for the current routing step. It was also monitored for anomaly recovery. 
+
+\end{document}

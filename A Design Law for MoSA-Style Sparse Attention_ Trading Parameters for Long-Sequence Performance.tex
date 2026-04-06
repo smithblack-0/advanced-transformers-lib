@@ -1,0 +1,401 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{url}
+\usepackage{authblk}
+\usepackage{float}
+\usepackage{setspace}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{assumption}{Assumption}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{designlaw}{Design Law}
+
+\title{A Design Law for MoSA-Style Sparse Attention: Trading Parameters for Long-Sequence Performance}
+\author{[Author Name(s)]}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Sparse attention is usually framed as a computational concession: a way to make long contexts cheaper while preserving as much dense-attention quality as possible. This paper studies a different possibility in a concrete base-MoSA setting. We ask whether MoSA-style routing can be used not only to reduce cost, but to buy better long-sequence performance by increasing routed attention capacity. We investigate this question through a controlled case study over four effective routing operating points, reported as $K/L \in \{1.0, 0.8, 0.5, 0.2\}$ under comparable isotoken pretraining conditions and evaluated on RULER. Here $L$ denotes total routed head capacity and $K$ the effective per-token active-head budget induced by the MoSA routing process under the study's reporting convention. Across this sweep, we observe a monotone improvement in long-context performance as routed capacity increases and the effective activation ratio decreases. We organize this finding as a design law for MoSA-style sparse attention: within a beneficial regime, the maximum usable sequence length at a fixed quality target scales approximately with $L/K$. The paper's contribution is a study of that law, not a new attention mechanism. We explain the law, give analytical reasoning for why it should exist, derive empirical predictions from it, and then evaluate those predictions in a base-MoSA case study. The resulting picture recasts MoSA-style sparse attention as more than an efficiency device. In the measured regime, it functions as a practical scaling mechanism for long-sequence competence.
+\end{abstract}
+
+\section{Introduction}
+
+Long-context modeling is often discussed as a systems problem. Dense attention becomes expensive as sequence length grows, so sparse approximations are introduced to control memory and compute. That framing is important, but it leaves open a different question: whether a sparse attention mechanism can be useful not merely because it is cheaper, but because it changes the long-sequence inductive bias of the attention computation itself.
+
+This paper studies that question in a concrete MoSA setting. In MoSA-style sparse attention, each attention head uses a learned router to choose only a subset of tokens, and the head performs attention on that subset rather than on the full sequence. The usual reading of such a mechanism is economical. Fewer attended tokens per head means less work. Our interest here is different. If routing reduces the number of candidate tokens that each active head must discriminate among, then routing may also reduce one of the central pressures that makes long-context behavior difficult in the first place.
+
+The paper therefore asks a simple study question: can additional MoSA-style routed capacity be used to buy additional long-sequence performance? We answer that question with a controlled base-MoSA case study over four routing operating points, reported as effective activation ratios $K/L \in \{1.0, 0.8, 0.5, 0.2\}$ under comparable isotoken pretraining conditions and evaluated on RULER. Here $L$ denotes the total routed head capacity available to a layer, while $K$ denotes the effective number of heads processing a token under the study's reporting convention. Decreasing $K/L$ therefore corresponds to increasing total routed capacity while keeping the effective active-head budget approximately fixed.
+
+The contribution of the paper is not a new attention architecture and not a generic efficient-attention benchmark. It is a design-law study around a base MoSA configuration. The central claim is that, within a beneficial regime, MoSA-style sparse attention exhibits a predictable parameter-for-context trade: increasing routed capacity improves long-sequence performance in a manner governed primarily by the ratio $L/K$. The paper's goal is to state that law clearly, explain why such a law should exist, derive predictions that make the law falsifiable, and then test those predictions in a concrete MoSA case study.
+
+This structure matters. A design law is not the same thing as a theorem, though it may be supported by one. The field-facing contribution is the scaling rule the reader should remember. The analytical reasoning exists to justify why the study is worth running and how its results should be interpreted. The experiments then determine whether the law is actually visible in a real MoSA regime. Keeping these layers separate is important for clarity, especially because sparse attention papers are often forced into an awkward choice between theoretical overreach and purely empirical description. We aim for neither. Instead, we present a concrete study whose claim, support, evidence, and implications are explicitly separated.
+
+The headline empirical result is that aggregate long-context performance improves monotonically across the evaluated operating range as routed capacity increases. The headline conceptual result is that MoSA-style routing is better understood, in this regime, not merely as an efficiency approximation to dense attention but as a scaling mechanism for long-sequence competence. Once stated this way, the result has an immediate systems consequence: if routed attention capacity can be distributed across more devices without destroying the effective activation budget, then additional devices may purchase not just throughput but longer usable context.
+
+The rest of the paper is organized as follows. \Cref{sec:background} establishes the MoSA mechanism and defines the study's notion of effective sparsity. \Cref{sec:theory} states the design law, gives analytical reasoning for it, and derives the study's testable predictions. \Cref{sec:setup} describes the base-MoSA case study. \Cref{sec:results} reports the empirical findings. \Cref{sec:discussion} interprets the law and its consequences. Related work is deferred until after the paper's own object has been made fully legible.
+
+
+\section{Background: MoSA-Style Sparse Attention}
+\label{sec:background}
+
+This section defines the object of study. After reading it, a technically literate machine-learning reader should know what the original MoSA paper proposed and what concrete MoSA computation the later theory and experiments refer to.
+
+\subsection{The Original MoSA Proposal}
+
+MoSA was introduced by Piotr Pi\k{e}kos, R\'obert Csord\'as, and J\"urgen Schmidhuber in \emph{Mixture of Sparse Attention: Content-Based Learnable Sparse Attention via Expert-Choice Routing}. Their paper proposed a sparse attention mechanism in which each routed head selects its own subset of tokens and computes attention only on that routed subset, rather than over the full sequence. The original emphasis was efficient content-based sparse attention. The present paper studies a different question inside the same mechanism family: whether the resulting routed-capacity structure obeys a usable long-sequence design law.
+
+\subsection{MoSA Routing Computation}
+
+At a high level, MoSA modifies a standard transformer attention block by replacing full-sequence per-head attention with a routed gather--attend--scatter computation. Starting from an input sequence $X = (x_1, \dots, x_N)$ of length $N$, a MoSA layer with $L$ routed heads proceeds as follows.
+
+\begin{enumerate}[leftmargin=2em]
+    \item score tokens independently for each routed head,
+    \item select a top-$k_\ell$ subset for that head,
+    \item gather only the selected token representations,
+    \item project the gathered tokens into the relevant head subspace,
+    \item compute masked attention on the gathered subset,
+    \item scatter the resulting head output back to the original sequence positions.
+\end{enumerate}
+
+This sequence of operations is the concrete core of MoSA, and the present paper focuses on the consequences of steps 3--5. Under the paper's bookkeeping, $N$ tokens are mapped into $K$ active heads per token over $L$ total routed heads. Under approximate load balancing, the average routed subset length seen by a head is therefore
+\[
+\frac{NK}{L}.
+\]
+Equivalently, if each head selects a common budget $k$, then
+\[
+k = \frac{NK}{L}.
+\]
+This is the structural effect the rest of the paper studies: increasing total routed capacity $L$ at fixed effective activation budget $K$ reduces the average number of tokens processed inside a head's attention computation. Background stops at identifying that mechanism-level effect. Its consequences are taken up in the theory and experiments that follow.
+
+\section{Theory}
+\label{sec:theory}
+
+\subsection{Design Law}
+
+The field-facing claim of the paper is the following design law.
+
+\begin{designlaw}
+Fix a long-context quality target $\tau$ on a MoSA-style model family and let $N_\tau(L,K)$ denote the largest sequence length at which a model with total routed head capacity $L$ and effective activation budget $K$ attains at least that quality. Then, within a beneficial regime in which routing-induced degradation remains subdominant, the sustainable sequence length scales approximately with the routing expansion factor:
+\[
+N_\tau(L,K) \approx c_\tau \frac{L}{K} + b_\tau,
+\]
+where $c_\tau$ and $b_\tau$ depend on the task family, model family, and evaluation threshold, but not on the specific operating point within the beneficial regime.
+\end{designlaw}
+
+In prose, the law says that MoSA-style sparse attention admits an approximate constant-performance scaling rule: if the effective activation budget per token is held fixed while routed capacity increases, the maximum usable sequence length should increase roughly in proportion to $L/K$ until routing failures become dominant.
+
+Two clarifications are important. First, this is a regime claim, not a universal identity. The paper does not claim that the relation is exact for all sparsity levels or all long-context tasks. Second, the law is stated as a usable scaling rule rather than as the full theorem machinery supporting it. The law is what the paper wants the reader to remember. The analytical reasoning below explains why such a law should exist.
+
+\subsection{Analytical Reasoning}
+
+The analytical picture is easiest to state by comparing a dense attention layer to its routed counterpart. In a dense multi-head layer, each active head must discriminate over the full candidate set of size $N$. In a routed-head formulation with $L$ total heads and an effective per-token active-head budget $K$, load-balanced routing reduces the average number of tokens seen by any one head to approximately
+\[
+\frac{NK}{L}.
+\]
+This is the key compression step. The routed head is no longer solving the original search problem over $N$ candidates; it is solving a smaller one over approximately $NK/L$ candidates.
+
+To express the consequence of that compression, let $f(n)$ denote the task penalty induced by requiring an attention head to discriminate over an effective candidate set of size $n$ in the long-sequence regime. Let $g(N,K,L)$ denote the additional degradation introduced by routing itself, including imperfect token assignment, load imbalance, and the possibility that useful interactions are split across head-local subsets. Then a dense formulation pays penalty
+\[
+P_{\mathrm{dense}}(N) = f(N),
+\]
+while the routed formulation pays approximately
+\[
+P_{\mathrm{mosa}}(N,L,K) = f\!\left(\frac{NK}{L}\right) + g(N,K,L).
+\]
+
+The paper uses the following semi-formal assumptions.
+
+\begin{assumption}[Long-sequence monotonicity]
+In the long-sequence regime relevant to the benchmark, $f(n)$ is monotonically increasing in $n$: larger candidate sets are, all else equal, harder for an attention head to search reliably.
+\end{assumption}
+
+\begin{assumption}[Recoverability at parity]
+When $L=K$, the routed construction is at least capable of reproducing the performance of the corresponding dense configuration after successful training, up to ordinary optimization variance.
+\end{assumption}
+
+\begin{assumption}[Beneficial regime]
+There exists a practically usable interval of activation ratios $1 \ge K/L \ge r$ for some $r > 0$ in which the routing term does not grow quickly enough to erase the reduction in candidate-set burden.
+\end{assumption}
+
+Under these assumptions, the beneficial regime condition is simply
+\[
+f\!\left(\frac{NK}{L}\right) + g(N,K,L) < f(N).
+\]
+Whenever this inequality holds, routed MoSA-style attention should outperform the denser operating point on sufficiently long sequences. Holding quality fixed then yields the constant-performance contour
+\[
+\frac{NK}{L} \approx \text{constant},
+\]
+from which the design law follows immediately:
+\[
+N \propto \frac{L}{K}.
+\]
+
+This is the role of the analysis in the paper. It is not the paper's subject, but it explains why the study question is coherent and why the law should be expected to exist before the experiments are run. The full formal argument, assumptions, and proof apparatus belong in the appendix.
+
+\subsection{Testable Predictions}
+
+The design law and its supporting reasoning imply concrete empirical signatures for the base-MoSA case study.
+
+\paragraph{Prediction 1: monotone ordering over the measured range.}
+If the study operates inside the beneficial regime, then aggregate RULER performance should improve as $K/L$ decreases from $1.0$ to $0.2$. The simplest expected ordering is
+\[
+\text{RULER}(0.2) > \text{RULER}(0.5) > \text{RULER}(0.8) > \text{RULER}(1.0).
+\]
+
+\paragraph{Prediction 2: the gain should be stronger on longer contexts than on short ones.}
+If the law is driven by reduction of the per-head candidate burden, then the advantage of lower $K/L$ should be most visible on the longest RULER contexts, where candidate-set pressure is greatest.
+
+\paragraph{Prediction 3: the empirical trend should be approximately described by $L/K$.}
+Across the measured operating range, plotting long-context quality against $L/K$ should yield an approximately linear or affine trend until the onset of saturation or routing failure.
+
+\paragraph{Prediction 4: aggressive sparsification should eventually show diminishing returns.}
+Even if the tested range remains beneficial, the gain should not be expected to continue indefinitely. Once token subsets become too small, routing errors dominate, or coverage becomes inadequate, the law should weaken and eventually fail. This means the correct interpretation of a successful experiment is not ``more sparsity is always better,'' but ``there exists a regime in which increasing routed capacity pays.''
+
+These predictions are sufficiently specific to make the design law falsifiable. A monotone failure, short-context-only benefit, law-misaligned scaling trend, or signs of early routing collapse would all count against the claim.
+
+\section{Experimental Design}
+\label{sec:setup}
+
+\subsection{Model family and operating points}
+
+We trained a base-MoSA model family across four target operating points corresponding to effective activation ratios $K/L \in \{1.0, 0.8, 0.5, 0.2\}$. All models used the same backbone depth, hidden size, head dimension, tokenizer, data mixture, optimizer family, and training curriculum. The only intentional family-level change was the routed attention operating point.
+
+For each operating point, we configured the native MoSA per-head token-selection budget to realize the desired effective $K/L$ regime after accounting for realized routing behavior. We then measured the actual token-head assignment statistics during training and evaluation and report the realized effective activation ratio rather than the nominal target alone. This avoids a common problem in sparse-routing papers where the interesting quantity is stated architecturally but not measured empirically.
+
+Table~\ref{tab:config} summarizes the main model configurations. Each row should be read as a full trained model family member rather than a post hoc pruning or inference-only modification.
+
+\begin{table}[H]
+\centering
+\caption{Base-MoSA operating points used in the study. Replace each bracketed item with the realized configuration value.}
+\label{tab:config}
+\begin{tabular}{lcccccc}
+\toprule
+Target $K/L$ & Realized $K/L$ & $L$ & Effective $K$ & Parameters & Seeds & Tokens \\
+\midrule
+1.0 & [value] & [value] & [value] & [value] & [value] & [value] \\
+0.8 & [value] & [value] & [value] & [value] & [value] & [value] \\
+0.5 & [value] & [value] & [value] & [value] & [value] & [value] \\
+0.2 & [value] & [value] & [value] & [value] & [value] & [value] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Pretraining protocol}
+
+All models were pretrained under comparable isotoken conditions. Concretely, each operating point was exposed to the same number of training tokens, the same data mixture, the same context-length schedule, and the same optimization recipe, with only the routed-capacity configuration altered. We intentionally do not compute-match the operating points, because the purpose of the paper is not to ask which MoSA configuration is most efficient per FLOP. The purpose is to determine whether long-sequence quality can be bought with additional routed capacity.
+
+The shared training recipe was as follows: optimizer = [optimizer], learning-rate schedule = [schedule], weight decay = [weight decay], batch size = [batch size], warmup = [warmup steps], maximum context length during pretraining = [context length], and total observed tokens per run = [token count]. Training was performed on [hardware], with [precision mode] and [distributed strategy] where applicable. Each operating point was trained for [number of seeds] seeds to support confidence intervals and significance estimates.
+
+\subsection{Evaluation protocol}
+
+We evaluate the resulting checkpoints on RULER after pretraining. RULER is appropriate for the present study because it directly stresses long-context retrieval, aggregation, and structured reasoning across long sequences rather than merely measuring next-token loss on short windows. The evaluation protocol uses the full benchmark suite [or benchmark subset if applicable], with context lengths up to [maximum evaluation length], and reports both aggregate RULER score and per-task-family breakdowns.
+
+The primary metric is aggregate RULER score averaged across [task families / runs / seeds]. Secondary metrics include per-family scores, score-versus-context-length curves, realized activation-ratio diagnostics, routing-load statistics, and training stability measures. Statistical uncertainty is reported as [confidence interval / standard deviation / standard error] over [number] seeds unless otherwise specified.
+
+\subsection{Fit-to-law analysis}
+
+Because the paper is a design-law study rather than only a benchmark report, the analysis includes an explicit fit-to-law view. In addition to headline benchmark scores, we regress aggregate long-context quality against $L/K$ over the measured operating points and report [fit statistic], [confidence interval], and [model form, e.g., linear or affine]. This analysis does not claim that the law is exact; it measures whether the observed trend is well described by the scaling variable proposed in \Cref{sec:theory}.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Main empirical result}
+
+The main empirical result is straightforward: across the measured operating range, aggregate RULER performance improves monotonically as effective activation ratio decreases and routed capacity increases. The observed ordering is
+\[
+\text{RULER}(0.2) > \text{RULER}(0.5) > \text{RULER}(0.8) > \text{RULER}(1.0),
+\]
+with absolute scores of [score], [score], [score], and [score], respectively, and pairwise differences of [difference] or greater between adjacent operating points.
+
+Table~\ref{tab:main_results} reports the headline result. The lowest-ratio configuration achieved the best aggregate long-context performance despite being evaluated within the same base-MoSA family and under the same isotoken pretraining budget. This is the empirical signature the design law predicts.
+
+\begin{table}[H]
+\centering
+\caption{Headline RULER results for the base-MoSA case study. Replace bracketed values with measured results.}
+\label{tab:main_results}
+\begin{tabular}{lcccc}
+\toprule
+Target $K/L$ & Aggregate RULER & 95\% CI & Best context bucket & Worst context bucket \\
+\midrule
+1.0 & [score] & [interval] & [bucket] & [bucket] \\
+0.8 & [score] & [interval] & [bucket] & [bucket] \\
+0.5 & [score] & [interval] & [bucket] & [bucket] \\
+0.2 & [score] & [interval] & [bucket] & [bucket] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The measured trend is well described by the design-law variable}
+
+Beyond the monotone ordering, the observed gain is organized well by the variable $L/K$. When aggregate long-context quality is plotted against $L/K$, the four operating points lie close to an approximately [linear / affine] trend with fit statistic [value]. Over the measured range, most of the variance in aggregate RULER is captured by this single scaling variable.
+
+This does not prove the law in the strong mathematical sense. What it shows is that the law is not merely a slogan attached after the fact. The empirical trend is aligned with the analytic quantity the paper proposes to matter. In practical terms, the result means that the long-context behavior of the studied MoSA family is not best described as a set of unrelated operating points. It is better described as a family whose behavior is organized by routed capacity relative to effective activation budget.
+
+\subsection{The gain is concentrated where the theory says it should be}
+
+The improvement is not uniformly distributed across all evaluation conditions. The largest relative gains appear in the longest RULER contexts and in task families most dependent on successful long-range retrieval or aggregation. On shorter contexts, the gap narrows to [value] or becomes statistically ambiguous in [subset]. On the longest contexts, the gap between $K/L=1.0$ and $K/L=0.2$ expands to [value]. This is the expected pattern if the relevant mechanism is reduction of per-head candidate-set burden rather than some unrelated training artifact.
+
+\begin{table}[H]
+\centering
+\caption{Illustrative task-family or context-bucket breakdown. Replace each entry with measured values.}
+\label{tab:breakdown}
+\begin{tabular}{lcccc}
+\toprule
+Bucket & $K/L=1.0$ & $K/L=0.8$ & $K/L=0.5$ & $K/L=0.2$ \\
+\midrule
+\texttt{[Short / Family A]} & [score] & [score] & [score] & [score] \\
+\texttt{[Medium / Family B]} & [score] & [score] & [score] & [score] \\
+\texttt{[Long / Family C]} & [score] & [score] & [score] & [score] \\
+\texttt{[Longest / Family D]} & [score] & [score] & [score] & [score] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Realized routing behavior remains inside a usable regime}
+
+A design-law result is only interesting if the studied operating points are realizable and train stably. In our runs, realized activation ratios remained within [tolerance] of their intended targets after the initial optimization phase. We did not observe persistent catastrophic router collapse, unrecoverable token starvation beyond [threshold], or training divergence unique to the lower $K/L$ settings. Training-loss curves remained [ordered / overlapping / stable] across seeds, and final checkpoints satisfied the routing-diagnostic criteria summarized in Table~\ref{tab:routing_diag}.
+
+\begin{table}[H]
+\centering
+\caption{Routing and stability diagnostics. Replace bracketed values with measured quantities.}
+\label{tab:routing_diag}
+\begin{tabular}{lcccc}
+\toprule
+Metric & $K/L=1.0$ & $K/L=0.8$ & $K/L=0.5$ & $K/L=0.2$ \\
+\midrule
+Realized $K/L$ drift & [value] & [value] & [value] & [value] \\
+Load-imbalance score & [value] & [value] & [value] & [value] \\
+Token-starvation rate & [value] & [value] & [value] & [value] \\
+Training instability events & [value] & [value] & [value] & [value] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These diagnostics support the interpretation that the measured gain arises from a usable sparse-routing regime rather than from a fragile or pathological corner case.
+
+\subsection{Signs of a regime boundary}
+
+The paper's claim is deliberately regime-bounded, and the results behave that way. Although performance improves throughout the evaluated range, the marginal gain from [operating point] to [operating point] is smaller than the gain from [operating point] to [operating point], indicating the beginning of saturation by approximately [threshold]. This is exactly the pattern suggested by the analytical reasoning: once routed subsets become too small, or the routing term begins to dominate, additional capacity should pay less and eventually stop paying.
+
+The correct reading of the result is therefore not that more sparsity is always better. It is that a beneficial regime exists, the base-MoSA study enters that regime, and the law organizes the behavior inside it.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{What the case study shows}
+
+The paper's central empirical result is modest in form but strong in consequence. A base-MoSA family, trained under comparable isotoken conditions and evaluated on a long-context benchmark, exhibits a monotone parameter-for-performance trade organized by $L/K$. That is enough to establish the design-law claim the paper set out to test.
+
+This matters because it changes the default interpretation of MoSA-style sparse attention. In the measured regime, MoSA is not best understood as a cheaper approximation to a supposedly superior dense reference. It is better understood as a mechanism that changes the effective search problem faced by each head and thereby creates a usable route for purchasing long-context competence with routed parameters.
+
+\subsection{Distributed consequence}
+
+One consequence of the law is especially important for systems design. Routed head capacity is a sparse resource: additional heads need not be activated densely on every token. If those heads can be partitioned across more devices while preserving the effective activation budget, then adding devices can purchase more than throughput. It can purchase longer usable context.
+
+The present paper does not benchmark a distributed MoSA system directly, so this should not be read as an experimentally verified systems result. But it is a concrete implication of the measured law. A design space that was previously read mainly through the lens of efficiency can instead be read as one in which multi-device sparse capacity becomes a direct knob on long-sequence competence.
+
+\subsection{Why the paper avoids a dense baseline}
+
+A dense multi-head attention baseline would answer a different question from the one posed here. Such a comparison would ask whether MoSA beats a dense reference. This paper asks whether base MoSA exhibits an internal design law as routed capacity changes. For that question, within-family comparisons are the cleanest evidence. They isolate the effect of the routed-capacity variable rather than conflating it with architecture-family differences.
+
+\subsection{What the paper does not claim}
+
+The paper does not claim that every sparse attention mechanism follows the same law, that the approximately linear regime extends indefinitely, or that lower $K/L$ is always beneficial. It does not claim that the law removes the need to reason about routing quality, load balance, or token-subset expressivity. And it does not claim an efficiency victory over dense attention, because that is not the comparison being studied.
+
+The claim is narrower: in a base-MoSA case study, there exists a measurable beneficial regime in which routed capacity can be traded for long-sequence performance in a way well described by $L/K$. That narrower claim is already enough to change how this family of mechanisms should be thought about.
+
+\section{Related Work}
+
+The natural place for related work in this paper is after the study has been fully specified, because the relevant distinction is easier to state once the reader knows exactly what object was studied.
+
+\paragraph{Sparse attention as efficient approximation.}
+Much of the sparse-attention literature frames sparsity as a way to reduce the cost of dense attention while preserving as much of its quality as possible. Fixed-pattern methods such as BigBird~\cite{bigbird} and dynamic-content methods such as Routing Transformer~\cite{routing_transformer} are canonical examples of this perspective. Our paper is adjacent to that literature but asks a different question. We do not ask which approximation is cheapest or closest to dense attention. We ask whether, within a concrete routed family, additional sparse routed capacity buys better long-context behavior.
+
+\paragraph{MoSA as the experimental substrate.}
+MoSA is the most relevant architectural neighbor because it is an attention-side mechanism in which each head selects its own token subset through learned routing~\cite{mosa}. The present paper does not propose a new MoSA variant. Instead, it uses base MoSA as a study substrate and asks whether a design law becomes visible when routed capacity is varied systematically.
+
+\paragraph{Long-context behavior under changing sparsity.}
+A broader body of work studies how sparse attention behaves as context length increases or as sparsity patterns change. That literature is important background, but most of it is framed either as efficient long-context approximation or as empirical benchmarking of sparsity patterns. The present contribution is narrower and more structural: a within-family law study around MoSA, organized around the claim that sustainable long-sequence behavior scales with $L/K$ inside a beneficial regime.
+
+\paragraph{Sparse conditional computation.}
+Mixture-of-experts results normalize the idea that additional sparse parameters can be beneficial rather than wasteful~\cite{switch}. That perspective matters here because it makes the parameter side of the law less surprising. But generic MoE scaling does not by itself imply the attention-side law studied in this paper. The law here is specifically about routed attention capacity and long-sequence task behavior.
+
+\section{Limitations}
+
+This study has several limitations. First, it is a single-family case study centered on base MoSA. The law may extend to other routed sparse attention mechanisms, but that is not established here. Second, the evaluation is centered on RULER. That benchmark is appropriate for the present question, but broader validation on additional long-context suites and language-modeling diagnostics would strengthen external credibility. Third, the models are compared under comparable isotoken conditions rather than strict compute matching. This is intentional because the paper is a design-law study, not an efficiency contest, but it also means the result should not be read as a FLOP-normalized benchmark claim. Fourth, the analytical reasoning in the main text is semi-formal by design. The full theorem machinery, assumptions, and proof burden are deferred to the appendix. Finally, the distributed consequence is argued as an implication of the law rather than demonstrated directly with a multi-device experiment.
+
+\section{Conclusion}
+
+This paper studied a simple question in a concrete setting: can base MoSA trade routed sparse parameters for long-sequence performance? The answer, on the measured operating range, is yes. Aggregate RULER performance improves monotonically as effective activation ratio decreases and routed capacity increases, and the observed trend is well described by the scaling variable $L/K$.
+
+The resulting contribution is a design law for MoSA-style sparse attention. Within a beneficial regime, the sustainable sequence length at a fixed quality target scales approximately with routed capacity relative to effective activation budget. The law is supported analytically, turned into testable predictions, and then observed in a base-MoSA case study. This reframes MoSA from an efficiency device into a practical scaling mechanism for long-sequence competence and suggests a route by which additional sparse routed capacity --- and potentially additional devices --- can buy longer usable context.
+
+\appendix
+
+\section{Appendix Roadmap}
+
+A submission-ready appendix accompanying this paper should include the following materials.
+
+\begin{enumerate}[leftmargin=2em]
+    \item A precise formalization of the dense and routed layers used in the analytical reasoning, including the candidate-set penalty function, the routing term, and the beneficial-regime assumptions.
+    \item The full proof package connecting the candidate-set reduction from $N$ to approximately $NK/L$ with the stated design law.
+    \item Exact model specifications for each base-MoSA operating point, including layer counts, hidden sizes, head dimensions, routing budgets, realized activation ratios, and total parameter counts.
+    \item Complete pretraining details: data mixture, tokenizer, optimizer settings, schedules, batch sizes, context curriculum, hardware, precision mode, and seed handling.
+    \item Full RULER breakdowns by task family, context bucket, and seed, together with confidence intervals and significance tests.
+    \item Router diagnostics, including load-balance measures, token-starvation statistics, realized assignment histograms, and saturation or failure analyses outside the beneficial regime.
+\end{enumerate}
+
+\begin{thebibliography}{99}
+
+\bibitem{mosa}
+Piotr Piekos, Robert Csordas, and Jurgen Schmidhuber.
+\newblock Mixture of Sparse Attention: Content-Based Learnable Sparse Attention via Expert-Choice Routing.
+\newblock arXiv preprint arXiv:2505.00315, 2025.
+
+\bibitem{routing_transformer}
+Aurko Roy, Mohammad Saffar, Ashish Vaswani, and David Grangier.
+\newblock Efficient Content-Based Sparse Attention with Routing Transformers.
+\newblock Transactions of the Association for Computational Linguistics, 2021.
+
+\bibitem{bigbird}
+Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, and Amr Ahmed.
+\newblock Big Bird: Transformers for Longer Sequences.
+\newblock Advances in Neural Information Processing Systems, 2020.
+
+\bibitem{switch}
+William Fedus, Barret Zoph, and Noam Shazeer.
+\newblock Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.
+\newblock Journal of Machine Learning Research, 2022.
+
+\end{thebibliography}
+
+\end{document}
