@@ -27,10 +27,10 @@ is being achieved, one verified unit at a time.
 - [X] Unit 1 — audit the copy against SHRAM requirements; produce ordered change list
 - [X] Unit 2 — independent verification of Unit 1 change list against the code
 - [X] Unit 3 — ShramConfig: add all SHRAM-specific architectural parameters
-- [ ] Unit 4 — Router and load balancing: token-choice routing + DeepSeek biasing
+- [X] Unit 4 — Router and load balancing: token-choice routing + DeepSeek biasing
 - [ ] Unit 5 — Local sliding-window attention module (h_l)
 - [ ] Unit 6 — Expert packing and unpacking: permutation machinery, padding, masks
-- [ ] Unit 7 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensors
+- [ ] Unit 7 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensorsHJ
 - [ ] Unit 8 — MoSRAH sparse path: routing → packing → BEA → unpacking → weighted reduction
 - [ ] Unit 9 — SHRAM hybrid layer: assemble H(x) = h_l (Unit 5) + h_s (Unit 8)
 - [ ] Unit 10 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
@@ -45,8 +45,9 @@ is being achieved, one verified unit at a time.
 
 ## Status
 
-**Current state:** Unit 3 complete. ShramConfig verified with 27 passing tests. Unit 4
-(Router and load balancing) is next. Network tests deselected (Hub repo not yet created).
+**Current state:** Unit 4 complete. MoSRAHRouter and LoadBalanceLoss verified with 23
+passing tests. Unit 5 (local sliding-window attention module) is next. Network tests
+deselected (Hub repo not yet created).
 
 ---
 
