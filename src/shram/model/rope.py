@@ -117,10 +117,20 @@ class RotaryEmbedding(nn.Module):
         The cos/sin cache is extended lazily when position_ids reference positions
         beyond its current length.
 
+        position_ids may be any integer tensor whose values are valid position indices.
+        Its shape must match the non-head, non-head_dim dimensions of q and k:
+
+        - Standard causal attention: position_ids (B, N), q (B, H, N, head_dim).
+        - BEA packed attention:      position_ids (B, L, T), q (B, L, T, head_dim).
+
+        Head dimensions sit between the batch dimension and the position dimensions in
+        q/k. They are absent from position_ids and are handled by inserting broadcast
+        dimensions automatically.
+
         Args:
-            q: Query tensor of shape (batch, num_heads, seq_len, head_dim).
-            k: Key tensor of shape (batch, num_kv_heads, seq_len, head_dim).
-            position_ids: Integer positions of shape (batch, seq_len).
+            q: Query tensor of shape (batch, [num_heads,] *pos_dims, head_dim).
+            k: Key tensor of shape (batch, [num_kv_heads,] *pos_dims, head_dim).
+            position_ids: Integer positions of shape (batch, *pos_dims).
 
         Returns:
             Tuple of (q_rotated, k_rotated, attention_scaling). attention_scaling is
@@ -132,10 +142,20 @@ class RotaryEmbedding(nn.Module):
         if self._cos_cached is None or seq_len > self._cos_cached.shape[0] or self._cos_cached.dtype != q.dtype:
             self._extend_cache(seq_len, device=q.device, dtype=q.dtype)
 
-        # Gather cos/sin for the given positions → (batch, seq_len, head_dim),
-        # then unsqueeze the head axis for broadcast over all heads.
-        cos = self._cos_cached[position_ids].unsqueeze(1)
-        sin = self._sin_cached[position_ids].unsqueeze(1)
+        # Direct index gather: works for any position_ids shape.
+        # cos/sin shape is (*position_ids.shape, head_dim).
+        cos = self._cos_cached[position_ids]
+        sin = self._sin_cached[position_ids]
+
+        # q/k may have head dimensions between the batch dimension and the position
+        # dimensions that are absent from position_ids. Insert one broadcast dimension
+        # at dim 1 per missing head dimension so that cos/sin align with q/k.
+        # Standard case: position_ids (B, N) → cos (B, N, D); q (B, H, N, D) needs
+        # cos (B, 1, N, D) — one unsqueeze. BEA case: position_ids (B, L, T) → cos
+        # (B, L, T, D); q (B, L, T, D) — no unsqueeze needed.
+        for _ in range(q.ndim - cos.ndim):
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
 
         q_rotated = q * cos + _rotate_half(q) * sin
         k_rotated = k * cos + _rotate_half(k) * sin

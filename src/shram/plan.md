@@ -28,26 +28,30 @@ is being achieved, one verified unit at a time.
 - [X] Unit 2 — independent verification of Unit 1 change list against the code
 - [X] Unit 3 — ShramConfig: add all SHRAM-specific architectural parameters
 - [X] Unit 4 — Router and load balancing: token-choice routing + DeepSeek biasing
-- [ ] Unit 5 — Local sliding-window attention module (h_l)
-- [ ] Unit 6 — Expert packing and unpacking: permutation machinery, padding, masks
-- [ ] Unit 7 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensorsHJ
-- [ ] Unit 8 — MoSRAH sparse path: routing → packing → BEA → unpacking → weighted reduction
-- [ ] Unit 9 — SHRAM hybrid layer: assemble H(x) = h_l (Unit 5) + h_s (Unit 8)
-- [ ] Unit 10 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
-- [ ] Unit 11 — ShramModel: aggregate load_balance_loss in output
-- [ ] Unit 12 — ShramForCausalLM: expose load_balance_loss; KV cache resolution
-- [ ] Unit 13 — upload_to_hub
-- [ ] Unit 14 — documentation
-- [ ] Unit 15 — end-to-end tests
-- [ ] Unit 16 — final audit
+- [X] Unit 5.A — ShramConfig: yarn_alpha (α) and yarn_beta (β) as first-class parameters
+      (blocker discovered during Unit 5.B review; resolved before rope.py finalization)
+- [ ] Unit 5.B — rope.py: extend RotaryEmbedding for arbitrary position tensor shape (OD-4)
+- [ ] Unit 6 — Local sliding-window attention module (h_l)
+- [ ] Unit 7 — Expert packing and unpacking: permutation machinery, padding, masks
+- [ ] Unit 8 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensors
+- [ ] Unit 9 — MoSRAH sparse path: routing → packing → BEA → unpacking → weighted reduction
+- [ ] Unit 10 — SHRAM hybrid layer: assemble H(x) = h_l (Unit 6) + h_s (Unit 9)
+- [ ] Unit 11 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
+- [ ] Unit 12 — ShramModel: aggregate load_balance_loss in output
+- [ ] Unit 13 — ShramForCausalLM: expose load_balance_loss; KV cache resolution
+- [ ] Unit 14 — upload_to_hub
+- [ ] Unit 15 — documentation
+- [ ] Unit 16 — end-to-end tests
+- [ ] Unit 17 — final audit
 
 ---
 
 ## Status
 
-**Current state:** Unit 4 complete. MoSRAHRouter and LoadBalanceLoss verified with 23
-passing tests. Unit 5 (local sliding-window attention module) is next. Network tests
-deselected (Hub repo not yet created).
+**Current state:** Unit 5.A complete (yarn_alpha/yarn_beta ShramConfig patch, 34 tests
+passing). Unit 5.B (rope.py arbitrary position tensor shape) is implemented and 18/18 tests
+pass, but is pending user approval before being marked complete. Unit 6 begins after Unit
+5.B approval. Network tests deselected (Hub repo not yet created).
 
 ---
 
@@ -405,20 +409,84 @@ Concerns.
 
 ---
 
-### Unit 5 — Local Sliding-Window Attention Module
+### Unit 5.A — ShramConfig: yarn_alpha and yarn_beta (Blocker)
+
+**What:** Blocker discovered during review of Unit 5.B. YaRN's ramp boundaries α and β —
+called `beta_slow` and `beta_fast` by HF's `_compute_yarn_parameters` — were absent from
+ShramConfig. job.md Architecture § requires every architectural parameter to be explicitly
+tunable through config. Silent reliance on HF's hardcoded defaults (α=1, β=32) violated
+this invariant.
+
+**Invariants this unit must satisfy:**
+- `yarn_alpha` (α) and `yarn_beta` (β) are first-class ShramConfig parameters with defaults
+  matching the paper's LLaMA-family recommendation: α=1.0, β=32.0 (paper §A.2 RoPE Treatment).
+- When `rope_scaling` is YaRN type, `yarn_alpha` and `yarn_beta` are injected into the dict
+  as `beta_slow` and `beta_fast` before HF's base class processes it. They are the single
+  source of truth — not the dict keys.
+- Non-YaRN configs are unaffected: no injection occurs for linear or default rope types.
+- Both parameters survive a `to_dict`/`from_dict` serialization roundtrip.
+- Tests verify: default values, custom values stored, injection into YaRN rope_parameters,
+  no injection for non-YaRN, roundtrip preservation.
+
+**Paper ref:** §A.2 RoPE Treatment — ramp function γ(r) with boundaries α and β.
+
+---
+
+### Unit 5.B — rope.py: Arbitrary Position Tensor Shape
+
+**What:** Extend `RotaryEmbedding.forward` so that `position_ids` may be any shape, not
+only 2D `(B, N)`. This unblocks both Unit 6 (h_l, which uses the shared module) and
+Unit 8 (BEA, which requires 3D `(B, L, T)` packed positions). Doing it now as a standalone
+verified unit eliminates the mid-Unit-8 blocker and keeps the interface clean for all
+callers.
+
+**OD-4 resolution (closed here):** `RotaryEmbedding.forward` is extended to accept
+`position_ids` of arbitrary shape. The cos/sin cache is indexed directly — `cos =
+_cos_cached[position_ids]` — which produces a result of shape `(*position_ids.shape,
+head_dim)` regardless of how many leading dimensions position_ids has. Head-dimension
+broadcasting is handled so that both standard 2D usage and BEA's 3D usage work correctly
+through the same code path.
+
+**Invariants this unit must satisfy:**
+- All existing rope.py tests pass without modification. The extension is backward-compatible:
+  2D `position_ids (B, N)` with q/k of shape `(B, H, N, head_dim)` behaves identically to
+  the pre-extension implementation.
+- 3D `position_ids (B, L, T)` produces correct cos/sin: the gathered values at each
+  `(b, l, t)` position match what would be produced by indexing with the scalar
+  `position_ids[b, l, t]` directly.
+- The rotation is applied correctly to q/k regardless of position_ids shape. No rotation
+  logic is duplicated — a single implementation covers all calling conventions.
+- `attention_scaling` is returned unchanged; callers decide whether to apply it.
+- Tests verify: existing 2D behavior unchanged, 3D gather correctness, rotation applied
+  correctly for both shapes.
+
+**Paper refs:** Appendix B.RoPE Mechanics (OD-4 resolution).
+
+---
+
+### Unit 6 — Local Sliding-Window Attention Module
 
 **Invariants this unit must satisfy:**
 - Implements h_l(x) as a standalone module: (B, N, d) → (B, N, d). This module is a
-  verified black box before the hybrid layer (Unit 9) assembles it.
+  verified black box before the hybrid layer (Unit 10) assembles it.
 - Local attention is enforced by the kernel natively. The window size is passed as a
   parameter to the kernel itself; masking is handled internally. A boolean attn_mask
   constructed outside the kernel is not acceptable (job.md Architecture §).
 - Window size is configurable via config. Nothing is hardcoded.
 - The module is causal within the window.
-- The specific kernel (flash_attn, flex_attention, or other) is determined at this unit's
-  planning time. The unit planner evaluates available options against the kernel-native
-  invariant above and records the choice and rationale here before implementation begins.
-  OD-1 is closed at this point.
+- **OD-1 resolved:** `torch.nn.attention.flex_attention` with `create_block_mask` is used.
+  The BlockMask classifies every (Q-block, KV-block) pair and skips fully-masked blocks
+  entirely — zero FLOPs, not post-hoc zeroing. This satisfies the kernel-native invariant.
+  flex_attention is PyTorch-native (no external package), CPU-testable via eager mode, and
+  stable across PyTorch 2.5+. Paper names FlashAttention; user has approved flex_attention
+  as equivalent (both use the flash formulation under the hood).
+- h_l uses the shared `RotaryEmbedding` instance (no separate RoPE module). Standard 2D
+  `position_ids (B, N)` are passed. The returned `attention_scaling` is not applied —
+  h_l treats it as 1.0. Rationale: the local window is always short (window_size=128);
+  YaRN's magnitude correction is irrelevant for positions that are always in-distribution,
+  and silently applying it would subtly mis-scale the local path's logits.
+- MHA (not GQA) — OD-3 resolution. `num_sliding_window_heads` query heads, each with its
+  own K and V projection.
 - Tests verify: output shape, tokens outside the window receive zero attention weight,
   causal ordering is preserved within the window, window_size equal to sequence length
   degrades to standard causal attention.
@@ -427,7 +495,7 @@ Concerns.
 
 ---
 
-### Unit 6 — Expert Packing and Unpacking
+### Unit 7 — Expert Packing and Unpacking
 
 **Invariants this unit must satisfy:**
 - Expert packing converts `selected_heads` (B, N, K) + x (B, N, d) into `packed_hidden`
@@ -451,7 +519,7 @@ Concerns.
 
 ---
 
-### Unit 7 — Bottlenecked Ensemble Attention (BEA)
+### Unit 8 — Bottlenecked Ensemble Attention (BEA)
 
 **Invariants this unit must satisfy:**
 - BEA operates on `packed_hidden` (B, L, T, d); output y (B, L, T, d).
@@ -467,15 +535,14 @@ Concerns.
   that head's output), RoPE passthrough (both position tensors produce different outputs),
   padding positions do not influence real-token outputs, causal masking holds.
 
-**Potential blocker:** OD-4 (resolved in principle — extend rope.py for arbitrary position
-tensor shape). If rope.py modification is not yet done, push it as a blocker unit when Unit 7
-planning begins.
+**Note:** OD-4 (rope.py arbitrary position tensor shape) is resolved in Unit 5 and verified
+before this unit begins. No blocker expected.
 
 **Paper refs:** Appendix A.BEA, Appendix B.RoPE Mechanics.
 
 ---
 
-### Unit 8 — MoSRAH Sparse Path
+### Unit 9 — MoSRAH Sparse Path
 
 **Invariants this unit must satisfy:**
 - MoSRAH forward: (`selected_heads`, `routing_probs`) = Router(x); `packed_hidden` =
@@ -494,11 +561,11 @@ planning begins.
 
 ---
 
-### Unit 9 — SHRAM Hybrid Layer
+### Unit 10 — SHRAM Hybrid Layer
 
 **Invariants this unit must satisfy:**
 - SHRAM forward: H(x) = h_l(x) + h_s(x), where h_l is the local sliding-window module
-  (Unit 5, verified black box) and h_s is MoSRAH (Unit 8, verified black box).
+  (Unit 6, verified black box) and h_s is MoSRAH (Unit 9, verified black box).
 - h_l and h_s have fully independent parameters. Their outputs are summed.
 - load_balance_loss from h_s is propagated through the hybrid layer's return.
 - Output shape: (B, N, d) — same interface as GroupedQueryAttention it replaces.
@@ -509,7 +576,7 @@ planning begins.
 
 ---
 
-### Unit 10 — DecoderLayer Update
+### Unit 11 — DecoderLayer Update
 
 **Invariants this unit must satisfy:**
 - DecoderLayer uses SHRAM hybrid layer in place of GroupedQueryAttention.
@@ -520,7 +587,7 @@ planning begins.
 
 ---
 
-### Unit 11 — ShramModel Update
+### Unit 12 — ShramModel Update
 
 **Invariants this unit must satisfy:**
 - ShramModel collects load_balance_loss from all decoder layers and includes an aggregated
@@ -532,7 +599,7 @@ planning begins.
 
 ---
 
-### Unit 12 — ShramForCausalLM Update
+### Unit 13 — ShramForCausalLM Update
 
 **Invariants this unit must satisfy:**
 - load_balance_loss is accessible from the forward output so the training loop can weight and
@@ -549,7 +616,7 @@ planning begins.
 
 ---
 
-### Unit 13 — upload_to_hub.py
+### Unit 14 — upload_to_hub.py
 
 **What:** Adapt the upload script for the SHRAM model type. Update class names, model type
 string, and model card content. Register `ShramConfig` and `ShramForCausalLM` with the AutoClass
@@ -562,7 +629,7 @@ API and push all model files to the Hub.
 
 ---
 
-### Unit 14 — Documentation
+### Unit 15 — Documentation
 
 **What:** Write `documentation.md` covering design decisions, deviations from the paper, and
 limitations. Update `README.md` with accurate architectural details. Record every open decision
@@ -575,7 +642,7 @@ resolved during implementation and the rationale for each.
 
 ---
 
-### Unit 15 — End-to-End Tests
+### Unit 16 — End-to-End Tests
 
 **What:** Full-stack smoke tests: instantiate from config, run a training step, verify loss
 decreases. Include load-balance loss in the training step. Include network tests for the Hub
@@ -589,7 +656,7 @@ round-trip.
 
 ---
 
-### Unit 16 — Final Audit
+### Unit 17 — Final Audit
 
 **What:** Review every file in `src/shram/` against the invariants in `job.md`. Verify no
 hardcoded values, no missing documentation, no gaps between tests and intent. Apply the

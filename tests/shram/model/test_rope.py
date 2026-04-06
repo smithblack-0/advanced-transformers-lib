@@ -257,3 +257,96 @@ class TestRopeTypeCompatibility:
         assert q_rot.shape == q.shape
         assert k_rot.shape == k.shape
         assert scaling != 1.0
+
+
+# ---------------------------------------------------------------------------
+# Arbitrary position tensor shape (OD-4)
+# ---------------------------------------------------------------------------
+
+class TestArbitraryPositionShape:
+    """Verify that forward accepts position_ids of any shape, not only 2D (B, N).
+
+    BEA requires 3D position_ids (B, L, T) paired with q/k of shape (B, L, T, head_dim),
+    where L is the number of expert heads and T is packed sequence length. There are no
+    head dimensions in this layout — the rotation must apply element-wise without any
+    broadcast insertion.
+    """
+
+    def test_3d_position_ids_output_shapes(self):
+        """forward must accept 3D position_ids (B, L, T) and preserve q/k shapes."""
+        config = small_config()
+        rope = RotaryEmbedding(config)
+        B, L, T = 2, 4, 6
+        D = config.head_dim
+        q = torch.randn(B, L, T, D)
+        k = torch.randn(B, L, T, D)
+        position_ids = torch.randint(0, 16, (B, L, T))
+        q_rot, k_rot, _ = rope(q, k, position_ids)
+        assert q_rot.shape == (B, L, T, D)
+        assert k_rot.shape == (B, L, T, D)
+
+    def test_3d_rotation_matches_direct_gather(self):
+        """Rotation values for 3D position_ids must match manually gathered cos/sin.
+
+        Verifies that the extension correctly indexes the cache at each (b, l, t)
+        position and applies the rotation — not just that shapes are right.
+        """
+        config = small_config()
+        rope = RotaryEmbedding(config)
+        B, L, T = 2, 3, 4
+        D = config.head_dim
+        q = torch.randn(B, L, T, D)
+        k = torch.randn(B, L, T, D)
+        position_ids = torch.randint(0, 10, (B, L, T))
+
+        q_rot, k_rot, _ = rope(q, k, position_ids)
+
+        # Manually compute the expected rotation by indexing the cache directly.
+        cos = rope._cos_cached[position_ids]   # (B, L, T, D)
+        sin = rope._sin_cached[position_ids]
+        q_expected = q * cos + _rotate_half(q) * sin
+        k_expected = k * cos + _rotate_half(k) * sin
+
+        torch.testing.assert_close(q_rot, q_expected)
+        torch.testing.assert_close(k_rot, k_expected)
+
+    def test_3d_single_L_matches_2d(self):
+        """3D position_ids (B, 1, N) with q (B, 1, N, D) must produce the same rotation
+        as 2D position_ids (B, N) with the same q.
+
+        When L=1, the 3D layout collapses to a single sequence with no head dimension.
+        This cross-validates that the extension leaves 2D-equivalent semantics intact.
+        """
+        config = small_config()
+        rope = RotaryEmbedding(config)
+        B, N, D = 1, 6, config.head_dim
+        q = torch.randn(B, 1, N, D)
+        k = torch.randn(B, 1, N, D)
+        positions_3d = torch.arange(N).reshape(1, 1, N).expand(B, 1, N)
+        positions_2d = positions_3d.squeeze(1)   # (B, N)
+
+        q_rot_3d, k_rot_3d, _ = rope(q, k, positions_3d)
+        q_rot_2d, k_rot_2d, _ = rope(q, k, positions_2d)
+
+        torch.testing.assert_close(q_rot_3d, q_rot_2d)
+        torch.testing.assert_close(k_rot_3d, k_rot_2d)
+
+    def test_attention_scaling_unaffected_by_position_ids_shape(self):
+        """attention_scaling must be identical regardless of position_ids dimensionality."""
+        config = small_config(
+            max_position_embeddings=512,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 512,
+            },
+        )
+        rope = RotaryEmbedding(config)
+        D = config.head_dim
+        q2 = torch.randn(1, 1, 4, D)
+        k2 = torch.randn(1, 1, 4, D)
+        q3 = torch.randn(1, 1, 4, D)
+        k3 = torch.randn(1, 1, 4, D)
+        _, _, scaling_2d = rope(q2, k2, torch.arange(4).unsqueeze(0))
+        _, _, scaling_3d = rope(q3, k3, torch.arange(4).reshape(1, 1, 4))
+        assert scaling_2d == scaling_3d
