@@ -16,7 +16,7 @@ Do not bypass or duplicate this system.
 from transformers import PretrainedConfig
 
 
-class Llama3Config(PretrainedConfig):
+class MosaConfig(PretrainedConfig):
     """Configuration class for the Llama 3 baseline decoder-only transformer.
 
     This config is the single source of truth for every architectural dimension of the
@@ -26,7 +26,7 @@ class Llama3Config(PretrainedConfig):
 
     RoPE scaling is handled by HuggingFace's rope system. Pass rope_scaling as a dict
     using HF's format (key is ``rope_type``, not ``type``). Supported types:
-    ``"linear"``, ``"dynamic"``, ``"yarn"``, ``"longrope"``, ``"llama3"``. HF validates
+    ``"linear"``, ``"dynamic"``, ``"yarn"``, ``"longrope"``, ``"mosa"``. HF validates
     the dict and standardises it into ``config.rope_parameters``.
 
     Registered with HuggingFace AutoClass via ``auto_map``. Instantiate from the Hub::
@@ -66,7 +66,7 @@ class Llama3Config(PretrainedConfig):
             never be hardcoded in the architecture.
         max_position_embeddings: The context length the model was trained at. Used by
             HF's rope system as original_max_position_embeddings for scaling types that
-            need it (yarn, longrope, llama3). This is the training context length, not
+            need it (yarn, longrope, mosa). This is the training context length, not
             an inference ceiling — the rope module handles longer sequences at runtime
             via lazy cache extension. Llama 3 base training context: 8192.
         rope_scaling: Optional RoPE scaling configuration for extending context beyond
@@ -84,14 +84,14 @@ class Llama3Config(PretrainedConfig):
             weights. False for Llama 3.
     """
 
-    model_type = "llama3_baseline"
+    model_type = "mosa_baseline"
 
     # auto_map tells HuggingFace which classes to instantiate when loading this config
     # with trust_remote_code=True. Paths are relative to the Hub repository root, not
     # the local src/ layout — these are the paths used after HF downloads the files.
     auto_map = {
-        "AutoConfig": "configuration.Llama3Config",
-        "AutoModelForCausalLM": "huggingface.Llama3ForCausalLM",
+        "AutoConfig": "configuration.MosaConfig",
+        "AutoModelForCausalLM": "huggingface.MosaForCausalLM",
     }
 
     def __init__(

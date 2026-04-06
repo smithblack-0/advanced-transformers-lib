@@ -1,4 +1,4 @@
-"""Integration and end-to-end tests for the Llama 3 baseline.
+"""Integration and end-to-end tests for SHRAM.
 
 Two test layers live here:
 
@@ -17,15 +17,15 @@ import torch
 import pytest
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.model.huggingface import Llama3ForCausalLM
+from src.shram.model.configuration import ShramConfig
+from src.shram.model.huggingface import ShramForCausalLM
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def small_config(**kwargs) -> Llama3Config:
+def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
         hidden_size=64,
         num_attention_heads=4,
@@ -35,12 +35,12 @@ def small_config(**kwargs) -> Llama3Config:
         vocab_size=256,
     )
     defaults.update(kwargs)
-    return Llama3Config(**defaults)
+    return ShramConfig(**defaults)
 
 
 @pytest.fixture
-def model() -> Llama3ForCausalLM:
-    return Llama3ForCausalLM(small_config()).eval()
+def model() -> ShramForCausalLM:
+    return ShramForCausalLM(small_config()).eval()
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ class TestIntegrationBeamSearch:
 class TestIntegrationTrainable:
     def test_loss_backward_runs(self):
         """loss.backward() must complete without error on the full assembled model."""
-        m = Llama3ForCausalLM(small_config()).train()
+        m = ShramForCausalLM(small_config()).train()
         ids = torch.randint(0, 256, (1, 4))
         out = m(ids, labels=ids, use_cache=False)
         out.loss.backward()
@@ -112,7 +112,7 @@ class TestIntegrationTrainable:
         independent tensors and both must have gradients. The loss path runs through
         the full stack: embed_tokens → decoder layers → lm_head → cross-entropy.
         """
-        m = Llama3ForCausalLM(small_config()).train()
+        m = ShramForCausalLM(small_config()).train()
         ids = torch.randint(0, 256, (1, 4))
         out = m(ids, labels=ids, use_cache=False)
         out.loss.backward()
@@ -127,21 +127,21 @@ class TestIntegrationTrainable:
 
 class TestIntegrationAutoClass:
     def test_from_config_after_local_registration(self):
-        """AutoModelForCausalLM.from_config must return a Llama3ForCausalLM after
+        """AutoModelForCausalLM.from_config must return a ShramForCausalLM after
         local AutoClass registration — the same path a researcher uses before or
         without Hub access.
         """
-        AutoConfig.register("llama3_baseline", Llama3Config)
-        AutoModelForCausalLM.register(Llama3Config, Llama3ForCausalLM)
+        AutoConfig.register("shram", ShramConfig)
+        AutoModelForCausalLM.register(ShramConfig, ShramForCausalLM)
         m = AutoModelForCausalLM.from_config(small_config())
-        assert isinstance(m, Llama3ForCausalLM)
+        assert isinstance(m, ShramForCausalLM)
 
 
 # ---------------------------------------------------------------------------
 # Hub constant (Unit 10)
 # ---------------------------------------------------------------------------
 
-HUB_REPO = "smithblack-0/llama3_baseline"
+HUB_REPO = "smithblack-0/shram"
 
 
 # ---------------------------------------------------------------------------
@@ -193,12 +193,12 @@ class TestE2ELoadable:
 
     def test_config_model_type(self, hub_config):
         """Config loaded from Hub must identify as the expected model type."""
-        assert hub_config.model_type == "llama3_baseline"
+        assert hub_config.model_type == "shram"
 
     def test_model_instantiates_from_hub_config(self, hub_config):
-        """AutoModelForCausalLM.from_config must produce a Llama3ForCausalLM."""
+        """AutoModelForCausalLM.from_config must produce a ShramForCausalLM."""
         model = AutoModelForCausalLM.from_config(hub_config, trust_remote_code=True)
-        assert type(model).__name__ == "Llama3ForCausalLM"
+        assert type(model).__name__ == "ShramForCausalLM"
 
 
 # ---------------------------------------------------------------------------

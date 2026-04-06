@@ -14,15 +14,15 @@ than absolute position.
 import pytest
 import torch
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.model.rope import RotaryEmbedding, _rotate_half
+from src.mosa.model.configuration import MosaConfig
+from src.mosa.model.rope import RotaryEmbedding, _rotate_half
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def small_config(**kwargs) -> Llama3Config:
+def small_config(**kwargs) -> MosaConfig:
     """Config with small dimensions sufficient to exercise rope without scale noise."""
     defaults = dict(
         hidden_size=64,
@@ -32,11 +32,11 @@ def small_config(**kwargs) -> Llama3Config:
         num_hidden_layers=2,
     )
     defaults.update(kwargs)
-    return Llama3Config(**defaults)
+    return MosaConfig(**defaults)
 
 
 def random_qk(
-    config: Llama3Config,
+    config: MosaConfig,
     batch: int = 2,
     seq: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

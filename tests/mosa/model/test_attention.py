@@ -10,15 +10,15 @@ import torch
 import pytest
 from transformers import DynamicCache
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.model.attention import GroupedQueryAttention
+from src.mosa.model.configuration import MosaConfig
+from src.mosa.model.attention import GroupedQueryAttention
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def small_config(**kwargs) -> Llama3Config:
+def small_config(**kwargs) -> MosaConfig:
     defaults = dict(
         hidden_size=64,
         num_attention_heads=4,
@@ -27,11 +27,11 @@ def small_config(**kwargs) -> Llama3Config:
         num_hidden_layers=2,
     )
     defaults.update(kwargs)
-    return Llama3Config(**defaults)
+    return MosaConfig(**defaults)
 
 
 def make_input(
-    config: Llama3Config,
+    config: MosaConfig,
     batch: int = 2,
     seq: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:

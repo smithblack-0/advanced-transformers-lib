@@ -18,7 +18,7 @@ model from config. Override any parameter at instantiation time.
 
 > **Important:** `trust_remote_code=True` is required. It downloads the architecture
 > source files from the Hub and imports them into your Python process. Review the
-> source at [smithblack-0/llama3_baseline](https://huggingface.co/smithblack-0/llama3_baseline) before use.
+> source at [smithblack-0/mosa_baseline](https://huggingface.co/smithblack-0/mosa_baseline) before use.
 
 ## Usage
 
@@ -27,7 +27,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 # Pull architecture config -- override any parameter at instantiation time
 config = AutoConfig.from_pretrained(
-    "smithblack-0/llama3_baseline",
+    "smithblack-0/mosa_baseline",
     trust_remote_code=True,
     num_hidden_layers=16,  # example override
 )
@@ -36,7 +36,7 @@ config = AutoConfig.from_pretrained(
 model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
 # Load tokenizer
-tokenizer = AutoTokenizer.from_pretrained("smithblack-0/llama3_baseline")
+tokenizer = AutoTokenizer.from_pretrained("smithblack-0/mosa_baseline")
 
 # Save and reload after training
 model.save_pretrained("./checkpoint")

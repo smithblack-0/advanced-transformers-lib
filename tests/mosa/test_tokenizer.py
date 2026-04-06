@@ -10,9 +10,9 @@ Three test categories:
 
 3. Model directory state — requires prepare_tokenizer to have been run at
    least once against the real model directory. Skipped automatically if
-   tokenizer files are not present; run src/llama3/tokenizer.py to populate.
+   tokenizer files are not present; run src/mosa/tokenizer.py to populate.
 
-4. Config alignment — verifies Llama3Config default vocab_size matches the
+4. Config alignment — verifies MosaConfig default vocab_size matches the
    GPT-NeoX tokenizer. Offline; no tokenizer files required.
 """
 
@@ -22,10 +22,10 @@ from pathlib import Path
 import pytest
 from transformers import AutoTokenizer
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.tokenizer import _ensure_fast_tokenizer_class, prepare_tokenizer
+from src.mosa.model.configuration import MosaConfig
+from src.mosa.tokenizer import _ensure_fast_tokenizer_class, prepare_tokenizer
 
-MODEL_DIR = Path("src/llama3/model")
+MODEL_DIR = Path("src/mosa/model")
 EXPECTED_VOCAB_SIZE = 50277
 
 
@@ -118,7 +118,7 @@ class TestPrepareTokenizer:
 
 @pytest.mark.skipif(
     not _tokenizer_files_present(),
-    reason="tokenizer not prepared — run: python src/llama3/tokenizer.py",
+    reason="tokenizer not prepared — run: python src/mosa/tokenizer.py",
 )
 class TestTokenizerInModelDir:
     def test_tokenizer_config_has_fast_class(self):
@@ -145,9 +145,9 @@ class TestTokenizerInModelDir:
 
 class TestConfigAlignment:
     def test_default_vocab_size_matches_tokenizer(self):
-        """Llama3Config default vocab_size must match GPT-NeoX's 50,280.
+        """MosaConfig default vocab_size must match GPT-NeoX's 50,280.
 
         A mismatch means the embedding table and logit layer would be sized
         wrong for the tokenizer that ships with the model.
         """
-        assert Llama3Config().vocab_size == EXPECTED_VOCAB_SIZE
+        assert MosaConfig().vocab_size == EXPECTED_VOCAB_SIZE

@@ -1,11 +1,11 @@
 """Prepare the GPT-NeoX tokenizer for Hub distribution.
 
 Run this script before upload_to_hub.py to ensure the tokenizer files are
-present and correct in src/llama3/model/. upload_to_hub.py will then include
+present and correct in src/mosa/model/. upload_to_hub.py will then include
 them in the Hub upload so that AutoTokenizer.from_pretrained works for
 researchers pulling the repository.
 
-    python src/llama3/tokenizer.py
+    python src/mosa/tokenizer.py
 
 Known issue handled here: AutoTokenizer.save_pretrained can write the slow
 tokenizer class name to tokenizer_config.json even when the fast tokenizer
@@ -38,7 +38,7 @@ def prepare_tokenizer(dest: Path = MODEL_DIR) -> None:
 
     Args:
         dest: Directory to write tokenizer files into. Defaults to
-            src/llama3/model/ — the Hub distribution folder.
+            src/mosa/model/ — the Hub distribution folder.
     """
     print(f"Fetching tokenizer from {SOURCE_REPO}...")
     tokenizer = AutoTokenizer.from_pretrained(SOURCE_REPO)

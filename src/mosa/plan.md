@@ -20,23 +20,23 @@ The process it records:
 
 ## Completion Record
 
-- [ ] Preliminary — copy llama3 to mosa, rename, verify baseline tests pass
-- [ ] Unit 1 — configuration.py
-- [ ] Unit 2 — rope.py (index-aware extension for sparse heads)
-- [ ] Unit 3 — attention.py (MoSA hybrid attention layer)
-- [ ] Unit 4 — decoder_layer.py
-- [ ] Unit 5 — model.py
-- [ ] Unit 6 — huggingface.py
-- [ ] Unit 7 — upload_to_hub.py
-- [ ] Unit 8 — Documentation
-- [ ] Unit 9 — End-to-End Tests
-- [ ] Unit 10 — Audit
+- [x] Preliminary — copy llama3 to mosa, rename, verify baseline tests pass
+- [x] Unit 1 — audit the copy against MoSA requirements; produce ordered change list
+- [ ] Unit 2 — configuration.py (add MoSA params; resolve open decision: param names/defaults)
+- [ ] Unit 3 — attention.py (MoSA hybrid layer; resolve open decisions: GQA/MHA, routing, cache)
+- [ ] Unit 4 — rope.py (add rotate_fraction support for sparse heads)
+- [ ] Unit 5 — decoder_layer.py (wire up new attention class)
+- [ ] Unit 6 — huggingface.py (causal mask and cache handling)
+- [ ] Unit 7 — upload_to_hub
+- [ ] Unit 8 — documentation
+- [ ] Unit 9 — end-to-end tests
+- [ ] Unit 10 — audit
 
 ---
 
 ## Status
 
-**Current state:** Plan written. Not yet started.
+**Current state:** Units 1 complete. Change list produced. 110 local tests pass on the mosa copy. Unit 2 not yet started.
 
 ---
 
@@ -131,239 +131,179 @@ afterward. A component without passing tests is not complete regardless of how c
 
 ---
 
-## Repository Structure
-
-```
-advanced-transformers-lib/
-├── src/
-│   └── mosa/
-│       ├── model/                  ← contents uploaded flat to Hub root
-│       │   ├── __init__.py
-│       │   ├── configuration.py    # Unit 1
-│       │   ├── rope.py             # Unit 2
-│       │   ├── attention.py        # Unit 3
-│       │   ├── decoder_layer.py    # Unit 4
-│       │   ├── model.py            # Unit 5
-│       │   ├── huggingface.py      # Unit 6
-│       │   ├── type_aliases.py
-│       │   └── README.md
-│       ├── upload_to_hub.py        # Unit 7
-│       └── tokenizer.py
-└── tests/
-    └── mosa/
-        ├── __init__.py
-        ├── test_tokenizer.py
-        └── model/
-            ├── __init__.py
-            ├── test_configuration.py
-            ├── test_rope.py
-            ├── test_attention.py
-            ├── test_decoder_layer.py
-            ├── test_model.py
-            └── test_huggingface.py
-```
-
-This structure is the expected outcome of the preliminary copy-and-rename step. File granularity is
-confirmed at the start of each unit and may be revised if responsibilities turn out larger or
-smaller than anticipated.
-
-**RMSNorm:** `torch.nn.RMSNorm` is used directly. No separate file or unit. As in the Llama 3
-baseline, each point of use carries a comment explaining why RMSNorm was chosen.
-
----
-
-## Open Decisions
-
-These must be resolved and surfaced to the user before the affected unit begins. They are recorded
-here so they are not forgotten and are not resolved silently.
-
-**1. KV-cache support.**
-The MoSA reference implementation has no cache support. The paper describes a theoretical cache
-reduction benefit (sparse heads cache only k KV slots rather than T) but does not implement it.
-Options range from disabling `use_cache` entirely to implementing partial cache support for dense
-heads only. The correct answer depends on research intent and must be decided before Unit 6
-(huggingface.py).
-
-**2. Non-autoregressive routing.**
-During training, the MoSA router scores all tokens over the full input sequence — including future
-tokens. During autoregressive inference, only past tokens are available. This train/inference
-mismatch is acknowledged in the paper and is unresolved in the reference implementation. Whether to
-accept this as-is (as the paper does) or introduce a mechanism to mask future tokens during routing
-must be decided before Unit 3 (attention.py).
-
-**3. Dense heads: GQA or MHA.**
-The MoSA paper uses standard multi-head attention for its dense heads. The Llama 3 baseline uses
-Grouped Query Attention. Whether the dense heads in the hybrid layer use GQA (consistent with the
-baseline) or MHA (consistent with the paper) must be decided before Unit 3.
-
-**4. MoSA-specific config parameter names and defaults.**
-The set of parameters controlling head counts, sparsity, routing behaviour, and RoPE adaptation
-must be named and given sensible defaults before Unit 1 (configuration.py). Naming follows the
-conventions already established in the Llama 3 config.
-
----
-
-## Implementation Order
-
-The order below is preferred, not fixed. Blockers are handled via the stack mechanism.
-
-0. **Preliminary** — copy `src/llama3/` → `src/mosa/`, copy `tests/llama3/` → `tests/mosa/`;
-   rename all classes and strings from `Llama3`/`llama3` to `Mosa`/`mosa`; verify all copied
-   tests pass before touching any logic.
-1. **configuration.py** — resolve open decision 4; add MoSA-specific parameters
-2. **rope.py** — verify existing RoPE transfers; implement index-aware variant for sparse heads
-3. **attention.py** — MoSA hybrid layer; resolve open decisions 2 and 3 before starting
-4. **decoder_layer.py** — verify copy transfers; adapt to new attention signature if needed
-5. **model.py** — verify copy transfers; adapt if needed
-6. **huggingface.py** — resolve open decision 1; adapt mask threading and cache handling
-7. **upload_to_hub.py** — adapt for mosa model type and class names
-8. **Documentation** — documentation.md and README.md model card
-9. **End-to-End Tests** — full stack training and generation smoke tests
-10. **Audit** — review every file against invariants in job.md; close any gaps found
-
----
-
-## HuggingFace AutoClass Protocol
-
-Same protocol as the Llama 3 baseline. The `auto_map` in `config.json` must point to the correct
-class names and files. `model_type` must be unique — `"mosa"` is the expected value. The upload
-script pushes the `model/` directory contents flat to the Hub root alongside `config.json`.
-
----
-
 ## Units of Work
 
 ---
 
-### Preliminary — Copy and Rename
+### Preliminary — Copy and Rename ✓
 
-**What:** Copy `src/llama3/` to `src/mosa/` and `tests/llama3/` to `tests/mosa/` using shell
-commands. Rename all class names, module references, and string identifiers from `Llama3`/`llama3`
-to `Mosa`/`mosa` throughout. Update `model_type` in configuration.py to `"mosa"`. Verify all
-copied tests pass before any logic is changed.
-
-**Why it exists:** The Llama 3 baseline is a known-good verified implementation. Starting from a
-working copy rather than a blank slate eliminates mechanical errors in the scaffolding and lets the
-units that follow focus exclusively on what is genuinely new.
-
-**Invariants this preliminary step must satisfy:**
-- `src/mosa/` and `tests/mosa/` exist and mirror the llama3 structure exactly, with all names
-  updated.
-- All copied tests pass against the copied (unmodified) implementation.
-- `src/llama3/` and `tests/llama3/` are untouched.
+`src/mosa/` and `tests/mosa/` copied from `src/llama3/` and `tests/llama3/`. All class names,
+module references, and string identifiers renamed from `Llama3`/`llama3` to `Mosa`/`mosa`.
+`model_type` updated to `"mosa"`. 110 local tests pass. `src/llama3/` and `tests/llama3/`
+untouched.
 
 ---
 
-### Unit 1 — configuration.py
+### Unit 1 — Audit the Copy; Produce the Change List
 
-**What:** Adapt `MosaConfig` from the copied Llama 3 config. Verify all existing parameters are
-still correct. Add MoSA-specific parameters for: head count split (dense vs sparse), sparsity
-control (tokens selected per head), routing behaviour (first-token forcing), and RoPE adaptation
-fraction. Exact names and defaults to be decided and surfaced before this unit begins (open
-decision 4).
+**What:** Read the MoSA paper and reference repository against the copied mosa source. For each
+file in `src/mosa/`, determine: does it transfer unchanged, does it need modification, or does it
+need replacement? For each file that needs modification or replacement, describe what must change
+and why, and identify any open decisions that must be resolved before that work can begin.
+
+The output of this unit is a fully populated change list appended to this plan — one entry per
+affected file, with rationale and open decisions called out. The units 2..N in the completion
+record are filled in at that point. No code is written in this unit.
+
+**Why it exists:** We do not yet know the full scope of changes required. Committing to a unit
+breakdown before understanding the problem produces a plan that will be wrong. This unit produces
+the evidence the plan needs before implementation begins.
 
 **Invariants this unit must satisfy:**
-- All parameters from the Llama 3 config that remain architecturally relevant are present.
+- Every file in `src/mosa/` has been assessed.
+- Every required change has a stated rationale grounded in the paper or reference repo.
+- Every open decision is named and tied to the unit where it must be resolved.
+- The completion record is updated with concrete unit numbers.
+- No code has been written or modified.
+
+**Change list — file-by-file assessment:**
+
+| File | Status | Summary |
+|------|--------|---------|
+| `model/configuration.py` | Modify | Add MoSA-specific params; fix stale "Llama 3" docstring references; update model_type |
+| `model/rope.py` | Modify | Add `rotate_fraction` support; existing position-gather logic already handles arbitrary indices |
+| `model/attention.py` | Replace | Entire new MoSA hybrid attention layer; GQA module does not transfer |
+| `model/decoder_layer.py` | Modify | Import new attention class; forward signature may need minor adaptation |
+| `model/model.py` | Trivial | Class references already renamed; logic transfers unchanged |
+| `model/huggingface.py` | Modify | Causal mask threading and cache handling need rethinking for MoSA |
+| `model/mlp.py` | None | Transfers unchanged |
+| `model/type_aliases.py` | None | Transfers unchanged |
+| `model/__init__.py` | None | Transfers unchanged |
+| `tokenizer.py` | None | Transfers unchanged |
+| `upload_to_hub.py` | Trivial | Class names already renamed; content updates deferred to Unit 7 |
+
+**Detail — configuration.py:**
+Needs five new parameters for MoSA: head count split (dense vs sparse), sparsity denominator,
+first-token forcing flag, and RoPE rotate fraction. Exact names and defaults are an open decision
+(resolved at start of Unit 2). Existing params transfer. Stale "Llama 3" text in docstrings needs
+updating. `model_type` should be simplified from `"mosa_baseline"` to `"mosa"`.
+
+**Detail — rope.py:**
+The existing `RotaryEmbedding.forward()` already gathers cos/sin at arbitrary `position_ids`, so
+index-aware RoPE for sparse heads works without structural change. The only new requirement is
+`rotate_fraction`: only a configurable fraction of head dimensions should receive rotation; the
+remainder pass through unchanged. This requires a new parameter and a small change to the apply
+step. Whether this is a method parameter or a constructor parameter is decided at Unit 4.
+
+**Detail — attention.py:**
+Full replacement. The MoSA hybrid layer:
+- Dense heads: standard causal MHA/GQA (open decision: which — Unit 3)
+- Sparse MoSA heads: per-head router (Linear → sigmoid), top-k selection, optional first-token
+  forcing, gather from sequence, per-head Q/K/V projections, index-aware RoPE, structurally-derived
+  causal mask (from original positions), SDPA, router-score gating of output, scatter back
+- Layer output: sum of all head outputs
+The file will be substantially new. Tests for this unit are entirely new.
+
+**Detail — decoder_layer.py:**
+Currently imports `GroupedQueryAttention`. Will import the new hybrid attention class instead. The
+forward signature `(x, position_ids, cache, layer_idx, causal_mask)` may need revision depending
+on what the new attention module requires — in particular, whether `causal_mask` is still relevant
+for sparse heads (it is not — they build their own) or only for dense heads (potentially yes).
+This is clarified during Unit 3 and resolved as a blocker if needed.
+
+**Detail — huggingface.py:**
+Currently builds a `causal_mask` for `use_cache=True` and threads it through the stack. With MoSA,
+sparse heads ignore this mask (they derive causality from token indices). Dense heads may still use
+it. Whether to keep, remove, or narrow the mask threading depends on what Unit 3 decides about
+the dense head interface. KV-cache support (open decision) also lives here.
+
+**Open decisions (must be resolved before the named unit begins):**
+
+1. **Config param names and defaults** (Unit 2): What are the MoSA-specific config params called
+   and what are their defaults? Names should follow the existing config conventions.
+
+2. **Dense heads: GQA or MHA?** (Unit 3): The paper uses standard MHA. The baseline uses GQA.
+   Dense heads in the hybrid layer — which do we use?
+
+3. **Non-autoregressive routing** (Unit 3): During training the router sees the full sequence
+   including future tokens; during inference it only sees past tokens. Do we accept this mismatch
+   as-is (as the paper does), or add a mechanism to mask future tokens from the router?
+
+4. **KV-cache support** (Unit 6): The reference implementation has no cache. Do we support
+   `use_cache=True` at all? Options: disable entirely, support for dense heads only, or full
+   support.
+
+---
+
+### Unit 2 — configuration.py
+
+**What:** Add MoSA-specific parameters to `MosaConfig`. Fix stale "Llama 3" text in docstrings.
+Update `model_type` to `"mosa"`. Resolve open decision 1 (param names and defaults) before
+starting.
+
+**Invariants this unit must satisfy:**
 - All MoSA-specific parameters are present with correct types, defaults, and validation.
+- All existing parameters from the Llama 3 baseline that remain relevant are present and unchanged.
 - `model_type` is `"mosa"`.
-- `auto_map` points to the correct MoSA class names.
-- All parameters are documented with rationale in this plan.
+- All parameters are documented with rationale consistent with the style of the existing config.
+- `test_configuration.py` passes and accurately reflects the new parameters.
 
 ---
 
-### Unit 2 — rope.py
+### Unit 3 — attention.py
 
-**What:** Verify that the standard RoPE implementation transfers unchanged for dense heads. Implement
-an index-aware RoPE variant for sparse heads: given a set of original sequence position indices,
-apply rotary encodings at those positions rather than at contiguous positions 0..k-1. The
-`rotate_fraction` parameter (controlling what fraction of head dimensions receive rotation) must be
-supported and configurable. Whether this is an extension of the existing module or a separate
-module is a decision to make at the start of this unit.
+**What:** Replace the GQA module with the MoSA hybrid attention layer. Resolve open decisions 2
+(GQA/MHA for dense heads) and 3 (non-autoregressive routing) before starting. The sparse head
+computation — router, gather, projection, index-aware RoPE, causal mask, attention, gating,
+scatter — is entirely new. Dense heads are adapted from the existing attention module.
+`test_attention.py` is substantially rewritten for the new component.
 
-**Invariants this unit must satisfy:**
-- Standard RoPE (used by dense heads) produces identical output to the Llama 3 baseline for the
-  same inputs.
-- Index-aware RoPE produces correct rotations at the specified original sequence positions.
-- A token gathered from position `i` in a sparse head receives the same rotation it would have
-  received at position `i` in a dense head.
-- `rotate_fraction` is respected: dimensions outside the rotated fraction are passed through
-  unchanged.
-- All behaviour is driven by config; no hardcoded values.
-
----
-
-### Unit 3 — attention.py (MoSA hybrid layer)
-
-**What:** The primary new component. Implements the full MoSA hybrid attention layer combining
-dense heads and sparse MoSA heads. Open decisions 2 (non-autoregressive routing) and 3 (GQA vs
-MHA for dense heads) must be resolved and surfaced before this unit begins.
-
-The sparse head computation:
-- Router: learned per-head per-token scorer producing a score in [0, 1] via sigmoid.
-- Top-k selection: select the k highest-scoring tokens per head; k is derived from config.
-- Optional first-token forcing: if configured, token 0 is always included.
-- Gather: extract the k selected tokens from the full sequence.
-- Projection: per-head Q, K, V projections over the k-token subset only.
-- Index-aware RoPE: apply rotary encodings at original sequence positions.
-- Causal mask: derived structurally from original positions of selected tokens — token i attends
-  to token j only if j's original position ≤ i's original position.
-- Attention: standard scaled dot-product attention over the k×k subset.
-- Router gating: scale attention output by router scores before output projection.
-- Output projection and scatter: project back to hidden dimension, scatter to full sequence.
-
-Dense head computation follows the Llama 3 baseline. Layer output is the sum of all head outputs.
+This unit is likely to surface blockers (e.g. rope.py needing rotate_fraction before attention
+can be completed). Those are pushed onto the stack and resolved in order.
 
 **Invariants this unit must satisfy:**
 - The hybrid layer accepts `[B, T, h]` and returns `[B, T, h]`.
-- Sparse heads attend only to the selected k tokens; no other tokens receive or contribute
-  attention in those heads.
-- Causality is enforced correctly: no sparse head can attend to a token at a later original
-  position.
-- RoPE uses original sequence positions, not local positions within the gathered subset.
-- Router gradients flow correctly — the scalar gating by router scores is the gradient bridge
-  through the non-differentiable top-k operation.
-- All parameters (head counts, sparsity, routing, RoPE fraction) are driven by config.
-- Dense heads and sparse heads are independently verifiable in tests.
+- Sparse heads attend only to their k selected tokens; causality is enforced by original positions.
+- RoPE uses original sequence positions for sparse heads.
+- Router gradients flow through the scalar gating (the gradient bridge through non-differentiable top-k).
+- Dense and sparse paths are independently testable.
+- All parameters are driven by config.
 
 ---
 
-### Unit 4 — decoder_layer.py
+### Unit 4 — rope.py
 
-**What:** Verify the copied decoder layer wires correctly to the new attention module. Adapt the
-forward signature if the MoSA hybrid attention layer requires different arguments than the Llama 3
-attention module. No logic changes beyond what compatibility requires.
+**What:** Add `rotate_fraction` support to `RotaryEmbedding`. Only the specified fraction of head
+dimensions receive rotation; the rest pass through unchanged. This is required by MoSA sparse
+heads. Whether this is a constructor or call-site parameter is decided at the start of this unit.
 
 **Invariants this unit must satisfy:**
-- The decoder layer produces correct output when given known inputs.
-- The attention sub-layer, norm, and MLP are composed in the correct order.
-- Any changes to the forward signature are minimal and justified.
+- Standard behaviour (rotate_fraction=1.0) is identical to the existing implementation.
+- At rotate_fraction < 1.0, only the specified fraction of dimensions is rotated.
+- `test_rope.py` covers both the full-rotation and partial-rotation cases.
 
 ---
 
-### Unit 5 — model.py
+### Unit 5 — decoder_layer.py
 
-**What:** Verify the copied model stack wires correctly to the new decoder layer. Adapt if needed.
-No logic changes beyond what compatibility requires.
+**What:** Update the import to use the new hybrid attention class. Adapt the forward signature if
+Unit 3 changed what the attention module expects. Minimal changes only.
 
 **Invariants this unit must satisfy:**
-- The model stack correctly passes inputs through all decoder layers.
-- `position_ids` and `causal_mask` threading (if still applicable after Unit 3 decisions) is
-  correct.
-- Hidden states from all layers are correctly collected when `output_hidden_states=True`.
+- The decoder layer correctly composes the new attention module with RMSNorm and MLP.
+- `test_decoder_layer.py` passes.
 
 ---
 
 ### Unit 6 — huggingface.py
 
-**What:** Adapt the HuggingFace wrapper for the MoSA variant. Resolve open decision 1 (KV-cache)
-before starting. Adapt causal mask construction and threading to account for the fact that sparse
-heads derive their own causality internally — the external mask may only be relevant for dense
-heads, or may not be needed at all. The correct answer must be reasoned through and surfaced.
+**What:** Resolve open decision 4 (KV-cache support). Adapt causal mask construction and threading
+to match what the hybrid attention layer actually needs after Unit 3. Minimal changes beyond what
+is required.
 
 **Invariants this unit must satisfy:**
-- The model can be instantiated via `AutoModelForCausalLM.from_config` and trained.
-- Forward pass contract (inputs, outputs, error conditions) is documented and enforced.
-- KV-cache behaviour (whether supported and how) is clearly documented and tested.
+- Forward pass contract is correct and documented.
+- Cache behaviour (whether supported and how) is tested and documented.
 - Causal masking is correct for all code paths.
 
 ---
@@ -371,8 +311,8 @@ heads, or may not be needed at all. The correct answer must be reasoned through 
 ### Unit 7 — upload_to_hub.py
 
 **What:** Adapt the upload script for the MoSA model type. Update class names, model type string,
-and model card content. The script must register `MosaConfig` and `MosaForCausalLM` with the
-AutoClass API and push all model files to the Hub.
+and model card content. Register `MosaConfig` and `MosaForCausalLM` with the AutoClass API and
+push all model files to the Hub.
 
 **Invariants this unit must satisfy:**
 - A freshly instantiated model can be round-tripped: upload → `from_pretrained` → forward pass.
@@ -383,14 +323,13 @@ AutoClass API and push all model files to the Hub.
 
 ### Unit 8 — Documentation
 
-**What:** Write `documentation.md` covering design decisions, deviations from the paper, and any
-limitations. Update `README.md` (model card) with accurate architectural details. Document all open
-decisions that were made during implementation and the rationale for each.
+**What:** Write `documentation.md` covering design decisions, deviations from the paper, and
+limitations. Update `README.md` with accurate architectural details. Record every open decision
+resolved during implementation and the rationale for each.
 
 **Invariants this unit must satisfy:**
 - Every open decision resolved during implementation is recorded with its rationale.
-- Limitations (e.g. train/inference routing mismatch, if accepted as-is) are documented
-  explicitly.
+- Limitations are documented explicitly.
 - The model card accurately describes the MoSA variant.
 
 ---
@@ -398,7 +337,8 @@ decisions that were made during implementation and the rationale for each.
 ### Unit 9 — End-to-End Tests
 
 **What:** Full-stack smoke tests: instantiate from config, run a training step, verify loss
-decreases. Mirror the Llama 3 end-to-end test structure.
+decreases. Mirror the Llama 3 end-to-end test structure. Include network tests for the Hub
+round-trip.
 
 **Invariants this unit must satisfy:**
 - The model can be instantiated from a config, run a forward pass, compute loss, and backpropagate
@@ -410,8 +350,8 @@ decreases. Mirror the Llama 3 end-to-end test structure.
 ### Unit 10 — Audit
 
 **What:** Review every file in `src/mosa/` against the invariants in `job.md`. Verify no
-hardcoded values, no missing documentation, no gaps between tests and intent. Apply the close-the-
-testing-gap rule to any defect found.
+hardcoded values, no missing documentation, no gaps between tests and intent. Apply the
+close-the-testing-gap rule to any defect found.
 
 **Invariants this unit must satisfy:**
 - Every invariant in job.md is satisfied and has a corresponding test.

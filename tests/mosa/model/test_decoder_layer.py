@@ -7,8 +7,8 @@ attention and MLP are correctly integrated (output feeds through both paths).
 import torch
 from transformers import DynamicCache
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.model.decoder_layer import DecoderLayer
+from src.mosa.model.configuration import MosaConfig
+from src.mosa.model.decoder_layer import DecoderLayer
 
 
 def make_causal_mask(cache_position: torch.Tensor, k_len: int) -> torch.Tensor:
@@ -25,7 +25,7 @@ def make_causal_mask(cache_position: torch.Tensor, k_len: int) -> torch.Tensor:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def small_config(**kwargs) -> Llama3Config:
+def small_config(**kwargs) -> MosaConfig:
     defaults = dict(
         hidden_size=64,
         num_attention_heads=4,
@@ -35,11 +35,11 @@ def small_config(**kwargs) -> Llama3Config:
         rms_norm_eps=1e-5,
     )
     defaults.update(kwargs)
-    return Llama3Config(**defaults)
+    return MosaConfig(**defaults)
 
 
 def make_input(
-    config: Llama3Config,
+    config: MosaConfig,
     batch: int = 2,
     seq: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:

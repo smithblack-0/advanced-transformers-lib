@@ -1,4 +1,4 @@
-"""Tests for Llama3ForCausalLM.
+"""Tests for MosaForCausalLM.
 
 Verifies the invariants documented in plan.md for Unit 7. Backbone correctness
 is covered by test_model.py and is not replicated here. These tests focus on
@@ -12,15 +12,15 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.model.huggingface import Llama3ForCausalLM
+from src.mosa.model.configuration import MosaConfig
+from src.mosa.model.huggingface import MosaForCausalLM
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def small_config(**kwargs) -> Llama3Config:
+def small_config(**kwargs) -> MosaConfig:
     defaults = dict(
         hidden_size=64,
         num_attention_heads=4,
@@ -30,12 +30,12 @@ def small_config(**kwargs) -> Llama3Config:
         vocab_size=256,
     )
     defaults.update(kwargs)
-    return Llama3Config(**defaults)
+    return MosaConfig(**defaults)
 
 
 @pytest.fixture
-def model() -> Llama3ForCausalLM:
-    return Llama3ForCausalLM(small_config()).eval()
+def model() -> MosaForCausalLM:
+    return MosaForCausalLM(small_config()).eval()
 
 
 # ---------------------------------------------------------------------------
@@ -141,12 +141,12 @@ class TestLoss:
 class TestWeightTying:
     def test_tied_weights_share_storage(self):
         """When tie_word_embeddings=True, lm_head and embed_tokens share the same data."""
-        m = Llama3ForCausalLM(small_config(tie_word_embeddings=True)).eval()
+        m = MosaForCausalLM(small_config(tie_word_embeddings=True)).eval()
         assert m.lm_head.weight.data_ptr() == m.embed_tokens.weight.data_ptr()
 
     def test_untied_weights_are_independent(self):
         """When tie_word_embeddings=False, lm_head and embed_tokens are separate."""
-        m = Llama3ForCausalLM(small_config(tie_word_embeddings=False)).eval()
+        m = MosaForCausalLM(small_config(tie_word_embeddings=False)).eval()
         assert m.lm_head.weight.data_ptr() != m.embed_tokens.weight.data_ptr()
 
 
@@ -256,7 +256,7 @@ class TestReorderCache:
     must be taken before calling _reorder_cache.
     """
 
-    def _make_cache(self, model: Llama3ForCausalLM, batch_size: int, seq_len: int):
+    def _make_cache(self, model: MosaForCausalLM, batch_size: int, seq_len: int):
         """Run a forward pass with a batch and return the resulting DynamicCache."""
         ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len))
         with torch.no_grad():
@@ -321,13 +321,13 @@ class TestConfigDefaults:
     def test_config_output_hidden_states_respected(self):
         """output_hidden_states from config must be used when not passed explicitly.
 
-        Config resolution lives in Llama3ForCausalLM.forward(), which reads
+        Config resolution lives in MosaForCausalLM.forward(), which reads
         config.output_hidden_states as the default. Verified by constructing a model
         with output_hidden_states=True in the config and confirming hidden_states are
         returned without passing the flag at call time.
         """
-        from src.llama3.model.configuration import Llama3Config
-        config = Llama3Config(
+        from src.mosa.model.configuration import MosaConfig
+        config = MosaConfig(
             hidden_size=64,
             num_attention_heads=4,
             num_key_value_heads=2,
@@ -336,15 +336,15 @@ class TestConfigDefaults:
             vocab_size=256,
             output_hidden_states=True,
         )
-        m = Llama3ForCausalLM(config).eval()
+        m = MosaForCausalLM(config).eval()
         with torch.no_grad():
             out = m(torch.randint(0, 256, (1, 4)), use_cache=False)
         assert out.hidden_states is not None
 
     def test_config_use_cache_respected(self):
         """use_cache from config must be used when not passed explicitly."""
-        from src.llama3.model.configuration import Llama3Config
-        config = Llama3Config(
+        from src.mosa.model.configuration import MosaConfig
+        config = MosaConfig(
             hidden_size=64,
             num_attention_heads=4,
             num_key_value_heads=2,
@@ -353,7 +353,7 @@ class TestConfigDefaults:
             vocab_size=256,
             use_cache=False,
         )
-        m = Llama3ForCausalLM(config).eval()
+        m = MosaForCausalLM(config).eval()
         with torch.no_grad():
             out = m(torch.randint(0, 256, (1, 4)))
         assert out.past_key_values is None
@@ -367,7 +367,7 @@ class TestSaveLoad:
     def test_save_pretrained_round_trip(self, model, tmp_path):
         """All weights must be identical after save_pretrained / from_pretrained."""
         model.save_pretrained(tmp_path)
-        loaded = Llama3ForCausalLM.from_pretrained(tmp_path)
+        loaded = MosaForCausalLM.from_pretrained(tmp_path)
 
         for (name, p1), (_, p2) in zip(
             model.named_parameters(), loaded.named_parameters()
@@ -377,12 +377,12 @@ class TestSaveLoad:
     def test_auto_model_from_config(self):
         """AutoModelForCausalLM.from_config must instantiate without error."""
         from transformers import AutoConfig
-        from src.llama3.model.configuration import Llama3Config
-        from src.llama3.model.huggingface import Llama3ForCausalLM
+        from src.mosa.model.configuration import MosaConfig
+        from src.mosa.model.huggingface import MosaForCausalLM
 
-        AutoConfig.register("llama3_baseline", Llama3Config)
-        AutoModelForCausalLM.register(Llama3Config, Llama3ForCausalLM)
+        AutoConfig.register("mosa_baseline", MosaConfig)
+        AutoModelForCausalLM.register(MosaConfig, MosaForCausalLM)
 
         config = small_config()
         m = AutoModelForCausalLM.from_config(config)
-        assert isinstance(m, Llama3ForCausalLM)
+        assert isinstance(m, MosaForCausalLM)

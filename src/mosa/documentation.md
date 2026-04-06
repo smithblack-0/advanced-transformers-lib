@@ -5,8 +5,8 @@
 ### Steps
 
 **1. Edit the repository name if needed.**
-Open `src/llama3/upload_to_hub.py` and check `REPO_ID` at the top. It is set to
-`smithblack-0/llama3_baseline` by default. Change it to match your intended
+Open `src/mosa/upload_to_hub.py` and check `REPO_ID` at the top. It is set to
+`smithblack-0/mosa_baseline` by default. Change it to match your intended
 HuggingFace repository before proceeding.
 
 **2. Create the repository on HuggingFace if it does not already exist.**
@@ -24,14 +24,14 @@ HuggingFace repository before proceeding.
 **4. Run the upload.**
 
 ```bash
-python -m src.llama3.upload_to_hub
+python -m src.mosa.upload_to_hub
 ```
 
 Paste the token when prompted. The script will:
 1. Refresh tokenizer files
 2. Write `config.json`
 3. Render the architecture card (`README.md`) from `model_card.md`
-4. Upload `src/llama3/model/` to the Hub repository root
+4. Upload `src/mosa/model/` to the Hub repository root
 
 **5. Delete the token (recommended).**
 Go back to Settings > Access Tokens and delete the token you just used.
@@ -44,11 +44,11 @@ From a fresh Python environment with no local HuggingFace cache:
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 config = AutoConfig.from_pretrained(
-    "smithblack-0/llama3_baseline",
+    "smithblack-0/mosa_baseline",
     trust_remote_code=True,
 )
 model = AutoModelForCausalLM.from_config(config)
-tokenizer = AutoTokenizer.from_pretrained("smithblack-0/llama3_baseline")
+tokenizer = AutoTokenizer.from_pretrained("smithblack-0/mosa_baseline")
 ```
 
 All three must succeed. The Hub repository must contain no weight files.
@@ -61,12 +61,12 @@ All three must succeed. The Hub repository must contain no weight files.
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 config = AutoConfig.from_pretrained(
-    "smithblack-0/llama3_baseline",
+    "smithblack-0/mosa_baseline",
     trust_remote_code=True,
     num_hidden_layers=16,  # override any parameter
 )
 model = AutoModelForCausalLM.from_config(config)
-tokenizer = AutoTokenizer.from_pretrained("smithblack-0/llama3_baseline")
+tokenizer = AutoTokenizer.from_pretrained("smithblack-0/mosa_baseline")
 ```
 
 `trust_remote_code=True` is required -- it downloads and imports the architecture
@@ -82,7 +82,7 @@ python -m pytest tests/
 
 Tests marked `@pytest.mark.network` require a network connection. Tests in
 `TestTokenizerInModelDir` are skipped if the tokenizer has not been prepared
-locally -- run `python src/llama3/tokenizer.py` first.
+locally -- run `python src/mosa/tokenizer.py` first.
 
 ---
 
@@ -90,7 +90,7 @@ locally -- run `python src/llama3/tokenizer.py` first.
 
 ### Repository structure and the WYSIWYG design
 
-`src/llama3/model/` is the Hub distribution unit. Its contents are uploaded directly to the Hub
+`src/mosa/model/` is the Hub distribution unit. Its contents are uploaded directly to the Hub
 repository root by `upload_to_hub.py` using `upload_folder` — no manifest, no copying, no
 transformation. What is in that directory is exactly what researchers receive. This means:
 
@@ -101,11 +101,11 @@ transformation. What is in that directory is exactly what researchers receive. T
 ### Relative imports inside model/
 
 All Python files inside `model/` must use relative imports (e.g. `from .configuration import
-Llama3Config`), not absolute imports (e.g. `from src.llama3.model.configuration import ...`).
+MosaConfig`), not absolute imports (e.g. `from src.mosa.model.configuration import ...`).
 
 When a researcher calls `AutoConfig.from_pretrained(..., trust_remote_code=True)`, HuggingFace
 downloads the `model/` contents into a local cache directory and adds that directory to `sys.path`.
-In that context there is no `src` or `llama3` package — absolute imports break immediately.
+In that context there is no `src` or `mosa` package — absolute imports break immediately.
 Relative imports work because `model/` contains `__init__.py` and Python resolves them within
 the package.
 

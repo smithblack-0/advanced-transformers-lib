@@ -1,4 +1,4 @@
-"""Tests for Llama3Config.
+"""Tests for MosaConfig.
 
 Each test verifies a specific invariant documented in the plan. The grouping mirrors
 the structure of the invariants: defaults, parameter overrides, structural validation,
@@ -10,14 +10,14 @@ here — we test that our config correctly passes parameters through to HF's sys
 
 import pytest
 
-from src.llama3.model.configuration import Llama3Config
+from src.mosa.model.configuration import MosaConfig
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def small_config(**kwargs) -> Llama3Config:
+def small_config(**kwargs) -> MosaConfig:
     """Return a config with small dimensions suitable for testing.
 
     Using full-scale defaults (hidden_size=4096 etc.) in tests that don't care about
@@ -32,7 +32,7 @@ def small_config(**kwargs) -> Llama3Config:
         num_hidden_layers=4,
     )
     defaults.update(kwargs)
-    return Llama3Config(**defaults)
+    return MosaConfig(**defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -42,22 +42,22 @@ def small_config(**kwargs) -> Llama3Config:
 class TestInstantiation:
     def test_default_instantiation_succeeds(self):
         """Config must instantiate without arguments — all parameters have defaults."""
-        config = Llama3Config()
+        config = MosaConfig()
         assert config is not None
 
     def test_model_type(self):
         """model_type must be unique to avoid colliding with HF's built-in 'llama'."""
-        assert Llama3Config.model_type == "llama3_baseline"
+        assert MosaConfig.model_type == "mosa_baseline"
 
     def test_auto_map_present(self):
         """auto_map must be set so HuggingFace trust_remote_code can find the classes."""
-        assert "AutoConfig" in Llama3Config.auto_map
-        assert "AutoModelForCausalLM" in Llama3Config.auto_map
+        assert "AutoConfig" in MosaConfig.auto_map
+        assert "AutoModelForCausalLM" in MosaConfig.auto_map
 
     def test_auto_map_points_to_correct_files(self):
         """auto_map paths must match the actual file layout used on the Hub."""
-        assert Llama3Config.auto_map["AutoConfig"] == "configuration.Llama3Config"
-        assert Llama3Config.auto_map["AutoModelForCausalLM"] == "huggingface.Llama3ForCausalLM"
+        assert MosaConfig.auto_map["AutoConfig"] == "configuration.MosaConfig"
+        assert MosaConfig.auto_map["AutoModelForCausalLM"] == "huggingface.MosaForCausalLM"
 
     def test_head_dim_computed_when_not_provided(self):
         """head_dim is derived from hidden_size // num_attention_heads when not set."""
@@ -117,7 +117,7 @@ class TestStructuralValidation:
     def test_hidden_size_not_divisible_by_num_heads_raises(self):
         """A hidden_size that doesn't divide evenly across heads is structurally invalid."""
         with pytest.raises(ValueError, match="hidden_size"):
-            Llama3Config(hidden_size=100, num_attention_heads=32)
+            MosaConfig(hidden_size=100, num_attention_heads=32)
 
     def test_num_heads_not_divisible_by_kv_heads_raises(self):
         """GQA requires query heads to divide evenly across KV head groups."""
@@ -181,7 +181,7 @@ class TestSerialisation:
             attention_dropout=0.1,
             use_cache=False,
         )
-        restored = Llama3Config.from_dict(original.to_dict())
+        restored = MosaConfig.from_dict(original.to_dict())
 
         assert restored.vocab_size == original.vocab_size
         assert restored.hidden_size == original.hidden_size

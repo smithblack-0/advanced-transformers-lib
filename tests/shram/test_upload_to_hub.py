@@ -5,11 +5,11 @@ verified manually per the strategy in plan.md. These tests cover the
 independently verifiable functions: config table rendering and card rendering.
 """
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.upload_to_hub import _render_card, _render_config_table
+from src.shram.model.configuration import ShramConfig
+from src.shram.upload_to_hub import _render_card, _render_config_table
 
 
-def small_config(**kwargs) -> Llama3Config:
+def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
         hidden_size=64,
         num_attention_heads=4,
@@ -19,7 +19,7 @@ def small_config(**kwargs) -> Llama3Config:
         vocab_size=256,
     )
     defaults.update(kwargs)
-    return Llama3Config(**defaults)
+    return ShramConfig(**defaults)
 
 
 # ---------------------------------------------------------------------------

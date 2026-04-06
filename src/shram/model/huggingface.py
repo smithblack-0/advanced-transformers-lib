@@ -1,11 +1,11 @@
-"""HuggingFace wrapper for the Llama 3 baseline.
+"""HuggingFace wrapper for Shram.
 
-Llama3ForCausalLM wraps Llama3Model with everything a researcher needs to
+ShramForCausalLM wraps ShramModel with everything a researcher needs to
 train, evaluate, and generate from it through the HuggingFace ecosystem:
 token embedding, vocabulary projection, next-token loss, weight tying, and
 the full AutoClass and GenerationMixin contracts.
 
-The token embedding lives here, not on the backbone. Llama3Model is a pure
+The token embedding lives here, not on the backbone. ShramModel is a pure
 transformer stack that accepts pre-embedded hidden states — it has no knowledge
 of tokens or vocabulary. This is the correct HF convention: the backbone is
 modality-agnostic; the token interface belongs on the task wrapper.
@@ -37,31 +37,31 @@ from transformers import PreTrainedModel, GenerationMixin
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from .configuration import Llama3Config
-from .model import Llama3Model
+from .configuration import ShramConfig
+from .model import ShramModel
 
 
-class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
-    """Llama 3 causal language model: token embedding, backbone, LM head, HF contract.
+class ShramForCausalLM(PreTrainedModel, GenerationMixin):
+    """Shram causal language model: token embedding, backbone, LM head, HF contract.
 
     Owns the token embedding and LM head. Delegates all transformer computation
-    to Llama3Model. Adds loss computation for training, weight tying between the
+    to ShramModel. Adds loss computation for training, weight tying between the
     LM head and the input embedding, and the full HuggingFace AutoClass and
     GenerationMixin contracts.
 
     Args:
-        config: Model configuration. Must be a ``Llama3Config`` instance.
+        config: Model configuration. Must be a ``ShramConfig`` instance.
     """
 
-    config_class = Llama3Config
+    config_class = ShramConfig
     base_model_prefix = "model"
     _no_split_modules = ["DecoderLayer"]
     supports_gradient_checkpointing = True
 
-    def __init__(self, config: Llama3Config) -> None:
+    def __init__(self, config: ShramConfig) -> None:
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.model = Llama3Model(config)
+        self.model = ShramModel(config)
 
         # No bias — consistent with all other projections in this architecture.
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -175,7 +175,7 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
             )
 
         # Resolve both flags against config defaults. Config sets the default;
-        # per-call arguments override it. Both fields in Llama3Config remain live.
+        # per-call arguments override it. Both fields in ShramConfig remain live.
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         output_hidden_states = (
             output_hidden_states

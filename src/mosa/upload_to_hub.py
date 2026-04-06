@@ -2,15 +2,15 @@
 
 Run as a module from the repository root:
 
-    python -m src.llama3.upload_to_hub
+    python -m src.mosa.upload_to_hub
 
 The script prompts for a HuggingFace write-access token at runtime. The token
 is passed directly to the API and never stored anywhere.
 
-What is uploaded: every file in src/llama3/model/ -- Python source, config.json,
+What is uploaded: every file in src/mosa/model/ -- Python source, config.json,
 tokenizer files, and README.md (architecture card). This folder is the exact Hub root.
 
-What is never uploaded: weights. No weight files exist in src/llama3/model/,
+What is never uploaded: weights. No weight files exist in src/mosa/model/,
 making accidental upload structurally impossible.
 """
 
@@ -18,23 +18,23 @@ from pathlib import Path
 
 from huggingface_hub import upload_folder
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.tokenizer import prepare_tokenizer
+from src.mosa.model.configuration import MosaConfig
+from src.mosa.tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
 
-REPO_ID = "smithblack-0/llama3_baseline"
+REPO_ID = "smithblack-0/mosa_baseline"
 MODEL_DIR = Path(__file__).parent / "model"
 _CARD_TEMPLATE = Path(__file__).parent / "model_card.md"
 
 # -----------------------------------------------------------------------------
 
 
-def _render_config_table(config: Llama3Config) -> str:
+def _render_config_table(config: MosaConfig) -> str:
     """Render a markdown table of default configuration parameters.
 
     Args:
-        config: Llama3Config providing the values to tabulate.
+        config: MosaConfig providing the values to tabulate.
 
     Returns:
         Markdown table string ready for insertion into the architecture card.
@@ -56,7 +56,7 @@ def _render_config_table(config: Llama3Config) -> str:
     return "\n".join(lines)
 
 
-def _render_card(config: Llama3Config, repo_id: str) -> str:
+def _render_card(config: MosaConfig, repo_id: str) -> str:
     """Render the architecture card by filling placeholders in model_card.md.
 
     Reads the static template, substitutes the repo_id and config defaults table.
@@ -64,7 +64,7 @@ def _render_card(config: Llama3Config, repo_id: str) -> str:
     not a fixed pretrained model, so no single count is meaningful.
 
     Args:
-        config: Llama3Config providing default parameter values.
+        config: MosaConfig providing default parameter values.
         repo_id: Hub repository identifier inserted wherever {repo_id} appears.
 
     Returns:
@@ -81,12 +81,12 @@ def upload(repo_id: str = REPO_ID) -> None:
     Prompts for a HuggingFace write-access token scoped to this repository,
     then runs four steps:
     1. Refresh tokenizer files in model/ via prepare_tokenizer()
-    2. Write config.json to model/ from Llama3Config defaults
+    2. Write config.json to model/ from MosaConfig defaults
     3. Render and write README.md (architecture card) to model/
     4. Upload model/ contents to the Hub repository root atomically
 
     The repository must already exist on HuggingFace Hub before running.
-    See src/llama3/documentation.md for setup instructions.
+    See src/mosa/documentation.md for setup instructions.
 
     Args:
         repo_id: Target Hub repository in 'namespace/name' format.
@@ -96,7 +96,7 @@ def upload(repo_id: str = REPO_ID) -> None:
     print("Step 1/4 -- Refreshing tokenizer...")
     prepare_tokenizer()
 
-    config = Llama3Config()
+    config = MosaConfig()
 
     print("Step 2/4 -- Writing config.json...")
     config.save_pretrained(MODEL_DIR)

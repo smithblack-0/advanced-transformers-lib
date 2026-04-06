@@ -1,4 +1,4 @@
-"""Tests for Llama3Model.
+"""Tests for MosaModel.
 
 Verifies the invariants documented in plan.md. Tests are scoped to the backbone
 only — decoder layer and attention correctness are covered by their own unit tests
@@ -8,7 +8,7 @@ The backbone accepts pre-embedded inputs (inputs_embeds), not token IDs. Tests
 construct random float tensors of shape (batch, seq_len, hidden_size) directly,
 which is the correct interface.
 
-Llama3Model is a plain nn.Module. It returns a plain dict. No HF lifecycle
+MosaModel is a plain nn.Module. It returns a plain dict. No HF lifecycle
 machinery (post_init, _init_weights, save/load) is present or tested here.
 """
 
@@ -16,15 +16,15 @@ import torch
 import pytest
 from transformers import DynamicCache
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.model.model import Llama3Model
+from src.mosa.model.configuration import MosaConfig
+from src.mosa.model.model import MosaModel
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def small_config(**kwargs) -> Llama3Config:
+def small_config(**kwargs) -> MosaConfig:
     """Minimal-dimension config for fast tests."""
     defaults = dict(
         hidden_size=64,
@@ -35,7 +35,7 @@ def small_config(**kwargs) -> Llama3Config:
         vocab_size=256,
     )
     defaults.update(kwargs)
-    return Llama3Config(**defaults)
+    return MosaConfig(**defaults)
 
 
 def random_embeds(batch: int, seq_len: int, hidden_size: int) -> torch.Tensor:
@@ -59,8 +59,8 @@ def make_causal_mask(cache_position: torch.Tensor, k_len: int) -> torch.Tensor:
 
 
 @pytest.fixture
-def model() -> Llama3Model:
-    return Llama3Model(small_config()).eval()
+def model() -> MosaModel:
+    return MosaModel(small_config()).eval()
 
 
 # ---------------------------------------------------------------------------

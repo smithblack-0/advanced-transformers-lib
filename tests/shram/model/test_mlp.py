@@ -6,15 +6,15 @@ projection, and that the gate is genuinely active (not a no-op).
 
 import torch
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.model.mlp import SwiGLUMLP
+from src.shram.model.configuration import ShramConfig
+from src.shram.model.mlp import SwiGLUMLP
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def small_config(**kwargs) -> Llama3Config:
+def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
         hidden_size=64,
         intermediate_size=128,
@@ -23,7 +23,7 @@ def small_config(**kwargs) -> Llama3Config:
         num_hidden_layers=2,
     )
     defaults.update(kwargs)
-    return Llama3Config(**defaults)
+    return ShramConfig(**defaults)
 
 
 # ---------------------------------------------------------------------------

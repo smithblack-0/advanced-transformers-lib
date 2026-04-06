@@ -1,9 +1,9 @@
 from .attention import GroupedQueryAttention
-from .configuration import Llama3Config
+from .configuration import MosaConfig
 from .decoder_layer import DecoderLayer
-from .huggingface import Llama3ForCausalLM
+from .huggingface import MosaForCausalLM
 from .mlp import SwiGLUMLP
-from .model import Llama3Model
+from .model import MosaModel
 from .rope import RotaryEmbedding
 
-__all__ = ["DecoderLayer", "GroupedQueryAttention", "Llama3Config", "Llama3ForCausalLM", "Llama3Model", "RotaryEmbedding", "SwiGLUMLP"]
+__all__ = ["DecoderLayer", "GroupedQueryAttention", "MosaConfig", "MosaForCausalLM", "MosaModel", "RotaryEmbedding", "SwiGLUMLP"]

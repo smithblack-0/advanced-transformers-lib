@@ -1,13 +1,13 @@
 """Transformer backbone for the Llama 3 baseline.
 
-Llama3Model is a pure PyTorch module: a sequence of DecoderLayer blocks followed
+MosaModel is a pure PyTorch module: a sequence of DecoderLayer blocks followed
 by a final RMSNorm. It accepts pre-embedded hidden states and returns contextual
 representations. It has no knowledge of tokens, vocabulary, generation, or the
-HuggingFace contract — those concerns belong on Llama3ForCausalLM.
+HuggingFace contract — those concerns belong on MosaForCausalLM.
 
 Keeping the embedding out of the backbone is the correct HF convention and makes
 the backbone genuinely modality-agnostic. The token interface — embedding lookup,
-LM head, weight tying — belongs on the task wrapper (Llama3ForCausalLM), which is
+LM head, weight tying — belongs on the task wrapper (MosaForCausalLM), which is
 the only class that knows this backbone is being used for language modelling.
 
 The final RMSNorm is necessary because the decoder stack uses pre-norm throughout:
@@ -32,11 +32,11 @@ import torch
 import torch.nn as nn
 from transformers.cache_utils import Cache
 
-from .configuration import Llama3Config
+from .configuration import MosaConfig
 from .decoder_layer import DecoderLayer
 
 
-class Llama3Model(nn.Module):
+class MosaModel(nn.Module):
     """Pure transformer backbone: decoder stack and final normalisation.
 
     Accepts pre-embedded hidden states of shape (batch, seq_len, hidden_size)
@@ -48,10 +48,10 @@ class Llama3Model(nn.Module):
     stream, so the backbone is agnostic to how positions are represented.
 
     Args:
-        config: Model configuration. Must be a ``Llama3Config`` instance.
+        config: Model configuration. Must be a ``MosaConfig`` instance.
     """
 
-    def __init__(self, config: Llama3Config) -> None:
+    def __init__(self, config: MosaConfig) -> None:
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
