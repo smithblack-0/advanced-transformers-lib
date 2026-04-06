@@ -81,6 +81,12 @@ class ShramConfig(PretrainedConfig):
         rope_scaling: Optional RoPE scaling configuration for extending context beyond
             max_position_embeddings without retraining. Pass as a dict in HF's format
             with ``rope_type`` as the key. Paper uses YaRN extrapolation mode.
+        yarn_alpha: YaRN ramp lower boundary α (paper §A.2 RoPE Treatment). Frequency
+            dimensions with ``r(d) < yarn_alpha`` are fully interpolated by scale s.
+            Paper value (LLaMA family): 1.0.
+        yarn_beta: YaRN ramp upper boundary β (paper §A.2 RoPE Treatment). Frequency
+            dimensions with ``r(d) > yarn_beta`` are left unscaled. Dimensions between
+            α and β are linearly blended. Paper value (LLaMA family): 32.0.
         attention_dropout: Dropout probability applied to attention weights. Default
             0.0 for deterministic behaviour.
         use_cache: Whether the model returns past_key_values for KV caching. Set True
@@ -117,6 +123,8 @@ class ShramConfig(PretrainedConfig):
         rope_theta: float = 500000.0,
         max_position_embeddings: int = 8192,
         rope_scaling: dict | None = None,
+        yarn_alpha: float = 1.0,
+        yarn_beta: float = 32.0,
         attention_dropout: float = 0.0,
         use_cache: bool = True,
         output_hidden_states: bool = False,
@@ -153,8 +161,16 @@ class ShramConfig(PretrainedConfig):
         self.window_size = window_size
         self.rope_mode = rope_mode
         self.rms_norm_eps = rms_norm_eps
+        self.yarn_alpha = yarn_alpha
+        self.yarn_beta = yarn_beta
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
+
+        # For YaRN, inject yarn_alpha/yarn_beta as beta_slow/beta_fast so that HF's
+        # _compute_yarn_parameters picks them up. yarn_alpha and yarn_beta are the
+        # single source of truth — the dict values are derived from them.
+        if rope_scaling is not None and rope_scaling.get("rope_type") == "yarn":
+            rope_scaling = {**rope_scaling, "beta_slow": yarn_alpha, "beta_fast": yarn_beta}
 
         # rope_theta, max_position_embeddings, and rope_scaling are passed to HF's
         # base class, which owns rope configuration via RotaryEmbeddingConfigMixin.

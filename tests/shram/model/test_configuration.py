@@ -126,6 +126,14 @@ class TestParameterStorage:
         config = small_config(tie_word_embeddings=True)
         assert config.tie_word_embeddings is True
 
+    def test_yarn_alpha_stored(self):
+        config = small_config(yarn_alpha=2.0)
+        assert config.yarn_alpha == 2.0
+
+    def test_yarn_beta_stored(self):
+        config = small_config(yarn_beta=16.0)
+        assert config.yarn_beta == 16.0
+
 
 # ---------------------------------------------------------------------------
 # Structural validation
@@ -182,6 +190,78 @@ class TestRopeConfiguration:
             }
         )
         assert config.rope_parameters["rope_type"] == "yarn"
+
+
+# ---------------------------------------------------------------------------
+# YaRN α/β parameters
+# ---------------------------------------------------------------------------
+
+class TestYarnParameters:
+    """yarn_alpha (α) and yarn_beta (β) are the ramp boundaries from paper §A.2.
+
+    They must be first-class config fields so every hyperparameter the architecture
+    uses is explicitly tunable. They are injected into rope_parameters as beta_slow
+    and beta_fast so HF's _compute_yarn_parameters sees the correct values.
+    """
+
+    def test_yarn_alpha_default(self):
+        """Default yarn_alpha must be 1.0 — paper's LLaMA-family recommendation."""
+        config = small_config()
+        assert config.yarn_alpha == 1.0
+
+    def test_yarn_beta_default(self):
+        """Default yarn_beta must be 32.0 — paper's LLaMA-family recommendation."""
+        config = small_config()
+        assert config.yarn_beta == 32.0
+
+    def test_yarn_alpha_beta_injected_into_rope_parameters(self):
+        """Custom yarn_alpha/yarn_beta must appear in rope_parameters as beta_slow/beta_fast.
+
+        HF's _compute_yarn_parameters reads beta_slow and beta_fast from rope_parameters.
+        Without injection, those parameters would silently fall back to HF's own defaults
+        regardless of what ShramConfig was given.
+        """
+        config = small_config(
+            yarn_alpha=2.0,
+            yarn_beta=16.0,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 8192,
+            },
+        )
+        assert config.rope_parameters["beta_slow"] == 2.0
+        assert config.rope_parameters["beta_fast"] == 16.0
+
+    def test_yarn_params_not_injected_for_non_yarn(self):
+        """yarn_alpha/yarn_beta must not pollute non-YaRN rope_parameters.
+
+        Injecting beta_slow/beta_fast into a linear or default config would be
+        incorrect — those keys are meaningless outside YaRN and could confuse HF.
+        """
+        config = small_config(
+            yarn_alpha=5.0,
+            yarn_beta=64.0,
+            rope_scaling={"rope_type": "linear", "factor": 4.0},
+        )
+        assert config.rope_parameters["rope_type"] == "linear"
+        assert "beta_slow" not in config.rope_parameters
+        assert "beta_fast" not in config.rope_parameters
+
+    def test_yarn_roundtrip_preserves_alpha_beta(self):
+        """yarn_alpha and yarn_beta must survive a to_dict/from_dict roundtrip."""
+        original = small_config(
+            yarn_alpha=2.0,
+            yarn_beta=16.0,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 8192,
+            },
+        )
+        restored = ShramConfig.from_dict(original.to_dict())
+        assert restored.yarn_alpha == original.yarn_alpha
+        assert restored.yarn_beta == original.yarn_beta
 
 
 # ---------------------------------------------------------------------------
