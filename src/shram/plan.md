@@ -28,9 +28,9 @@ is being achieved, one verified unit at a time.
 - [X] Unit 2 — independent verification of Unit 1 change list against the code
 - [X] Unit 3 — ShramConfig: add all SHRAM-specific architectural parameters
 - [X] Unit 4 — Router and load balancing: token-choice routing + DeepSeek biasing
-- [X] Unit 5.A — ShramConfig: yarn_alpha (α) and yarn_beta (β) as first-class parameters
-      (blocker discovered during Unit 5.B review; resolved before rope.py finalization)
-- [ ] Unit 5.B — rope.py: extend RotaryEmbedding for arbitrary position tensor shape (OD-4)
+- [X] Unit 5.A — Rope architecture design: how h_l and BEA construct independent RoPE instances
+- [X] Unit 5.B — ShramConfig: replace HF rope infrastructure with explicit rope parameters
+- [ ] Unit 5.C — RotaryEmbedding: rewrite with explicit constructor and paper math
 - [ ] Unit 6 — Local sliding-window attention module (h_l)
 - [ ] Unit 7 — Expert packing and unpacking: permutation machinery, padding, masks
 - [ ] Unit 8 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensors
@@ -48,10 +48,9 @@ is being achieved, one verified unit at a time.
 
 ## Status
 
-**Current state:** Unit 5.A complete (yarn_alpha/yarn_beta ShramConfig patch, 34 tests
-passing). Unit 5.B (rope.py arbitrary position tensor shape) is implemented and 18/18 tests
-pass, but is pending user approval before being marked complete. Unit 6 begins after Unit
-5.B approval. Network tests deselected (Hub repo not yet created).
+**Current state:** Units 5.A and 5.B complete. Unit 5.C (RotaryEmbedding rewrite) is next.
+test_rope.py and any other tests referencing the old rope interface are expected to be
+broken until 5.C is done. Network tests deselected (Hub repo not yet created).
 
 ---
 
@@ -409,58 +408,84 @@ Concerns.
 
 ---
 
-### Unit 5.A — ShramConfig: yarn_alpha and yarn_beta (Blocker)
+### Unit 5.A — Rope Architecture Design (complete)
 
-**What:** Blocker discovered during review of Unit 5.B. YaRN's ramp boundaries α and β —
-called `beta_slow` and `beta_fast` by HF's `_compute_yarn_parameters` — were absent from
-ShramConfig. job.md Architecture § requires every architectural parameter to be explicitly
-tunable through config. Silent reliance on HF's hardcoded defaults (α=1, β=32) violated
-this invariant.
+**Decision:** h_l and BEA each construct and own an independent `RotaryEmbedding` instance.
+No shared instance. Each path's rope behavior is fully determined by what it passes to its
+own constructor — no config reading inside `RotaryEmbedding`.
 
-**Invariants this unit must satisfy:**
-- `yarn_alpha` (α) and `yarn_beta` (β) are first-class ShramConfig parameters with defaults
-  matching the paper's LLaMA-family recommendation: α=1.0, β=32.0 (paper §A.2 RoPE Treatment).
-- When `rope_scaling` is YaRN type, `yarn_alpha` and `yarn_beta` are injected into the dict
-  as `beta_slow` and `beta_fast` before HF's base class processes it. They are the single
-  source of truth — not the dict keys.
-- Non-YaRN configs are unaffected: no injection occurs for linear or default rope types.
-- Both parameters survive a `to_dict`/`from_dict` serialization roundtrip.
-- Tests verify: default values, custom values stored, injection into YaRN rope_parameters,
-  no injection for non-YaRN, roundtrip preservation.
+**h_l constructs:** `RotaryEmbedding(mode="default", head_dim=config.head_dim, theta=config.local_rope_theta)`
+Always standard RoPE. The returned `A_rope` is always 1.0 and may be discarded.
 
-**Paper ref:** §A.2 RoPE Treatment — ramp function γ(r) with boundaries α and β.
+**BEA constructs:** `RotaryEmbedding(mode="yarn", head_dim=config.head_dim, theta=config.mosrah_rope_theta, training_seq_len=config.training_sequence_length, inference_seq_len=config.inference_sequence_length, alpha=config.alpha, beta=config.beta)`
+YaRN from paper §A.2. When `inference_sequence_length == training_sequence_length`, `s=1`
+and YaRN reduces exactly to standard RoPE — this is the intended usage for researchers not
+doing context extension, and must be documented.
+
+**HF rope infrastructure:** Removed. ShramConfig no longer delegates rope initialisation to
+HF's `RotaryEmbeddingConfigMixin`. All rope parameters are explicit config fields. No
+`rope_scaling`, no `rope_parameters`, no `ROPE_INIT_FUNCTIONS`.
+
+**Paper ref:** §A.2 RoPE Treatment, Appendix B.RoPE Mechanics.
 
 ---
 
-### Unit 5.B — rope.py: Arbitrary Position Tensor Shape
+### Unit 5.B — ShramConfig: Explicit Rope Parameters
 
-**What:** Extend `RotaryEmbedding.forward` so that `position_ids` may be any shape, not
-only 2D `(B, N)`. This unblocks both Unit 6 (h_l, which uses the shared module) and
-Unit 8 (BEA, which requires 3D `(B, L, T)` packed positions). Doing it now as a standalone
-verified unit eliminates the mid-Unit-8 blocker and keeps the interface clean for all
-callers.
-
-**OD-4 resolution (closed here):** `RotaryEmbedding.forward` is extended to accept
-`position_ids` of arbitrary shape. The cos/sin cache is indexed directly — `cos =
-_cos_cached[position_ids]` — which produces a result of shape `(*position_ids.shape,
-head_dim)` regardless of how many leading dimensions position_ids has. Head-dimension
-broadcasting is handled so that both standard 2D usage and BEA's 3D usage work correctly
-through the same code path.
+**What:** Replace the HF-delegated rope infrastructure in `configuration.py` with explicit
+research parameters. All previous rope-related config fields (`rope_theta`,
+`max_position_embeddings`, `rope_scaling`, `yarn_alpha`, `yarn_beta`) are removed and
+replaced with the fields decided in Unit 5.A.
 
 **Invariants this unit must satisfy:**
-- All existing rope.py tests pass without modification. The extension is backward-compatible:
-  2D `position_ids (B, N)` with q/k of shape `(B, H, N, head_dim)` behaves identically to
-  the pre-extension implementation.
-- 3D `position_ids (B, L, T)` produces correct cos/sin: the gathered values at each
-  `(b, l, t)` position match what would be produced by indexing with the scalar
-  `position_ids[b, l, t]` directly.
-- The rotation is applied correctly to q/k regardless of position_ids shape. No rotation
-  logic is duplicated — a single implementation covers all calling conventions.
-- `attention_scaling` is returned unchanged; callers decide whether to apply it.
-- Tests verify: existing 2D behavior unchanged, 3D gather correctness, rotation applied
-  correctly for both shapes.
+- Config has exactly these rope-related fields: `local_rope_theta`, `mosrah_rope_theta`,
+  `training_sequence_length`, `inference_sequence_length`, `alpha`, `beta`.
+- A `scale` property returns `inference_sequence_length / training_sequence_length`. It is
+  computed, not stored.
+- No `rope_scaling`, `rope_theta`, `max_position_embeddings`, `yarn_alpha`, `yarn_beta`
+  fields exist anywhere in the config.
+- No HF rope mixin behaviour: `rope_parameters` is not produced and not expected by any
+  downstream code.
+- All fields survive a `to_dict` / `from_dict` serialisation roundtrip.
+- Default values match the paper: `local_rope_theta=10000.0`, `mosrah_rope_theta=10000.0`,
+  `alpha=1.0`, `beta=32.0` (paper §A.2 LLaMA-family recommendation).
+  `training_sequence_length` and `inference_sequence_length` defaults are equal so that
+  `scale=1` and the model is in standard-RoPE mode unless explicitly extended.
+- Tests verify: all fields stored, `scale` property correct, roundtrip preservation,
+  `scale=1` when lengths are equal.
 
-**Paper refs:** Appendix B.RoPE Mechanics (OD-4 resolution).
+**Paper ref:** §A.2 RoPE Treatment.
+
+---
+
+### Unit 5.C — RotaryEmbedding: Explicit Constructor and Paper Math
+
+**What:** Rewrite `rope.py`. Remove all HF dependencies. Constructor accepts explicit
+mode and parameters; each caller constructs with exactly what it needs.
+
+**OD-4 resolution preserved:** `forward` accepts `position_ids` of arbitrary shape via
+direct cache indexing — `cos = _cos_cached[position_ids]`. This handles both 2D `(B, N)`
+for h_l and 3D `(B, L, T)` for BEA through the same code path.
+
+**Invariants this unit must satisfy:**
+- Constructor signature: `(mode, head_dim, theta, training_seq_len=None, inference_seq_len=None, alpha=None, beta=None, device=None)`.
+- `mode="default"`: computes `dim_rotation_freqs = 1/theta^(2d/head_dim)`. Returns `A_rope=1.0`.
+- `mode="yarn"`: computes YaRN-adjusted frequencies θ_d' per paper §A.2 equations exactly.
+  Returns `A_rope = (0.1·ln(s)+1)²` where `s = inference_seq_len / training_seq_len`.
+  When `s=1`, θ_d' = θ_d and `A_rope=1.0` — YaRN reduces to standard RoPE.
+- Unsupported mode raises `NotImplementedError`.
+- `yarn` mode requires `training_seq_len`, `inference_seq_len`, `alpha`, `beta` — raises
+  `ValueError` if any are absent.
+- `forward(q, k, position_ids)` returns `(q_rotated, k_rotated, A_rope)`. Works for
+  `position_ids` of any integer tensor shape. Head dimensions in q/k are handled by
+  inserting broadcast dimensions automatically.
+- No `PretrainedConfig`, no `ROPE_INIT_FUNCTIONS`, no HF imports.
+- Tests verify: default mode math (identity at position 0, relative position property),
+  YaRN frequency formula matches paper equations, `s=1` produces identical output to
+  default mode, `A_rope` values correct for both modes, arbitrary position_ids shape
+  (2D and 3D), 3D gather correctness.
+
+**Paper refs:** §A.2 RoPE Treatment, Appendix B.RoPE Mechanics.
 
 ---
 
@@ -480,11 +505,11 @@ through the same code path.
   flex_attention is PyTorch-native (no external package), CPU-testable via eager mode, and
   stable across PyTorch 2.5+. Paper names FlashAttention; user has approved flex_attention
   as equivalent (both use the flash formulation under the hood).
-- h_l uses the shared `RotaryEmbedding` instance (no separate RoPE module). Standard 2D
-  `position_ids (B, N)` are passed. The returned `attention_scaling` is not applied —
-  h_l treats it as 1.0. Rationale: the local window is always short (window_size=128);
-  YaRN's magnitude correction is irrelevant for positions that are always in-distribution,
-  and silently applying it would subtly mis-scale the local path's logits.
+- h_l constructs its own `RotaryEmbedding(mode="default", head_dim=config.head_dim,
+  theta=config.local_rope_theta)`. Standard 2D `position_ids (B, N)` are passed. The
+  returned `A_rope` is always 1.0 for default mode and is discarded. h_l never responds
+  to YaRN regardless of model config — this is enforced by the constructor choice, not
+  by runtime logic.
 - MHA (not GQA) — OD-3 resolution. `num_sliding_window_heads` query heads, each with its
   own K and V projection.
 - Tests verify: output shape, tokens outside the window receive zero attention weight,
@@ -525,18 +550,18 @@ through the same code path.
 - BEA operates on `packed_hidden` (B, L, T, d); output y (B, L, T, d).
 - W_Q, W_K, W_V have shape (L, d, `mosrah_head_dim`); W_O has shape (L, `mosrah_head_dim`,
   d). Each of L heads has independent parameters — no weight sharing across heads.
+- BEA constructs its own `RotaryEmbedding(mode="yarn", head_dim=config.head_dim,
+  theta=config.mosrah_rope_theta, training_seq_len=config.training_sequence_length,
+  inference_seq_len=config.inference_sequence_length, alpha=config.alpha, beta=config.beta)`.
+  The returned `A_rope` is applied to attention logits before softmax.
 - RoPE is applied with the supplied position tensor (either `packed_positions` for
-  main-sequence mode or local slot indices for semantic-sequence mode). BEA passes the tensor;
-  it does not choose the mode — that is the caller's responsibility.
+  main-sequence mode or local slot indices for semantic-sequence mode). BEA passes the
+  tensor; it does not choose the mode — that is the caller's (MoSRAH's) responsibility.
 - Causal masking is a triangular mask over the T (packed) dimension.
 - Padded positions (`active_mask` == False) do not contribute to attention output.
-- `attention_scaling` returned by RoPE is applied to the attention logits.
 - Tests verify: output shape, head independence (perturbing one head's weights changes only
   that head's output), RoPE passthrough (both position tensors produce different outputs),
   padding positions do not influence real-token outputs, causal masking holds.
-
-**Note:** OD-4 (rope.py arbitrary position tensor shape) is resolved in Unit 5 and verified
-before this unit begins. No blocker expected.
 
 **Paper refs:** Appendix A.BEA, Appendix B.RoPE Mechanics.
 

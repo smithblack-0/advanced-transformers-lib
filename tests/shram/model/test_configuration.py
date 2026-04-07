@@ -1,11 +1,8 @@
 """Tests for ShramConfig.
 
 Each test verifies a specific invariant documented in the plan. The grouping mirrors
-the structure of the invariants: defaults, parameter overrides, structural validation,
-rope configuration, and serialisation.
-
-RoPE scaling validation is owned by HF's RotaryEmbeddingConfigMixin and is not tested
-here — we test that our config correctly passes parameters through to HF's system.
+the invariant categories: instantiation, parameter storage, structural validation,
+rope parameters, scale property, and serialisation.
 """
 
 import pytest
@@ -18,12 +15,7 @@ from src.shram.model.configuration import ShramConfig
 # ---------------------------------------------------------------------------
 
 def small_config(**kwargs) -> ShramConfig:
-    """Return a config with small dimensions suitable for testing.
-
-    Using full-scale defaults in tests that don't care about scale adds noise.
-    This helper applies a consistent small baseline that satisfies all structural
-    constraints. Defaults match paper §4.3 proportions.
-    """
+    """Return a config with small dimensions suitable for testing."""
     defaults = dict(
         hidden_size=512,
         num_sliding_window_heads=16,
@@ -39,7 +31,7 @@ def small_config(**kwargs) -> ShramConfig:
 
 
 # ---------------------------------------------------------------------------
-# Defaults
+# Instantiation
 # ---------------------------------------------------------------------------
 
 class TestInstantiation:
@@ -64,7 +56,7 @@ class TestInstantiation:
 
 
 # ---------------------------------------------------------------------------
-# Parameter overrides
+# Parameter storage
 # ---------------------------------------------------------------------------
 
 class TestParameterStorage:
@@ -75,14 +67,6 @@ class TestParameterStorage:
     def test_num_hidden_layers_stored(self):
         config = small_config(num_hidden_layers=16)
         assert config.num_hidden_layers == 16
-
-    def test_rope_theta_stored(self):
-        config = small_config(rope_theta=10000.0)
-        assert config.rope_theta == 10000.0
-
-    def test_max_position_embeddings_stored(self):
-        config = small_config(max_position_embeddings=4096)
-        assert config.max_position_embeddings == 4096
 
     def test_num_sliding_window_heads_stored(self):
         config = small_config(num_sliding_window_heads=8)
@@ -97,7 +81,6 @@ class TestParameterStorage:
         assert config.num_selected_heads == 8
 
     def test_head_dim_stored(self):
-        """head_dim is explicitly specified and stored as-is."""
         config = small_config(head_dim=32)
         assert config.head_dim == 32
 
@@ -108,6 +91,30 @@ class TestParameterStorage:
     def test_rope_mode_stored(self):
         config = small_config(rope_mode="semantic_sequence")
         assert config.rope_mode == "semantic_sequence"
+
+    def test_local_rope_theta_stored(self):
+        config = small_config(local_rope_theta=500000.0)
+        assert config.local_rope_theta == 500000.0
+
+    def test_mosrah_rope_theta_stored(self):
+        config = small_config(mosrah_rope_theta=500000.0)
+        assert config.mosrah_rope_theta == 500000.0
+
+    def test_training_sequence_length_stored(self):
+        config = small_config(training_sequence_length=4096)
+        assert config.training_sequence_length == 4096
+
+    def test_inference_sequence_length_stored(self):
+        config = small_config(inference_sequence_length=16384)
+        assert config.inference_sequence_length == 16384
+
+    def test_alpha_stored(self):
+        config = small_config(alpha=2.0)
+        assert config.alpha == 2.0
+
+    def test_beta_stored(self):
+        config = small_config(beta=16.0)
+        assert config.beta == 16.0
 
     def test_use_cache_stored(self):
         config = small_config(use_cache=False)
@@ -125,14 +132,6 @@ class TestParameterStorage:
     def test_tie_word_embeddings_stored(self):
         config = small_config(tie_word_embeddings=True)
         assert config.tie_word_embeddings is True
-
-    def test_yarn_alpha_stored(self):
-        config = small_config(yarn_alpha=2.0)
-        assert config.yarn_alpha == 2.0
-
-    def test_yarn_beta_stored(self):
-        config = small_config(yarn_beta=16.0)
-        assert config.yarn_beta == 16.0
 
 
 # ---------------------------------------------------------------------------
@@ -158,110 +157,79 @@ class TestStructuralValidation:
         config = small_config(rope_mode="semantic_sequence")
         assert config.rope_mode == "semantic_sequence"
 
-    def test_even_head_dim_valid(self):
-        config = small_config(head_dim=16)
-        assert config.head_dim == 16
+    def test_zero_training_sequence_length_raises(self):
+        """training_sequence_length must be positive — used as divisor in scale."""
+        with pytest.raises(ValueError, match="training_sequence_length"):
+            small_config(training_sequence_length=0)
+
+    def test_zero_inference_sequence_length_raises(self):
+        """inference_sequence_length must be positive."""
+        with pytest.raises(ValueError, match="inference_sequence_length"):
+            small_config(inference_sequence_length=0)
 
 
 # ---------------------------------------------------------------------------
-# RoPE configuration
+# Rope parameter defaults
 # ---------------------------------------------------------------------------
 
-class TestRopeConfiguration:
-    def test_no_rope_scaling_by_default(self):
-        """Without rope_scaling, HF leaves rope_parameters as None — rope_theta is used directly."""
-        config = small_config()
-        assert config.rope_parameters is None
+class TestRopeParameterDefaults:
+    """Verify default values match the paper's specifications."""
 
-    def test_linear_rope_scaling_accepted(self):
-        """Linear scaling is the simplest extension method — divides all frequencies by factor."""
-        config = small_config(
-            rope_scaling={"rope_type": "linear", "factor": 4.0}
-        )
-        assert config.rope_parameters["rope_type"] == "linear"
+    def test_local_rope_theta_default(self):
+        """Default local_rope_theta must be 10000.0 — paper §B.RoPE Mechanics (b=10000)."""
+        config = ShramConfig()
+        assert config.local_rope_theta == 10000.0
 
-    def test_yarn_rope_scaling_accepted(self):
-        """YaRN applies frequency-aware scaling — used in the paper (§4.3 Pretraining)."""
-        config = small_config(
-            rope_scaling={
-                "rope_type": "yarn",
-                "factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            }
-        )
-        assert config.rope_parameters["rope_type"] == "yarn"
+    def test_mosrah_rope_theta_default(self):
+        """Default mosrah_rope_theta must be 10000.0 — paper §B.RoPE Mechanics (b=10000)."""
+        config = ShramConfig()
+        assert config.mosrah_rope_theta == 10000.0
+
+    def test_alpha_default(self):
+        """Default alpha must be 1.0 — paper §A.2 LLaMA-family recommendation."""
+        config = ShramConfig()
+        assert config.alpha == 1.0
+
+    def test_beta_default(self):
+        """Default beta must be 32.0 — paper §A.2 LLaMA-family recommendation."""
+        config = ShramConfig()
+        assert config.beta == 32.0
+
+    def test_sequence_lengths_equal_by_default(self):
+        """training and inference sequence lengths must default to equal values so scale=1."""
+        config = ShramConfig()
+        assert config.training_sequence_length == config.inference_sequence_length
 
 
 # ---------------------------------------------------------------------------
-# YaRN α/β parameters
+# Scale property
 # ---------------------------------------------------------------------------
 
-class TestYarnParameters:
-    """yarn_alpha (α) and yarn_beta (β) are the ramp boundaries from paper §A.2.
+class TestScaleProperty:
+    """scale = inference_sequence_length / training_sequence_length.
 
-    They must be first-class config fields so every hyperparameter the architecture
-    uses is explicitly tunable. They are injected into rope_parameters as beta_slow
-    and beta_fast so HF's _compute_yarn_parameters sees the correct values.
+    When scale == 1.0, YaRN reduces to standard RoPE. This is the default state.
     """
 
-    def test_yarn_alpha_default(self):
-        """Default yarn_alpha must be 1.0 — paper's LLaMA-family recommendation."""
-        config = small_config()
-        assert config.yarn_alpha == 1.0
+    def test_scale_one_when_lengths_equal(self):
+        """scale must be 1.0 when inference equals training length."""
+        config = small_config(training_sequence_length=8192, inference_sequence_length=8192)
+        assert config.scale == 1.0
 
-    def test_yarn_beta_default(self):
-        """Default yarn_beta must be 32.0 — paper's LLaMA-family recommendation."""
-        config = small_config()
-        assert config.yarn_beta == 32.0
+    def test_scale_computed_correctly(self):
+        """scale must equal inference / training."""
+        config = small_config(training_sequence_length=4096, inference_sequence_length=16384)
+        assert config.scale == 4.0
 
-    def test_yarn_alpha_beta_injected_into_rope_parameters(self):
-        """Custom yarn_alpha/yarn_beta must appear in rope_parameters as beta_slow/beta_fast.
+    def test_scale_fractional(self):
+        """scale may be non-integer."""
+        config = small_config(training_sequence_length=8192, inference_sequence_length=12288)
+        assert abs(config.scale - 1.5) < 1e-9
 
-        HF's _compute_yarn_parameters reads beta_slow and beta_fast from rope_parameters.
-        Without injection, those parameters would silently fall back to HF's own defaults
-        regardless of what ShramConfig was given.
-        """
-        config = small_config(
-            yarn_alpha=2.0,
-            yarn_beta=16.0,
-            rope_scaling={
-                "rope_type": "yarn",
-                "factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        )
-        assert config.rope_parameters["beta_slow"] == 2.0
-        assert config.rope_parameters["beta_fast"] == 16.0
-
-    def test_yarn_params_not_injected_for_non_yarn(self):
-        """yarn_alpha/yarn_beta must not pollute non-YaRN rope_parameters.
-
-        Injecting beta_slow/beta_fast into a linear or default config would be
-        incorrect — those keys are meaningless outside YaRN and could confuse HF.
-        """
-        config = small_config(
-            yarn_alpha=5.0,
-            yarn_beta=64.0,
-            rope_scaling={"rope_type": "linear", "factor": 4.0},
-        )
-        assert config.rope_parameters["rope_type"] == "linear"
-        assert "beta_slow" not in config.rope_parameters
-        assert "beta_fast" not in config.rope_parameters
-
-    def test_yarn_roundtrip_preserves_alpha_beta(self):
-        """yarn_alpha and yarn_beta must survive a to_dict/from_dict roundtrip."""
-        original = small_config(
-            yarn_alpha=2.0,
-            yarn_beta=16.0,
-            rope_scaling={
-                "rope_type": "yarn",
-                "factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        )
-        restored = ShramConfig.from_dict(original.to_dict())
-        assert restored.yarn_alpha == original.yarn_alpha
-        assert restored.yarn_beta == original.yarn_beta
+    def test_scale_is_not_stored(self):
+        """scale must be a computed property, not a stored field."""
+        config = small_config(training_sequence_length=4096, inference_sequence_length=16384)
+        assert "scale" not in config.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -270,14 +238,14 @@ class TestYarnParameters:
 
 class TestSerialisation:
     def test_roundtrip_preserves_all_fields(self):
-        """A config serialised to dict and restored must be identical to the original.
-
-        This is the HF contract for config persistence. If it breaks, save/load of
-        model checkpoints will silently use wrong architectural parameters.
-        """
+        """A config serialised to dict and restored must be identical to the original."""
         original = small_config(
-            rope_theta=10000.0,
-            max_position_embeddings=4096,
+            local_rope_theta=500000.0,
+            mosrah_rope_theta=200000.0,
+            training_sequence_length=4096,
+            inference_sequence_length=16384,
+            alpha=2.0,
+            beta=16.0,
             attention_dropout=0.1,
             use_cache=False,
             num_mosrah_heads=32,
@@ -299,8 +267,12 @@ class TestSerialisation:
         assert restored.window_size == original.window_size
         assert restored.rope_mode == original.rope_mode
         assert restored.rms_norm_eps == original.rms_norm_eps
-        assert restored.rope_theta == original.rope_theta
-        assert restored.max_position_embeddings == original.max_position_embeddings
+        assert restored.local_rope_theta == original.local_rope_theta
+        assert restored.mosrah_rope_theta == original.mosrah_rope_theta
+        assert restored.training_sequence_length == original.training_sequence_length
+        assert restored.inference_sequence_length == original.inference_sequence_length
+        assert restored.alpha == original.alpha
+        assert restored.beta == original.beta
         assert restored.attention_dropout == original.attention_dropout
         assert restored.use_cache == original.use_cache
         assert restored.output_hidden_states == original.output_hidden_states
