@@ -33,8 +33,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 5.C — RotaryEmbedding: rewrite with explicit constructor and paper math
 - [X] Unit 5.C.1 — RotaryEmbedding: revision pass (maintainability blocker; see unit)
 - [X] Unit 6.0 — Cache architecture: situation statement, design decisions, folder refactor
-- [ ] Unit 6.A.A — MoSRAHCache: custom buffer storage and HF Cache protocol
-- [ ] Unit 6.A.B — MoSRAHCache: vectorized scatter update
+- [X] Unit 6.A.A — MoSRAHCache: custom buffer storage and HF Cache protocol
+- [X] Unit 6.A.B — MoSRAHCache: vectorized scatter update
 - [ ] Unit 6.A.C — MoSRAHCache: test audit and trust verification
 - [ ] Unit 6.B — ShramCache: HF interface shim holding both sub-caches
 - [ ] Unit 6.C — ShramCache generation pipeline wiring dispatch as blocker via _prepare_cache_for_generation
@@ -56,7 +56,7 @@ is being achieved, one verified unit at a time.
 
 ## Status
 
-**Current state:** Units 5.A, 5.B, 5.C, 5.C.1, and 6.0 complete. Unit 6.A.A (MoSRAHCache storage) is next. Network tests deselected (Hub repo not yet created).
+**Current state:** Units 5.A, 5.B, 5.C, 5.C.1, 6.0, 6.A.A, and 6.A.B complete. Unit 6.A.C (test audit and trust verification) is next. Network tests deselected (Hub repo not yet created).
 
 ---
 

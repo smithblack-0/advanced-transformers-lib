@@ -1,44 +1,36 @@
-"""MoSRAH sparse KV cache.
+"""Unvectorized reference implementation of the MoSRAH sparse KV cache.
 
-MoSRAH routes each token to K of L available expert heads, so its KV cache is indexed
-by (layer_idx, head_idx) rather than by layer alone. The routing is dynamic and produces
-a ragged distribution of token counts across (batch, head) slots — different batch items
-may route different numbers of tokens to the same head, and different heads accumulate
-at different rates. DynamicCache cannot represent this correctly: it concatenates along
-the sequence dimension and assumes uniform token counts across the batch. MoSRAHCache
-therefore uses a custom buffer design.
+This module exists solely as a correctness oracle. SlowMoSRAHCache implements the same
+interface and storage layout as MoSRAHCache but uses an explicit Python loop over
+(batch, token, head) triples in update(). The loop is obviously correct by inspection:
+each token's key and value are written to the next available slot for that (batch, head)
+pair, in the order tokens appear along the sequence dimension, which directly enforces
+causal ordering without any index arithmetic to verify.
 
-Per layer, keys and values are stored as (B, L, T_max, u) tensors, where B is batch
-size, L is the number of expert heads (num_mosrah_heads), T_max is the current capacity
-(doubled when any slot overflows), and u is the bottlenecked head embedding width
-(head_dim). A (B, L) integer count tensor tracks the valid occupancy of each
-(batch, head) slot. Everything beyond the count for a given slot is junk data; consumers
-call get_expert_lengths() to obtain the counts and are responsible for masking.
-
-All buffers are allocated at construction time. MoSRAHCache is constructed by ShramCache
-inside _prepare_cache_for_generation, which has access to batch size, device, and all
-model config parameters needed to fully specify the storage layout upfront.
+SlowMoSRAHCache is never instantiated in the model path. Its role is to provide a
+trusted ground truth against which the vectorized MoSRAHCache.update() is validated in
+Unit 6.A.B tests, and as a reference for the Unit 6.D position decoder. Because the
+vectorized implementation is validated by asserting exact agreement with this one on all
+test inputs, the correctness of SlowMoSRAHCache is load-bearing: its own test suite
+(test_slow_mosrah_cache.py) must establish it is trustworthy before it can be used as
+an oracle.
 """
 
 import torch
 from transformers.cache_utils import Cache
 
 
-class MoSRAHCache(Cache):
-    """KV cache for the MoSRAH sparse attention path.
+class SlowMoSRAHCache(Cache):
+    """Unvectorized reference implementation of the MoSRAH KV cache.
 
-    Subclasses transformers.cache_utils.Cache to satisfy the HF Cache protocol.
-    Stores keys and values per (layer_idx, head_idx) using a custom buffer design
-    rather than delegating to DynamicCache, which cannot represent MoSRAH's ragged
-    per-(batch, head) token counts correctly.
+    Identical storage layout to MoSRAHCache: per-layer (B, L, T_max, u) key/value
+    buffers and (B, L) count tensors, with the same constructor signature and the same
+    HF Cache protocol methods. The sole difference is update(), which uses an explicit
+    Python loop over (b, n, k) triples rather than vectorized index arithmetic.
 
-    All storage is allocated at construction time. The caller (ShramCache) provides
-    batch size, device, and model config parameters so no lazy allocation is needed.
-
-    At each generation step, only the K heads selected by the router are updated.
-    Different batch items may select different heads, and different heads accumulate
-    at different rates. The custom buffer tracks this independently per (batch, head)
-    slot via explicit count tensors.
+    This class is not used in the model path. It exists so that MoSRAHCache.update()
+    can be validated by asserting exact agreement with this implementation on all test
+    inputs. See module docstring for the trust chain this enables.
 
     Args:
         num_hidden_layers: Number of decoder layers. Determines the number of
@@ -99,12 +91,16 @@ class MoSRAHCache(Cache):
         key_states: torch.Tensor,
         value_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Scatter key/value states into the per-head buffer for the given layer.
+        """Scatter key/value states into the per-head buffer using an explicit loop.
 
-        Uses a cumsum construction to derive the absolute buffer position for each
-        token-head assignment without any Python loops. For a given (batch, head)
-        slot, positions are assigned in the order tokens appear along the N dimension,
-        which preserves causal ordering.
+        Iterates over every (batch, token, head-choice) triple in sequence order.
+        For each triple, the key and value are written to the next available slot for
+        that (batch, head) pair and the count is incremented. Causal ordering is
+        guaranteed because the token dimension is traversed from 0 to N-1 and counts
+        are updated immediately after each write.
+
+        Buffer expansion (doubling T_max) is triggered before any writes if the
+        incoming tokens would cause any slot to overflow the current capacity.
 
         Args:
             layer_idx: Decoder layer index (0-based).
@@ -120,37 +116,30 @@ class MoSRAHCache(Cache):
         B, N, K = head_idx.shape
         counts = self._counts[layer_idx]
 
-        # Build a (B, N, L) boolean mask: mask[b, n, h] is True iff head h was
-        # selected by token n for batch item b. Used to compute both per-slot deltas
-        # and within-slot positions via cumsum.
-        mask = torch.zeros(
-            B, N, self.num_mosrah_heads, dtype=torch.bool, device=head_idx.device
+        # Compute how many tokens each (batch, head) slot will receive this call so
+        # we can check for overflow before writing anything.
+        delta = torch.zeros(
+            B, self.num_mosrah_heads, dtype=torch.long, device=head_idx.device
         )
-        mask.scatter_(2, head_idx, True)
-
-        # Number of tokens routed to each (batch, head) slot in this call.
-        delta = mask.long().sum(dim=1)  # (B, L)
+        for b in range(B):
+            for n in range(N):
+                for k in range(K):
+                    delta[b, head_idx[b, n, k].item()] += 1
 
         # Expand buffers if any slot would overflow.
         if (counts + delta).max().item() > self._t_max[layer_idx]:
             self._expand_layer(layer_idx)
 
-        # Cumulative count of selections of each head by each batch item up to and
-        # including token n. Subtracting 1 gives the zero-based within-slot index
-        # for this call (i.e. the rank of this token among those routed to this slot).
-        within_slot = mask.long().cumsum(dim=1).gather(2, head_idx) - 1  # (B, N, K)
-
-        # Offset by the pre-update count to get the absolute buffer position.
-        b_idx = torch.arange(B, device=head_idx.device).view(B, 1, 1).expand(B, N, K)
-        abs_pos = within_slot + counts[b_idx, head_idx]  # (B, N, K)
-
-        # Scatter key and value vectors into the buffer using advanced indexing.
-        # b_idx, head_idx, abs_pos together identify the (batch, head, slot) target;
-        # the feature dimension u is handled by the trailing broadcast.
-        self._keys[layer_idx][b_idx, head_idx, abs_pos] = key_states
-        self._values[layer_idx][b_idx, head_idx, abs_pos] = value_states
-
-        self._counts[layer_idx] += delta
+        # Write each token into the next available slot for its (batch, head) pair.
+        # Iterating n from 0 to N-1 preserves causal ordering within each slot.
+        for b in range(B):
+            for n in range(N):
+                for k in range(K):
+                    h = head_idx[b, n, k].item()
+                    pos = counts[b, h].item()
+                    self._keys[layer_idx][b, h, pos, :] = key_states[b, n, k, :]
+                    self._values[layer_idx][b, h, pos, :] = value_states[b, n, k, :]
+                    counts[b, h] += 1
 
         return self._keys[layer_idx], self._values[layer_idx]
 
@@ -161,7 +150,7 @@ class MoSRAHCache(Cache):
         lengths depending on routing history. There is no meaningful scalar summary.
         """
         raise NotImplementedError(
-            "MoSRAHCache has no single sequence length. "
+            "SlowMoSRAHCache has no single sequence length. "
             "Use get_expert_lengths(layer_idx) for per-head occupancy."
         )
 
@@ -181,6 +170,33 @@ class MoSRAHCache(Cache):
             that have not yet received any updates.
         """
         return self._counts[layer_idx]
+
+    # ---------------------------------------------------------------------------
+    # Internal helpers
+    # ---------------------------------------------------------------------------
+
+    def _expand_layer(self, layer_idx: int) -> None:
+        """Double the T_max capacity for the given layer, preserving existing data.
+
+        Called by update() when an incoming batch of tokens would cause any
+        (batch, head) slot to exceed the current buffer capacity. All existing
+        key and value data is copied into the low half of the new buffer; the
+        high half is zero-initialised and will be filled by subsequent writes.
+        """
+        old_t = self._t_max[layer_idx]
+        new_t = old_t * 2
+        dev = self._keys[layer_idx].device
+        new_keys = torch.zeros(
+            self.batch_size, self.num_mosrah_heads, new_t, self.head_dim, device=dev
+        )
+        new_values = torch.zeros(
+            self.batch_size, self.num_mosrah_heads, new_t, self.head_dim, device=dev
+        )
+        new_keys[:, :, :old_t, :] = self._keys[layer_idx]
+        new_values[:, :, :old_t, :] = self._values[layer_idx]
+        self._keys[layer_idx] = new_keys
+        self._values[layer_idx] = new_values
+        self._t_max[layer_idx] = new_t
 
     # ---------------------------------------------------------------------------
     # Cache protocol — coordination methods
@@ -230,35 +246,8 @@ class MoSRAHCache(Cache):
 
     @property
     def is_sliding(self) -> list[bool]:
-        """MoSRAH cache is not a sliding-window cache — all slots are full-history."""
+        """SlowMoSRAHCache is not a sliding-window cache — all slots are full-history."""
         return [False] * self.num_hidden_layers
-
-    # ---------------------------------------------------------------------------
-    # Internal helpers
-    # ---------------------------------------------------------------------------
-
-    def _expand_layer(self, layer_idx: int) -> None:
-        """Double the T_max capacity for the given layer, preserving existing data.
-
-        Called by update() when an incoming batch of tokens would cause any
-        (batch, head) slot to exceed the current buffer capacity. All existing
-        key and value data is copied into the low half of the new buffer; the
-        high half is zero-initialised and will be filled by subsequent writes.
-        """
-        old_t = self._t_max[layer_idx]
-        new_t = old_t * 2
-        dev = self._keys[layer_idx].device
-        new_keys = torch.zeros(
-            self.batch_size, self.num_mosrah_heads, new_t, self.head_dim, device=dev
-        )
-        new_values = torch.zeros(
-            self.batch_size, self.num_mosrah_heads, new_t, self.head_dim, device=dev
-        )
-        new_keys[:, :, :old_t, :] = self._keys[layer_idx]
-        new_values[:, :, :old_t, :] = self._values[layer_idx]
-        self._keys[layer_idx] = new_keys
-        self._values[layer_idx] = new_values
-        self._t_max[layer_idx] = new_t
 
     # ---------------------------------------------------------------------------
     # Cache protocol — unsupported operations
@@ -267,7 +256,7 @@ class MoSRAHCache(Cache):
     def get_max_cache_shape(self, layer_idx: int | None = None) -> int:
         """Not supported — MoSRAHCache is dynamic and unbounded."""
         raise NotImplementedError(
-            "MoSRAHCache is unbounded; get_max_cache_shape() is not supported."
+            "SlowMoSRAHCache is unbounded; get_max_cache_shape() is not supported."
         )
 
     def get_mask_sizes(
@@ -277,5 +266,5 @@ class MoSRAHCache(Cache):
     ) -> tuple[int, int]:
         """Not supported — MoSRAHCache does not participate in HF mask construction."""
         raise NotImplementedError(
-            "MoSRAHCache does not support get_mask_sizes()."
+            "SlowMoSRAHCache does not support get_mask_sizes()."
         )
