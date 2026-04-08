@@ -14,6 +14,10 @@ The library is a repository, not a PyPI package. Distribution is via HuggingFace
 
 ## Governing Principle
 
+Hours of LLM work rejected due to failing to follow governing principles: 6
+Total sessions completely rolled back: 4
+**These rules are serious**
+
 This is a research baseline, not a software project. That distinction determines everything about how this work is done.
 
 Software succeeds when it works. A research baseline succeeds when it can be *trusted*. These are different standards with different failure modes. Code that runs, produces outputs, and passes tests is not necessarily correct. Code whose correctness cannot be verified is not a step toward a research baseline — it is a different thing entirely, and it must be discarded and rebuilt. This has already happened on this project. It is not a warning; it is a description of how this work operates.
@@ -26,7 +30,7 @@ The measure of success at every step is not "does it run" and not "do the tests 
 
 Work from this document. Reason from invariants. Stop and ask when uncertain. Those are not constraints on getting things done — they are how correct things get done.
 
-Trust nothing. Avoid ever handling ambiguity by choosing to support multiple outcomes with fallback paths. This may silently hide config errors that torpedo the entire study.
+Trust nothing. Avoid ever handling ambiguity by choosing to support multiple outcomes with fallback paths. This may silently hide config errors that torpedo the entire study. All team members must agree on current project state before moving onto a next step. Sometimes, this means you will be ready to implement but must answer questions and ask permission to proceed first. This catches mistakes.
 
 > **Work is not accepted unless it can be proven correct. Correct means every decision traces to a principle in this document — before work begins as a stated commitment, and after as a demonstrated record. A plan that cannot show this connection before execution is not approvable. Work that cannot show it after is not complete. This is not abstract: multiple days of work on this project have already been discarded because this standard was not maintained. It will happen again before the work is accepted rather than after.
 
