@@ -786,19 +786,16 @@ MoSRAH ragged cache are a research design question and were not resolved here.
 This unit is the short-range sliding-window dot-product attention path inside SHRAM. It needs to be able to allow operation over the 64k sequence lengths during the experiment. The layer must support caching for later experimentation and have positional encoding. Because it is a local attention formulation it should not adjust its positional (RoPE) formulation when YaRN extrapolation occurs. It has to be causal as this is an autoregressive decoder context. It must be compatible with the broader SHRAM layer as well.
 
 **Invariants this unit must satisfy:**
-- The unit defines `h_l` for one SHRAM decoder layer only.
+- The unit defines `SlidingWindowAttention` for one SHRAM decoder layer only.
 - The unit implements the local short-range dot-product attention path inside SHRAM.
 - The unit implements causal sliding-window attention.
-- The unit supports the experimental long-sequence regime required by the project.
-- The unit accepts and uses the `.sliding_window_cache` belonging to its corresponding
-  `ShramLayerCache`.
+- The unit accepts and uses a SlidingWindowLayerCache. This is retrieved by the parent layer off the `ShramLayerCache`.
 - The unit supports cached execution for later experimentation.
 - The unit implements positional encoding for the local path.
 - The local path's positional encoding uses `default` RoPE mode and does not respond to YaRN
   dilation or long-context scaling changes elsewhere in the model.
 - The unit returns outputs in `(B, N, d)` form compatible with downstream SHRAM composition.
 - The unit is compatible with the broader SHRAM layer and cache architecture.
-- The unit is implemented for very rapid usage.
 - Tests and design for this unit are themselves structured so the unit can be trusted as a
   verified black box by later SHRAM-layer assembly.
 
@@ -815,18 +812,14 @@ This unit is the short-range sliding-window dot-product attention path inside SH
 - Verify the returned output remains compatible with later SHRAM composition.
 
 **Preliminary implementation strategy:**
-- If no contradictory ground truth is discovered during implementation, the local path should
-  receive and consume the layer-local `.sliding_window_cache` directly rather than re-resolving
-  broader cache ownership internally.
+- The layer will receive and consume a DynamicSlidingWindowLayer huggingface cache.
 - If FlexAttention continues to satisfy the required sliding-window, causal, and long-sequence
   behavior cleanly, it should be the preferred backend for this unit.
-- If the current `RotaryEmbedding` design continues to support `default` mode that ignores
-  dilation, that mode should be used for the local path.
+- The current RoPe design should be usuable in the default mode. If it is not it is a blocker and should be raised and discussed.
 - If cached and uncached execution diverge in behavior, correctness takes priority and the
   divergence should be surfaced explicitly rather than hidden behind fallback logic.
 - If the chosen backend introduces a limitation that breaks any of the above invariants, that
-  limitation should be surfaced and the backend choice reconsidered explicitly rather than worked
-  around silently.
+  limitation should be surfaced and the backend choice reconsidered explicitly rather than worked around silently.
 ---
 ### Unit 8 — Expert Packing and Unpacking
 
@@ -866,7 +859,7 @@ This unit sits at the conversion boundary between routing and BEA. Routing produ
 **Tests**
 - Verify the implemented packing/unpacking path matches the paper-specified algorithmic behavior.
 - Verify stable-sort-based packing preserves causal order within each expert bucket.
-- Verify a deliberately unstable-sort alternative would fail the causal-order test.
+- (Note on last case): Verify a deliberately unstable-sort alternative would fail the causal-order test.
 - Verify `active_mask` has the correct entry count and correctly identifies active tokens.
 - Verify active packed tokens are left-justified.
 - Verify packed positions match original sequence positions in packed order.
@@ -882,68 +875,117 @@ This unit sits at the conversion boundary between routing and BEA. Routing produ
 - If a more efficient implementation is introduced, it must preserve exactly the externally
   visible behavior specified by the paper.
 
-### Unit 8 — Expert Packing and Unpacking
-
-**Invariants this unit must satisfy:**
-- Expert packing converts `selected_heads` (B, N, K) + x (B, N, d) into `packed_hidden`
-  (B, L, T, d), `packed_positions` (B, L, T), `active_mask` (B, L, T boolean) as specified
-  in Appendix A.Expert Packing.
-- Stable sort is used to produce `expert_order_idx` — not argsort without stable=True.
-  Unstable sort silently violates causal ordering of tokens within each head's packed
-  representation.
-- `active_mask` has exactly B×N×K true entries. Active tokens are left-justified within each
-  head slot.
-- `packed_positions` contains original sequence positions (0..N-1) of the packed tokens.
-- `token_order_idx` (inverse permutation) is retained for unpacking.
-- Expert unpacking is the exact inverse: given y (B, L, T, d) and the packing context
-  (`token_order_idx`, `active_mask`), produces `unpacked_output` (B, N, K, d).
-- Round-trip identity: unpack(pack(x, selected_heads)) recovers x at all original positions.
-- Tests verify: stable sort causality (a test that fails with unstable sort),
-  `active_mask` entry count, `packed_positions` correctness, round-trip identity, padding
-  is zero.
-- Inference modes will need to know what sections are padding vs active once unpacked. 
-
-**Paper refs:** Appendix A.Expert Packing and Unpacking.
-
 ---
 
 ### Unit 9 — Bottlenecked Ensemble Attention (BEA)
 
-BEA is a pure attention operator: given a packed expert-choice tensor, a position tensor, a
-mask, and an optional cache, it projects Q/K/V, applies RoPE, writes K̃ and V to the cache if
-present, reads back accumulated K̃/V, and attends. BEA does not compute positions — the caller
-(Unit 10.B) supplies the position tensor P. BEA does not choose the RoPE mode — that is
-MoSRAH's responsibility. This keeps BEA's contract simple and independently testable.
+**Responsibility:** Define and verify the Bottlenecked Ensemble Attention operator used by the
+MoSRAH sparse path. This unit consumes packed expert-choice tensors together with a supplied
+position tensor and optional layer-local sparse cache, and returns expert-choice outputs in the same packed space.
 
-Storing post-RoPE K̃ in the cache (rather than raw K) means cached keys are already rotated;
-subsequent reads use them directly without re-applying RoPE. This is a correctness requirement:
-applying RoPE again to a cached K̃ would corrupt positional encoding.
+**Context of Correctness**
+
+BEA is the expert-choice attention operator in the sparse path. It consumes the packed expert
+tensors produced by Unit 8 rather than token-choice state. Queries, keys, and values are projected per head from packed expert-choice tensors; RoPE is
+applied using a supplied position tensor; a standard triangular causal mask or equivalent mathematical behavior is used over packed positions; and the output is projected back into `(B, L, T, d)` expert-choice form. BEA does not compute positions and does not choose the RoPE mode; both are supplied from outside to distribute complexity between BEA and its MoSRAH parent. Cached keys must be stored post-RoPE as `K̃`, because reapplying RoPE to cached keys would corrupt positional encoding. Since the resulting tensors are
+ordinary headed attention tensors, this unit is expected to use a fast attention backend rather than a naive attention implementation wherever possible. The implementation is already highly constrained by the requirements of the paper.
 
 **Invariants this unit must satisfy:**
-- Interface: `forward(packed_hidden, position_ids, active_mask, cache=None, layer_idx=None)`
-  where `packed_hidden` is `(B, L, T, d)`, `position_ids` is `(B, L, T)` int,
-  `active_mask` is `(B, L, T)` bool. Returns `y` of shape `(B, L, T, d)`.
-- `W_Q`, `W_K`, `W_V` shape `(L, d, u)`; `W_O` shape `(L, u, d)`. Independent parameters
-  per head — no weight sharing across heads. `u = d / K` (mosrah_head_dim from config).
-- BEA constructs its own `RotaryEmbedding(mode="yarn", head_dim=config.head_dim,
-  theta=config.mosrah_rope_theta, initial_seq_length=config.training_sequence_length,
-  dilation=config.scale, alpha=config.alpha, beta=config.beta)`. The returned `A_rope`
-  scales attention logits before softmax.
-- RoPE is applied to Q and K using `position_ids`. The result K̃ is post-RoPE.
-- If `cache is not None`: `cache.mosrah_cache.write(layer_idx, K̃, V, active_mask)`, then
-  `K̃_all, V_all, full_mask = cache.mosrah_cache.read(layer_idx)`. Attention uses
-  `K̃_all`, `V_all`, `full_mask`.
-- If `cache is None`: attention uses K̃, V, `active_mask` directly.
-- Causal masking is a triangular mask over the T (packed) dimension.
-- Padded positions (`active_mask == False`) do not contribute to attention output.
-- Tests verify: output shape; head independence (perturbing one head's weights changes only
-  that head's output); RoPE passthrough (different position tensors produce different outputs);
-  padding positions do not influence real-token outputs; causal masking holds; with cache,
-  accumulated K̃/V grow correctly across calls and are used in attention.
+- BEA is implemented as the packed expert-choice attention operator for the sparse MoSRAH path.
+- The unit consumes packed expert-choice hidden states, a supplied position tensor, an
+  active-token mask, and an optional layer-local MoSRAH cache.
+- The unit does not compute positions.
+- The unit does not choose the RoPE mode.
+- The unit implements interface
+  `forward(packed_embeddings, position_ids, active_mask, cache=None)` where:
+  - `packed_embeddings` has shape `(B, L, T, d)`
+  - `position_ids` has shape `(B, L, T)`
+  - `active_mask` has shape `(B, L, T)`
+  - return value has shape `(B, L, T, d)`
+- The BEA projection parameters are independent per head. No cross-head parameter sharing is
+  introduced here.
+- BEA applies RoPE to `Q` and `K` using the supplied `position_ids` and consumes the returned
+  attention scaling `A_rope` in the attention computation.
+- If a cache is provided, BEA stores post-RoPE `K̃` and raw `V` into that layer-local sparse
+  cache and performs attention against the accumulated cached state returned by the cache.
+- If no cache is provided, BEA performs attention against the current-step `K̃`, `V`, and
+  `active_mask` directly.
+- Causal masking is triangular over the packed sequence dimension or an equivalent mathematical system is utilized to support causality.
+- Inactive / padded positions do not contribute to attention outputs.
+- The unit returns packed expert-choice outputs in the same `(B, L, T, d)` space expected by
+  later unpacking.
+- The unit is implemented for very rapid usage and is not a naive attention implementation.
+- Tests and design for this unit are themselves structured so the unit can be trusted as a
+  verified black box by later sparse-path assembly.
 
-**Paper refs:** Appendix A.BEA, Appendix B.RoPE Mechanics.
+**Tests**
+- Verify output shape is correct.
+- Verify BEA accepts packed expert-choice inputs and returns packed expert-choice outputs.
+- Verify per-head parameter independence.
+- Verify different supplied position tensors produce different RoPE-adjusted attention behavior.
+- Verify BEA does not internally compute positions or override the supplied RoPE mode when RoPE is activated in YaRN.
+- Verify inactive / padded positions do not influence active-token outputs.
+- Verify causal masking is preserved over packed positions.
+- Verify cached execution stores post-RoPE `K̃` and raw `V`.
+- Verify cached execution uses accumulated cached state returned by the provided local MoSRAH
+  cache.
+- Verify uncached execution uses the current `K̃`, `V`, and `active_mask` directly.
+- Verify cached and uncached execution both satisfy the same externally visible BEA contract.
+- Verify the implementation uses a non-naive attention path compatible with the tensor form.
+
+**Preliminary implementation strategy:**
+- Cached and uncached BEA should share one public operator contract, with a small branch on
+  whether a local sparse cache was actually passed.
+- If a cache is passed, the operator should route through that cache using post-RoPE in the expert-packing mode. `K̃`, raw
+  `V`, and the active-token mask; otherwise it should attend directly over the current-step
+  tensors.
+- If the tensor forms remain ordinary headed attention tensors, a fast attention backend such as FlashAttention or FlexAttention should be preferred over a naive implementation.
+- If any implementation choice would cause RoPE to be applied twice to cached keys, it should be  rejected.
+- If a more efficient backend is introduced later, it must preserve the same externally visible  packed-space behavior, masking behavior, and cache semantics.
+
 
 ---
+### Unit 10.A — MoSRAH Position Computation
+
+**Responsibility:** Define and verify the position-tensor computation used by the MoSRAH sparse path before BEA is called.
+
+**Context of Correctness**
+
+A degree of ambiguity exists in what form of RoPE to use in this kind of model. Does the position as measured in the expert choice packing, or original token-choice packing matter more? The paper was unable to determine it so we must support both. . In main-sequence mode, the packed original-token positions from Unit 8 are used directly. In semantic-sequence mode, positions are instead local to each expert bucket. This is a separate unit as it was deemed sufficiently complex it should be it's own module. The algorithm is highly constrained as research was already performed during the implementation of unit 6.
+
+**Invariants this unit must satisfy:**
+
+- This unit computes the position tensor `P` supplied to BEA for the MoSRAH sparse path.
+- There are two supported RoPE modes:
+  - `main_sequence`
+  - `semantic_sequence`
+- In `main_sequence` mode, `P = J` always, where `J` is the packed original-token position
+  tensor produced by Unit 8.
+- In `semantic_sequence` mode with no sparse cache present, `P` is the per-expert local sequence
+  `0, 1, 2, ...` over the packed sequence dimension.
+- In `semantic_sequence` mode with a sparse cache present, `P` is the same local sequence offset by the current per-head occupancies returned by `get_heads_lengths()`.
+- The cached and uncached semantic-sequence computations produce contiguous per-expert position that are equivalent in nature.
+- The resulting `P` has shape `(B, L, T)` and is compatible with BEA.
+- Tests and design for this unit are themselves structured so the unit can be trusted as a
+  verified black box by Unit 10.B.
+
+**Tests**
+- Verify `main_sequence` mode returns `J` unchanged.
+- Verify `semantic_sequence` mode without cache returns local per-expert positions
+  `0, 1, 2, ...`.
+- Verify `semantic_sequence` mode with cache returns occupancy-offset local positions using
+  `get_heads_lengths()`.
+- Verify bulk updates with `T > 1` produce contiguous positions.
+- Verify cached semantic-sequence computation reads `get_heads_lengths()` before any cache update
+  in the same forward pass.
+- Verify returned position tensors have the correct shape for BEA.
+
+**Preliminary implementation strategy:**
+- If  `semantic_sequence` mode is selected and no contradictory ground truth is discovered during implementation this unit should first generate the offsets as a set of zeros, add to it the cache offsets if the cache exists, then add them to the generative arange when in semantic mode.
+- If `main_sequence` mode is selected, the unit should forward the packed position tensor `J`
+  directly.
+- If any later implementation change would cause BEA to update the cache before this unit reads cached occupancies, that change should be rejected.
+
 
 ### Unit 10.A — MoSRAH Position Computation (Blocker for 10.B)
 
@@ -980,7 +1022,7 @@ then reads). This ordering is the invariant — it must not be violated.
 
 ---
 
-### Unit 10.B — MoSRAH Sparse Path
+### Unit 10.B — MoSRAH Path
 
 **Invariants this unit must satisfy:**
 - MoSRAH forward: `(selected_heads, routing_probs) = Router(x)`; `packed_hidden, J, active_mask

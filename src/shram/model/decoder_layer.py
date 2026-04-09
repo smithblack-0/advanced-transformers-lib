@@ -25,7 +25,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 from transformers.cache_utils import Cache
 
-from .attention import GroupedQueryAttention
+#from .attention import GroupedQueryAttention
 from .mlp import SwiGLUMLP
 
 
