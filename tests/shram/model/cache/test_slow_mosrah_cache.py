@@ -295,6 +295,84 @@ def test_reorder_cache_permutes_counts():
 
 
 # ---------------------------------------------------------------------------
+# batch_repeat_interleave()
+# ---------------------------------------------------------------------------
+
+def test_batch_repeat_interleave_expands_keys():
+    """batch_repeat_interleave() expands dim 0 of the key buffer."""
+    cache = make_cache(batch=2)
+    seed_cache(cache, counts=torch.ones(2, NUM_HEADS, dtype=torch.long))
+    original_keys = cache.keys.clone()
+
+    cache.batch_repeat_interleave(3)
+
+    assert cache.keys.shape[0] == 6
+    assert torch.equal(cache.keys[0], original_keys[0])
+    assert torch.equal(cache.keys[1], original_keys[0])
+    assert torch.equal(cache.keys[2], original_keys[0])
+    assert torch.equal(cache.keys[3], original_keys[1])
+
+
+def test_batch_repeat_interleave_expands_counts():
+    """batch_repeat_interleave() expands dim 0 of the count tensor."""
+    cache = make_cache(batch=2)
+    counts = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+    seed_cache(cache, counts=counts)
+
+    cache.batch_repeat_interleave(2)
+
+    assert torch.equal(cache.get_heads_lengths()[0], counts[0])
+    assert torch.equal(cache.get_heads_lengths()[1], counts[0])
+    assert torch.equal(cache.get_heads_lengths()[2], counts[1])
+    assert torch.equal(cache.get_heads_lengths()[3], counts[1])
+
+
+def test_batch_repeat_interleave_updates_batch_size():
+    """batch_repeat_interleave() updates batch_size to B * repeats."""
+    cache = make_cache(batch=2)
+    cache.batch_repeat_interleave(4)
+    assert cache.batch_size == 8
+
+
+# ---------------------------------------------------------------------------
+# batch_select_indices()
+# ---------------------------------------------------------------------------
+
+def test_batch_select_indices_selects_keys():
+    """batch_select_indices() selects the correct rows from the key buffer."""
+    cache = make_cache(batch=4)
+    seed_cache(cache, counts=torch.ones(4, NUM_HEADS, dtype=torch.long))
+    original_keys = cache.keys.clone()
+
+    indices = torch.tensor([0, 3])
+    cache.batch_select_indices(indices)
+
+    assert cache.keys.shape[0] == 2
+    assert torch.equal(cache.keys[0], original_keys[0])
+    assert torch.equal(cache.keys[1], original_keys[3])
+
+
+def test_batch_select_indices_selects_counts():
+    """batch_select_indices() selects the correct rows from the count tensor."""
+    cache = make_cache(batch=4)
+    counts = torch.tensor([[1, 0, 2, 0], [3, 1, 0, 2], [0, 0, 1, 0], [4, 2, 1, 3]])
+    seed_cache(cache, counts=counts)
+
+    indices = torch.tensor([1, 3])
+    cache.batch_select_indices(indices)
+
+    assert torch.equal(cache.get_heads_lengths()[0], counts[1])
+    assert torch.equal(cache.get_heads_lengths()[1], counts[3])
+
+
+def test_batch_select_indices_updates_batch_size():
+    """batch_select_indices() updates batch_size to the number of retained indices."""
+    cache = make_cache(batch=4)
+    cache.batch_select_indices(torch.tensor([0, 2]))
+    assert cache.batch_size == 2
+
+
+# ---------------------------------------------------------------------------
 # update() — single step correctness
 #
 # Each test builds a small known input, calls update(), and checks the internal

@@ -78,17 +78,24 @@ def test_shram_layer_cache_is_cachelayermixin_subclass():
     assert issubclass(ShramLayerCache, CacheLayerMixin)
 
 
-def test_is_initialized_true_at_construction():
-    """is_initialized is True immediately after construction."""
+def test_is_initialized_false_at_construction():
+    """is_initialized is False at construction — sliding_window_cache has not yet allocated storage."""
     cache = make_cache()
+    assert cache.is_initialized is False
+
+
+def test_is_initialized_true_after_first_sliding_window_update():
+    """is_initialized becomes True after sliding_window_cache.update() allocates storage."""
+    cache = make_cache()
+    sw_update(cache, BATCH, 1)
     assert cache.is_initialized is True
 
 
 def test_lazy_initialization_is_noop():
-    """lazy_initialization() completes without error and leaves is_initialized True."""
+    """lazy_initialization() completes without error and does not change is_initialized."""
     cache = make_cache()
     cache.lazy_initialization(torch.zeros(1), torch.zeros(1))
-    assert cache.is_initialized is True
+    assert cache.is_initialized is False
 
 
 def test_update_raises():
@@ -200,6 +207,29 @@ def test_reset_on_fresh_cache_is_idempotent():
 # ---------------------------------------------------------------------------
 # reorder_cache()
 # ---------------------------------------------------------------------------
+
+def test_batch_repeat_interleave_expands_both_sub_caches():
+    """batch_repeat_interleave() expands the batch dimension of both sub-caches atomically."""
+    cache = make_cache(batch=2)
+    sw_update(cache, 2, 1)
+    mosrah_update(cache, 2, 1)
+    cache.batch_repeat_interleave(3)
+    assert cache.sliding_window_cache.keys.shape[0] == 6
+    assert cache.mosrah_cache.batch_size == 6
+    assert cache.mosrah_cache.keys.shape[0] == 6
+
+
+def test_batch_select_indices_trims_both_sub_caches():
+    """batch_select_indices() trims the batch dimension of both sub-caches atomically."""
+    cache = make_cache(batch=4)
+    sw_update(cache, 4, 1)
+    mosrah_update(cache, 4, 1)
+    indices = torch.tensor([0, 3])
+    cache.batch_select_indices(indices)
+    assert cache.sliding_window_cache.keys.shape[0] == 2
+    assert cache.mosrah_cache.batch_size == 2
+    assert cache.mosrah_cache.keys.shape[0] == 2
+
 
 def test_reorder_cache_permutes_sliding_window_keys():
     """reorder_cache() permutes the batch dimension of sliding_window_cache.keys."""

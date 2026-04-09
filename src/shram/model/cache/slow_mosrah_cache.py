@@ -192,6 +192,36 @@ class SlowMoSRAHCache(CacheLayerMixin):
         self.values = self.values[beam_idx]
         self._counts = self._counts[beam_idx]
 
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        """Expand the batch dimension by repeating each entry repeats times.
+
+        Used at beam search initialisation to expand the cache from batch size B to
+        B * repeats, matching the expanded beam candidate batch. Applied atomically
+        across keys, values, and _counts; batch_size is updated to reflect the new size.
+
+        Args:
+            repeats: Number of times to repeat each batch entry.
+        """
+        self.keys = self.keys.repeat_interleave(repeats, dim=0)
+        self.values = self.values.repeat_interleave(repeats, dim=0)
+        self._counts = self._counts.repeat_interleave(repeats, dim=0)
+        self.batch_size = self.batch_size * repeats
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        """Select a subset of batch entries by index.
+
+        Used in contrastive search to retain only the selected candidate entries.
+        Applied atomically across keys, values, and _counts; batch_size is updated
+        to reflect the number of retained entries.
+
+        Args:
+            indices: 1-D integer tensor of batch indices to retain.
+        """
+        self.keys = self.keys[indices]
+        self.values = self.values[indices]
+        self._counts = self._counts[indices]
+        self.batch_size = indices.shape[0]
+
     def offload(self) -> None:
         """Offload all cached tensors to CPU.
 

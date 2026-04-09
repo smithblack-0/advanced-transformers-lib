@@ -71,10 +71,29 @@ class ShramLayerCache(CacheLayerMixin):
             device=device,
             initial_buffer_size=initial_buffer_size,
         )
-        # Both sub-caches are ready for use at construction time. MoSRAHCache pre-allocates
-        # its buffers; DynamicSlidingWindowLayer handles lazy initialization internally on
-        # first update(). From the ShramLayerCache boundary, the layer is initialized.
-        self.is_initialized = True
+
+    # ---------------------------------------------------------------------------
+    # Properties
+    # ---------------------------------------------------------------------------
+
+    @property
+    def is_initialized(self) -> bool:
+        """True iff both sub-caches have allocated their storage.
+
+        Derived from the sub-caches rather than tracked as a flag, so it is always
+        consistent with actual sub-cache state. The effective gate is the sliding-window
+        cache: MoSRAHCache pre-allocates at construction and is always ready, while
+        DynamicSlidingWindowLayer allocates lazily on the first update() call.
+        """
+        return self.sliding_window_cache.is_initialized and self.mosrah_cache.is_initialized
+
+    @is_initialized.setter
+    def is_initialized(self, value: bool) -> None:
+        # CacheLayerMixin.__init__ assigns self.is_initialized = False as an instance
+        # attribute. Since property is a data descriptor it takes precedence, but Python
+        # still routes the assignment through __set__. Absorb it silently — state is
+        # derived from sub-caches, not stored here.
+        pass
 
     # ---------------------------------------------------------------------------
     # CacheLayerMixin — composite-meaningful methods
@@ -110,6 +129,30 @@ class ShramLayerCache(CacheLayerMixin):
         """
         self.sliding_window_cache.reorder_cache(beam_idx)
         self.mosrah_cache.reorder_cache(beam_idx)
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        """Expand the batch dimension of both sub-caches for beam search initialisation.
+
+        Delegates atomically to each sub-cache. Both must be expanded together so the
+        sliding-window and MoSRAH state correspond to the same beam candidates.
+
+        Args:
+            repeats: Number of times to repeat each batch entry.
+        """
+        self.sliding_window_cache.batch_repeat_interleave(repeats)
+        self.mosrah_cache.batch_repeat_interleave(repeats)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        """Select a subset of batch entries in both sub-caches for contrastive search.
+
+        Delegates atomically to each sub-cache. Both must be trimmed together so the
+        sliding-window and MoSRAH state remain consistent.
+
+        Args:
+            indices: 1-D integer tensor of batch indices to retain.
+        """
+        self.sliding_window_cache.batch_select_indices(indices)
+        self.mosrah_cache.batch_select_indices(indices)
 
     def offload(self) -> None:
         """Offload both sub-caches to CPU.

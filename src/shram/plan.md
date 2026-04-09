@@ -34,7 +34,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 5.C.1 — RotaryEmbedding: revision pass (maintainability blocker; see unit)
 - [X] Unit 6.0 — Cache architecture: situation statement, design decisions, folder refactor
 - [X] Unit 6.A — MoSRAHCache and SlowMoSRAHCache: update/get_heads_lengths interface with oracle validation
-- [X] Unit 6.B — ShramCache: HF interface shim holding both sub-caches
+- [X] Unit 6.B — ShramLayerCache: per-layer composite cache owning both sub-caches
+- [X] Unit 6.C — ShramCache: top-level HF Cache owning all layer caches
 - [ ] Unit 7 — Local sliding-window attention module (h_l)
 - [ ] Unit 8 — Expert packing and unpacking: permutation machinery, padding, masks
 - [ ] Unit 9 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensors
@@ -53,7 +54,7 @@ is being achieved, one verified unit at a time.
 
 ## Status
 
-**Current state:** Unit 6.B complete (18/18 tests passing). Unit 6.C next. Network tests deselected (Hub repo not yet created).
+**Current state:** Units 6.A–6.C complete (127/127 tests passing). Unit 7 next. Network tests deselected (Hub repo not yet created).
 
 ---
 
@@ -765,6 +766,17 @@ path is ragged and does not.
 - If a HuggingFace top-level cache method has no truthful model-wide meaning here, explicit
   `NotImplementedError()` is preferable to a misleading partial implementation.
 
+### 6.Final — Generation Strategy Support
+
+During 6.B/6.C review it was identified that `batch_repeat_interleave` (beam search init) and
+`batch_select_indices` (contrastive search) were incorrectly raising `NotImplementedError`.
+Both were straightforward extensions of the existing `reorder_cache` pattern and were
+implemented across the full stack: `MoSRAHCache`, `SlowMoSRAHCache`, `ShramLayerCache`, and
+`ShramCache`. `crop` (speculative decoding rollback) was deferred — its semantics for the
+MoSRAH ragged cache are a research design question and were not resolved here.
+
+---
+
 ### Unit 7 — Local Sliding-Window Attention Module
 
 **Responsibility:** Define and verify the local sliding-window attention path `h_l` for one SHRAM decoder layer.
@@ -816,6 +828,59 @@ This unit is the short-range sliding-window dot-product attention path inside SH
   limitation should be surfaced and the backend choice reconsidered explicitly rather than worked
   around silently.
 ---
+### Unit 8 — Expert Packing and Unpacking
+
+**Responsibility:** Define and verify the packing and unpacking subsystem that converts routed
+token-choice state into expert-choice packed state for BEA, and then restores token-choice
+ordering afterward.
+
+**Context of Correctness**
+
+This unit sits at the conversion boundary between routing and BEA. Routing produces token-choice state, while BEA consumes expert-choice packed tensors. The packing and unpacking process is not merely an implementation convenience here: the paper specifies the algorithmic structure in detail, and this portion of the system is especially sensitive to being implemented incorrectly. In particular, causal ordering inside expert buckets, the packed position tensor used by RoPE, the active-token mask, and the inverse mapping back to token-choice order are all load-bearing. For that reason, this unit is more constrained than many others: the paper’s stated algorithm is part of the correctness boundary and packing  packing/unpacking is not an open design space.
+
+**Invariants this unit must satisfy:**
+- Expert packing and unpacking are implemented as specified in Appendix A / Architecture Details of the paper, especially the expert packing/unpacking tensor implementation and its auxiliary tensors.
+- An auxiliary setup_packing function is used as described in the paper to prepare the auxiliary data and make implementation modular.
+- Packing converts routed token-choice state into expert-choice packed state for BEA, and
+  unpacking restores token-choice ordering afterward.
+- Stable sort is used wherever the paper requires it to establish expert-major ordering.
+  Unstable sort is not acceptable.
+- The packed representation includes:
+  - packed hidden states for BEA
+  - packed original-token positions for downstream RoPE use
+  - an active-token mask distinguishing real packed tokens from padding
+  - the inverse-ordering context required to restore token-choice order exactly
+- The active-token mask has the correct cardinality and correctly distinguishes active packed
+  tokens from padding.
+- Active packed tokens are left-justified within each expert slot.
+- Packed positions preserve the original sequence positions in the packed order required by the
+  paper.
+- Unpacking is the exact inverse of packing on active entries.
+- `unpack(pack(x, selected_heads))` recovers the original active token copies at the correct
+  token-choice locations.
+- Padding introduced during packing remains padding and does not become active data during
+  unpacking.
+- The unit exposes enough activity information for later attention and inference code to tell
+  which regions correspond to real routed tokens and which correspond to padding.
+
+**Tests**
+- Verify the implemented packing/unpacking path matches the paper-specified algorithmic behavior.
+- Verify stable-sort-based packing preserves causal order within each expert bucket.
+- Verify a deliberately unstable-sort alternative would fail the causal-order test.
+- Verify `active_mask` has the correct entry count and correctly identifies active tokens.
+- Verify active packed tokens are left-justified.
+- Verify packed positions match original sequence positions in packed order.
+- Verify unpacking restores outputs to token-choice order with the correct shape.
+- Verify round-trip identity on active entries.
+- Verify padding regions remain zero/inactive through unpacking.
+
+**Preliminary implementation strategy:**
+- The paper should be treated as the primary algorithmic specification for this unit.
+  otherwise defer to the paper rather than re-specifying the full algorithm here.
+- If an implementation choice would alter the packed ordering, position tensor semantics,
+  activity-mask semantics, or inverse mapping described in the paper, it should be rejected.
+- If a more efficient implementation is introduced, it must preserve exactly the externally
+  visible behavior specified by the paper.
 
 ### Unit 8 — Expert Packing and Unpacking
 
