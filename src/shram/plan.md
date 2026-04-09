@@ -36,8 +36,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 6.A — MoSRAHCache and SlowMoSRAHCache: update/get_heads_lengths interface with oracle validation
 - [X] Unit 6.B — ShramLayerCache: per-layer composite cache owning both sub-caches
 - [X] Unit 6.C — ShramCache: top-level HF Cache owning all layer caches
-- [ ] Unit 7 — Local sliding-window attention module (h_l)
-- [ ] Unit 8 — Expert packing and unpacking: permutation machinery, padding, masks
+- [X] Unit 7 — Local sliding-window attention module (h_l)
+- [X] Unit 8 — Expert packing and unpacking: permutation machinery, padding, masks
 - [ ] Unit 9 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensors
 - [ ] Unit 10.A — MoSRAH position computation: P tensor for both modes and all cache states
 - [ ] Unit 10.B — MoSRAH sparse path: routing → packing → position computation → BEA → unpacking → weighted reduction
@@ -905,7 +905,7 @@ ordinary headed attention tensors, this unit is expected to use a fast attention
 - The BEA projection parameters are independent per head. No cross-head parameter sharing is
   introduced here.
 - BEA applies RoPE to `Q` and `K` using the supplied `position_ids` and consumes the returned
-  attention scaling `A_rope` in the attention computation.
+  attention scaling `A_rope` in the attention computation. It does so in the YaRN capable mode.
 - If a cache is provided, BEA stores post-RoPE `K̃` and raw `V` into that layer-local sparse
   cache and performs attention against the accumulated cached state returned by the cache.
 - If no cache is provided, BEA performs attention against the current-step `K̃`, `V`, and
@@ -932,6 +932,7 @@ ordinary headed attention tensors, this unit is expected to use a fast attention
 - Verify uncached execution uses the current `K̃`, `V`, and `active_mask` directly.
 - Verify cached and uncached execution both satisfy the same externally visible BEA contract.
 - Verify the implementation uses a non-naive attention path compatible with the tensor form.
+- Verify the system responds to rescales under YaRN
 
 **Preliminary implementation strategy:**
 - Cached and uncached BEA should share one public operator contract, with a small branch on
@@ -987,60 +988,76 @@ A degree of ambiguity exists in what form of RoPE to use in this kind of model. 
 - If any later implementation change would cause BEA to update the cache before this unit reads cached occupancies, that change should be rejected.
 
 
-### Unit 10.A — MoSRAH Position Computation (Blocker for 10.B)
-
-BEA receives a position tensor P of shape `(B, L, T)` from its caller. This unit specifies
-exactly how P is computed under both rope modes and both cache states. It is a blocker for
-Unit 10.B — MoSRAH assembly must not begin until this computation is specified and verified.
-
-There are two rope modes (config-selected) and two cache states (training vs inference),
-giving four cases that reduce to two formulas:
-
-**Main-sequence mode:** `P = J` always. `J` is the packed original-token position tensor
-produced by expert packing (Unit 8), shape `(B, L, T)`. Cache state is irrelevant.
-
-**Semantic-sequence mode:** `P = base + arange(T)` where:
-- `base = 0` if `cache is None` (training). Positions are 0, 1, 2, ... within each head slot.
-- `base = cache.mosrah_cache.get_expert_lengths(layer_idx)` if `cache is not None` (inference).
-  Shape `(B, L)`, broadcast to `(B, L, T)`. Positions are offset by the current slot
-  occupancy so the new token(s) continue the semantic sequence already in the cache.
-
-`get_expert_lengths()` must be read **before** BEA calls `write()`, since `write()` increments
-the counts. The call order in Unit 10.B is: compute P (this unit) → call BEA (which writes,
-then reads). This ordering is the invariant — it must not be violated.
-
-**Invariants this unit must satisfy:**
-- Main-sequence mode returns `J` unchanged regardless of cache state.
-- Semantic mode, no cache: returns `arange(T)` broadcast to `(B, L, T)`.
-- Semantic mode, with cache: returns `get_expert_lengths(layer_idx).unsqueeze(-1) + arange(T)`
-  broadcast to `(B, L, T)`.
-- Position computation reads `get_expert_lengths()` before any `write()` occurs in this
-  forward pass.
-- Tests verify: main-sequence returns J; semantic no-cache returns slot indices; semantic
-  with-cache returns count-offset positions; bulk update (T > 1) produces contiguous positions;
-  positions read before write confirmed by populating cache and asserting offset is correct.
-
----
-
 ### Unit 10.B — MoSRAH Path
 
+**Responsibility:** Define and verify the full MoSRAH sparse path from routed token-choice input to
+final model-space sparse output.
+
+**Context of Correctness**
+
+The MoSRAH path bridges two different representational regimes. Routing begins in token-choice
+form, while BEA executes in packed expert-choice form. As such, this unit must perform the full
+bridge in order: route, pack, compute positions, attend, unpack, and reduce. The weighted
+reduction at the end must use the unbiased renormalized routing probabilities rather than the
+biased routing scores used for selection. This unit also has to support both RoPE position modes
+through Unit 10.A and must support inference through the layer-local MoSRAH cache. The routing
+system's load-balancing signal is also generated here and must be propagated out of the unit.
+
 **Invariants this unit must satisfy:**
-- MoSRAH forward: `(selected_heads, routing_probs) = Router(x)`; `packed_hidden, J, active_mask
-  = Pack(x, selected_heads)`; `P = PositionComputation(J, cache, layer_idx)` (Unit 10.A);
-  `y = BEA(packed_hidden, P, active_mask, cache, layer_idx)`; `unpacked_output = Unpack(y)`;
-  `o = sum_k unpacked_output_k * routing_probs_k`. Matches Algorithm 1 in the paper.
-- Weighted reduction uses `routing_probs` (unbiased, renormalized) — not biased scores,
-  not `selected_heads` indices.
-- `load_balance_loss` from Router is propagated through MoSRAH's return.
-- MoSRAH receives `cache` (a `ShramCache` or `None`) and `layer_idx`. It accesses
-  `cache.mosrah_cache` directly; it does not call `cache.update()`.
-- Input/output shape: `(B, N, d)` → `(B, N, d)`.
-- Tests verify: output shape; gradient flows through `routing_probs` to router weights;
-  `load_balance_loss` present; weighted reduction correct; cache accumulates correctly
+- The MoSRAH path is implemented as specified by Algorithm 1 and the surrounding appendix
+  material in the paper.
+- The unit consumes model-space hidden states `x` of shape `(B, N, d)` and returns model-space
+  sparse outputs of shape `(B, N, d)` together with `load_balance_loss`.
+- The unit performs the sparse-path forward sequence in the following order:
+  1. routing
+  2. expert packing
+  3. position computation
+  4. BEA
+  5. expert unpacking
+  6. weighted reduction
+- Routing produces `(selected_heads, routing_probs)` in token-choice form.
+- Packing consumes `x` and `selected_heads` and produces the packed expert-choice state required
+  by BEA.
+- Position computation is delegated to Unit 10.A.
+- BEA is called on packed expert-choice tensors and receives the layer-local MoSRAH cache
+  directly if caching is enabled.
+- Unpacking restores token-choice ordering from BEA's packed expert-choice outputs.
+- The final weighted reduction uses the unbiased renormalized `routing_probs`.
+- The final weighted reduction does **not** use biased selection scores and does **not** use the
+  selected-head indices as weighting values.
+- The unit supports both RoPE position modes provided by Unit 10.A.
+- The unit supports both cached and uncached execution.
+- `load_balance_loss` from the router is propagated through the MoSRAH path return.
+- The unit is implemented for very rapid usage.
+- Tests and design for this unit are themselves structured so the unit can be trusted as a
+  verified black box by later SHRAM-layer assembly.
+
+**Tests**
+- Verify output shape is correct.
+- Verify `load_balance_loss` is present in the unit return.
+- Verify the routed forward path follows the expected route → pack → position → BEA → unpack →
+  reduce structure.
+- Verify the final weighted reduction uses `routing_probs`.
+- Verify the final weighted reduction does not use biased routing scores.
+- Verify gradients flow through `routing_probs` back to the router weights.
+- Verify both supported position modes are accepted and produce valid outputs through Unit 10.A.
+- Verify uncached execution works correctly.
+- Verify cached execution uses the provided layer-local MoSRAH cache and accumulates correctly
   across calls.
+- Verify cached and uncached execution both satisfy the same external MoSRAH-path contract.
 
-**Paper refs:** §3 Design, Algorithm 1, Appendix A throughout.
-
+**Preliminary implementation strategy:**
+- The paper should be treated as the primary algorithmic specification for this unit.
+- If no contradictory ground truth is discovered during implementation, this unit should be
+  written as a straightforward orchestration of the already-verified subunits rather than as a
+  fused monolith that hides the bridge steps.
+- If caching is enabled, the unit should pass the layer-local MoSRAH cache directly into BEA;
+  otherwise it should execute the uncached path with the current packed tensors and active mask.
+- If both position modes remain supported, this unit should delegate position computation
+  entirely to Unit 10.A rather than reproducing position logic locally.
+- If a more aggressive fused implementation is later introduced for performance, it must preserve
+  the same externally visible routing, packing, position, attention, unpacking, reduction, and
+  cache semantics.
 ---
 
 ### Unit 11 — SHRAM Hybrid Layer
