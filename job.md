@@ -73,7 +73,7 @@ Note: `trust_remote_code=True` is required for custom architectures and must be 
 
 - The SHRAM layer computes H(x) = hl(x) + hs(x), where hl is a local sliding-window causal attention path and hs is the MoSRAH sparse routed path. These paths are independent components with independent parameters; their outputs are summed.
 
-- The local path hl uses FlashAttention's window-size mode — the kind where a window parameter (e.g., `window_size=(w, 0)`) is passed to the kernel and masking is handled internally by the implementation. A manually constructed sliding-window boolean mask passed as `attn_mask` is not an acceptable substitute and is architecturally incorrect.
+- The local path hl uses a flash attention formulation in a window-size mode — the kind where a window parameter (e.g., `window_size=(w, 0)`) is passed to the kernel and masking is handled internally by the implementation. A manually constructed sliding-window boolean mask passed as `attn_mask` is not an acceptable substitute and is architecturally incorrect.
 
 - The sparse path hs (MoSRAH) uses token-choice routing: each input token selects exactly K of L available attention heads. L and K are configurable parameters expressed through config.
 
@@ -266,3 +266,14 @@ When a defect is found — in audit or anywhere else — the resolution is not c
 
 **10. Surface paper↔implementation conflicts.**
 The primary reference is a research draft with incomplete sections and experimentally undetermined values. Where the paper is silent, contradictory, or leaves a value undetermined, this is a decision point — not a license to fill the gap autonomously. Surface it, resolve it explicitly with the user, and record the resolution in the plan before proceeding. Silent gap-filling is a defect.
+
+### Writing Standards for Plan Units
+
+Each plan unit must be written as a certification artifact, not merely a task description. A correct unit records: (1) the unit's responsibility, (2) why this unit is the globally correct action for the project at this abstraction boundary, including any relevant rejected alternatives, (3) the invariants that define correct behavior, (4) the tests that certify those invariants, and (5) a preliminary implementation strategy.
+
+Invariants may state only externally meaningful truth conditions, contractual obligations, and other facts that must be true for the unit to be correct. They must not contain implementation decisions such as storage layout, helper names, algorithms, inheritance choices, or other "how to do it" details unless those details are themselves part of the required external contract.
+
+The certification/rationale section must not read like a local patch note. It must explain why this unit, at this boundary, is the most correct action for the overall project, and why the main viable alternatives are less correct. Philosophy and engineering argument are not separate sections of thought: the rationale must embody the philosophy in the concrete engineering case to connect back to the program.
+
+The preliminary implementation strategy is the place for preferred approaches, provisional design choices, and decision contracts. It may say things like "if X remains true, Y must be preferred" or "if the ground situation reveals Z, this approach must be reconsidered." It must clearly distinguish these from invariants and preserve the ability to adapt to discovered facts without silently changing what correctness means.
+

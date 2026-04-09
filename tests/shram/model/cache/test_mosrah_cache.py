@@ -1,28 +1,40 @@
-"""Tests for MoSRAHCache — Units 6.A.A and 6.A.B.
+"""Tests for MoSRAHCache — Unit 6.A.
 
 Invariants verified in this file:
 
-Unit 6.A.A — storage and HF Cache protocol:
-- MoSRAHCache subclasses transformers.cache_utils.Cache
+HF CacheLayerMixin protocol and construction:
+- MoSRAHCache subclasses CacheLayerMixin
 - get_seq_length() raises NotImplementedError
-- get_expert_lengths() returns the (B, L) count tensor for any layer
-- get_expert_lengths() returns zeros for layers with no updates yet
-- is_initialized is False when all counts are zero, True after any update
-- reset() zeroes all counts and buffers across all layers
-- reorder_cache() permutes dim 0 of both buffers and counts atomically across all layers
+- lazy_initialization() is a no-op; is_initialized remains True
+- get_max_cache_shape() raises NotImplementedError
+- get_mask_sizes() raises NotImplementedError
+- get_heads_lengths() returns the (B, L) count tensor
+- get_heads_lengths() returns zeros for a fresh cache
+- get_heads_lengths() returns correct values after update() calls
+- get_heads_lengths() returns correct values after repeated update() calls
+- is_initialized is True at construction (storage is pre-allocated)
+- is_initialized remains True after reset() (storage is still allocated)
+- reset() zeroes all counts and buffers
+- reorder_cache() permutes dim 0 of both buffers and counts atomically
 
-Unit 6.A.B — vectorized scatter update:
-- update() produces identical (keys, counts) to SlowMoSRAHCache on all test inputs.
-  SlowMoSRAHCache is the correctness oracle: it was independently verified in
-  test_slow_mosrah_cache.py before being used here. Agreement with it on all cases
-  licenses trust in the vectorized implementation.
-  Cases covered: single token; multi-token same head; multi-call accumulation;
-  sparse routing; uneven per-head counts across batch items; buffer expansion.
+update()/return value interface:
+- update() returns a three-tensor tuple (keys, values, active_mask)
+- returned shapes and dtypes are correct
+- active_mask is True exactly for slots that have been written
+- roundtrip: values written are retrievable in the returned tuple
+
+Oracle agreement:
+- update() produces identical keys, values, _counts to SlowMoSRAHCache on all test
+  inputs. SlowMoSRAHCache is independently verified in test_slow_mosrah_cache.py;
+  agreement with it on all cases licenses trust in the vectorized implementation.
+  Cases covered: single active position; multiple heads; multiple tokens in one head;
+  sparse mask; multi-call accumulation; uneven per-batch routing; buffer expansion.
+- The returned (keys, values, active_mask) tuple also agrees between implementations.
 """
 
 import torch
 import pytest
-from transformers.cache_utils import Cache
+from transformers.cache_utils import CacheLayerMixin
 
 from src.shram.model.cache.mosrah_cache import MoSRAHCache
 from src.shram.model.cache.slow_mosrah_cache import SlowMoSRAHCache
@@ -32,88 +44,90 @@ from src.shram.model.cache.slow_mosrah_cache import SlowMoSRAHCache
 # Helpers
 # ---------------------------------------------------------------------------
 
-NUM_LAYERS = 3
 NUM_HEADS = 4
 HEAD_DIM = 16
 BATCH = 2
-INITIAL_T_MAX = 8
+INITIAL_BUFFER_SIZE = 8
 
 
 def make_cache(
-    num_layers: int = NUM_LAYERS,
     batch: int = BATCH,
-    initial_t_max: int = INITIAL_T_MAX,
+    initial_buffer_size: int = INITIAL_BUFFER_SIZE,
 ) -> MoSRAHCache:
     return MoSRAHCache(
-        num_hidden_layers=num_layers,
         num_mosrah_heads=NUM_HEADS,
         head_dim=HEAD_DIM,
         batch_size=batch,
         device=torch.device("cpu"),
-        initial_t_max=initial_t_max,
+        initial_buffer_size=initial_buffer_size,
     )
 
 
 def make_slow_cache(
-    num_layers: int = NUM_LAYERS,
     batch: int = BATCH,
-    initial_t_max: int = INITIAL_T_MAX,
+    initial_buffer_size: int = INITIAL_BUFFER_SIZE,
 ) -> SlowMoSRAHCache:
     return SlowMoSRAHCache(
-        num_hidden_layers=num_layers,
         num_mosrah_heads=NUM_HEADS,
         head_dim=HEAD_DIM,
         batch_size=batch,
         device=torch.device("cpu"),
-        initial_t_max=initial_t_max,
+        initial_buffer_size=initial_buffer_size,
     )
 
 
+def seed_cache(cache: MoSRAHCache, counts: torch.Tensor) -> None:
+    """Directly write known counts and matching key/value data into cache storage.
+
+    Bypasses update() to allow reset(), reorder_cache(), and get_heads_lengths() to be
+    tested against known non-zero state.
+    """
+    cache._counts[:] = counts.clone()
+    for b in range(cache.batch_size):
+        cache.keys[b] = float(b + 1)
+        cache.values[b] = float(-(b + 1))
+
+
 def _run_both(
-    head_idx: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
+    mask: torch.Tensor,
     batch: int,
-    initial_t_max: int = INITIAL_T_MAX,
-) -> tuple[MoSRAHCache, SlowMoSRAHCache]:
-    """Run the same update() call on both implementations and return both caches."""
-    fast = make_cache(num_layers=1, batch=batch, initial_t_max=initial_t_max)
-    slow = make_slow_cache(num_layers=1, batch=batch, initial_t_max=initial_t_max)
-    fast.update(layer_idx=0, head_idx=head_idx, key_states=key_states, value_states=value_states)
-    slow.update(layer_idx=0, head_idx=head_idx, key_states=key_states, value_states=value_states)
-    return fast, slow
+    initial_buffer_size: int = INITIAL_BUFFER_SIZE,
+) -> tuple[MoSRAHCache, SlowMoSRAHCache, tuple, tuple]:
+    """Run the same update() call on both implementations and return both caches and results."""
+    fast = make_cache(batch=batch, initial_buffer_size=initial_buffer_size)
+    slow = make_slow_cache(batch=batch, initial_buffer_size=initial_buffer_size)
+    fast_result = fast.update(key_states, value_states, mask)
+    slow_result = slow.update(key_states, value_states, mask)
+    return fast, slow, fast_result, slow_result
 
 
-def _assert_agree(fast: MoSRAHCache, slow: SlowMoSRAHCache) -> None:
-    """Assert that keys, values, and counts agree exactly across all layers."""
-    for i in range(fast.num_hidden_layers):
-        assert torch.equal(fast._keys[i], slow._keys[i]), f"keys differ at layer {i}"
-        assert torch.equal(fast._values[i], slow._values[i]), f"values differ at layer {i}"
-        assert torch.equal(fast._counts[i], slow._counts[i]), f"counts differ at layer {i}"
+def _assert_agree(
+    fast: MoSRAHCache,
+    slow: SlowMoSRAHCache,
+    fast_result: tuple,
+    slow_result: tuple,
+) -> None:
+    """Assert that internal state and returned tuple agree exactly between implementations."""
+    assert torch.equal(fast.keys, slow.keys), "keys differ"
+    assert torch.equal(fast.values, slow.values), "values differ"
+    assert torch.equal(fast._counts, slow._counts), "counts differ"
 
-
-def seed_layer(cache: MoSRAHCache, layer_idx: int, counts: torch.Tensor) -> None:
-    """Directly write known counts and matching key/value data into a layer's storage.
-
-    Bypasses update() (which raises NotImplementedError in 6.A.A) to allow
-    reset(), reorder_cache(), and get_expert_lengths() to be tested against
-    known non-zero state.
-    """
-    cache._counts[layer_idx] = counts.clone()
-    # Fill keys and values with recognisable per-batch-item data so reorder
-    # tests can verify the correct rows were permuted.
-    for b in range(cache.batch_size):
-        cache._keys[layer_idx][b] = float(b + 1)
-        cache._values[layer_idx][b] = float(-(b + 1))
+    fast_keys, fast_vals, fast_mask = fast_result
+    slow_keys, slow_vals, slow_mask = slow_result
+    assert torch.equal(fast_keys, slow_keys), "returned keys differ"
+    assert torch.equal(fast_vals, slow_vals), "returned values differ"
+    assert torch.equal(fast_mask, slow_mask), "returned active_mask differs"
 
 
 # ---------------------------------------------------------------------------
-# HF Cache protocol
+# HF CacheLayerMixin protocol
 # ---------------------------------------------------------------------------
 
-def test_mosrah_cache_is_cache_subclass():
-    """MoSRAHCache satisfies the HF Cache protocol."""
-    assert issubclass(MoSRAHCache, Cache)
+def test_mosrah_cache_is_cachelayermixin_subclass():
+    """MoSRAHCache satisfies the HuggingFace per-layer cache role."""
+    assert issubclass(MoSRAHCache, CacheLayerMixin)
 
 
 def test_get_seq_length_raises():
@@ -123,12 +137,16 @@ def test_get_seq_length_raises():
         cache.get_seq_length()
 
 
-def test_get_seq_length_raises_with_layer_arg():
-    """get_seq_length() raises regardless of the layer_idx argument."""
-    cache = make_cache()
-    with pytest.raises(NotImplementedError):
-        cache.get_seq_length(layer_idx=2)
+def test_lazy_initialization_is_noop():
+    """lazy_initialization() completes without error and leaves is_initialized True.
 
+    The cache is pre-allocated at construction time, so lazy_initialization() has
+    no work to do. It must not raise: HF orchestration paths call it before first
+    use and expect it to succeed.
+    """
+    cache = make_cache()
+    cache.lazy_initialization(torch.zeros(1), torch.zeros(1))
+    assert cache.is_initialized is True
 
 
 def test_get_max_cache_shape_raises():
@@ -149,89 +167,85 @@ def test_get_mask_sizes_raises():
 # Construction and shape invariants
 # ---------------------------------------------------------------------------
 
-def test_buffers_allocated_at_construction():
-    """All per-layer buffers exist immediately after construction."""
-    cache = make_cache()
-    assert len(cache._keys) == NUM_LAYERS
-    assert len(cache._values) == NUM_LAYERS
-    assert len(cache._counts) == NUM_LAYERS
-
-
 def test_buffer_shapes_at_construction():
     """Key and value buffers have shape (B, L, T_max, u); counts have shape (B, L)."""
     cache = make_cache()
-    for layer_idx in range(NUM_LAYERS):
-        assert cache._keys[layer_idx].shape == (BATCH, NUM_HEADS, INITIAL_T_MAX, HEAD_DIM)
-        assert cache._values[layer_idx].shape == (BATCH, NUM_HEADS, INITIAL_T_MAX, HEAD_DIM)
-        assert cache._counts[layer_idx].shape == (BATCH, NUM_HEADS)
+    assert cache.keys.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
+    assert cache.values.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
+    assert cache._counts.shape == (BATCH, NUM_HEADS)
+
+
+def test_buffer_capacity_at_construction():
+    """buffer_capacity reflects the allocated slot count immediately after construction."""
+    cache = make_cache()
+    assert cache.buffer_capacity == INITIAL_BUFFER_SIZE
 
 
 def test_counts_zero_at_construction():
-    """All count tensors are zero immediately after construction."""
+    """All counts are zero immediately after construction."""
     cache = make_cache()
-    for layer_idx in range(NUM_LAYERS):
-        assert cache._counts[layer_idx].sum() == 0
+    assert cache._counts.sum() == 0
 
 
 # ---------------------------------------------------------------------------
 # is_initialized
 # ---------------------------------------------------------------------------
 
-def test_is_initialized_false_on_fresh_cache():
-    """is_initialized is False when all counts are zero."""
+def test_is_initialized_true_at_construction():
+    """is_initialized is True immediately after construction — storage is pre-allocated."""
     cache = make_cache()
-    assert cache.is_initialized is False
-
-
-def test_is_initialized_true_after_update():
-    """is_initialized is True after any update() call."""
-    cache = make_cache(num_layers=1, batch=1)
-    cache.update(
-        layer_idx=0,
-        head_idx=torch.tensor([[[0]]]),
-        key_states=torch.ones(1, 1, 1, HEAD_DIM),
-        value_states=torch.ones(1, 1, 1, HEAD_DIM),
-    )
     assert cache.is_initialized is True
 
 
 # ---------------------------------------------------------------------------
-# get_expert_lengths
+# get_heads_lengths
 # ---------------------------------------------------------------------------
 
-def test_get_expert_lengths_shape_on_fresh_cache():
-    """get_expert_lengths() returns shape (B, L) even for an unwritten layer."""
+def test_get_heads_lengths_shape_on_fresh_cache():
+    """get_heads_lengths() returns shape (B, L) even for a fresh cache."""
     cache = make_cache()
-    lengths = cache.get_expert_lengths(0)
+    lengths = cache.get_heads_lengths()
     assert lengths.shape == (BATCH, NUM_HEADS)
 
 
-def test_get_expert_lengths_zeros_on_fresh_cache():
-    """get_expert_lengths() returns all zeros for a layer that has no updates."""
+def test_get_heads_lengths_zeros_on_fresh_cache():
+    """get_heads_lengths() returns all zeros before any update()."""
     cache = make_cache()
-    lengths = cache.get_expert_lengths(0)
-    assert lengths.sum() == 0
+    assert cache.get_heads_lengths().sum() == 0
 
 
-def test_get_expert_lengths_returns_correct_values():
-    """get_expert_lengths() returns the exact counts for a seeded layer."""
+def test_get_heads_lengths_correct_after_update():
+    """get_heads_lengths() returns the correct counts after update()."""
+    cache = make_cache(batch=1)
+    B, L, T = 1, NUM_HEADS, 1
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 0, 0] = True
+    mask[0, 2, 0] = True
+    cache.update(torch.ones(B, L, T, HEAD_DIM), torch.ones(B, L, T, HEAD_DIM), mask)
+    lengths = cache.get_heads_lengths()
+    assert lengths[0, 0].item() == 1
+    assert lengths[0, 2].item() == 1
+    assert lengths[0, 1].item() == 0
+    assert lengths[0, 3].item() == 0
+
+
+def test_get_heads_lengths_correct_after_repeated_updates():
+    """get_heads_lengths() accumulates correctly across multiple update() calls."""
+    cache = make_cache(batch=1)
+    B, L, T = 1, NUM_HEADS, 1
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 0, 0] = True
+    cache.update(torch.ones(B, L, T, HEAD_DIM), torch.ones(B, L, T, HEAD_DIM), mask)
+    cache.update(torch.ones(B, L, T, HEAD_DIM), torch.ones(B, L, T, HEAD_DIM), mask)
+    assert cache.get_heads_lengths()[0, 0].item() == 2
+
+
+def test_get_heads_lengths_returns_correct_seeded_values():
+    """get_heads_lengths() returns the exact counts for a seeded cache."""
     cache = make_cache()
     expected = torch.tensor([[3, 1, 4, 2], [0, 5, 2, 3]])
-    seed_layer(cache, layer_idx=0, counts=expected)
-    assert torch.equal(cache.get_expert_lengths(0), expected)
-
-
-def test_get_expert_lengths_independent_per_layer():
-    """get_expert_lengths() returns the correct counts for each layer independently."""
-    cache = make_cache()
-    counts_0 = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
-    counts_2 = torch.tensor([[8, 7, 6, 5], [4, 3, 2, 1]])
-    seed_layer(cache, layer_idx=0, counts=counts_0)
-    seed_layer(cache, layer_idx=2, counts=counts_2)
-    assert torch.equal(cache.get_expert_lengths(0), counts_0)
-    assert torch.equal(cache.get_expert_lengths(2), counts_2)
-    # Layer 1 was never written — should still be zero.
-    assert cache.get_expert_lengths(1).sum() == 0
+    seed_cache(cache, counts=expected)
+    assert torch.equal(cache.get_heads_lengths(), expected)
 
 
 # ---------------------------------------------------------------------------
@@ -239,52 +253,53 @@ def test_get_expert_lengths_independent_per_layer():
 # ---------------------------------------------------------------------------
 
 def test_reset_zeroes_all_counts():
-    """reset() sets all count tensors to zero across all layers."""
+    """reset() sets all counts to zero."""
     cache = make_cache()
-    seed_layer(cache, layer_idx=0, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
-    seed_layer(cache, layer_idx=2, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
-
+    seed_cache(cache, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
     cache.reset()
-
-    for layer_idx in range(NUM_LAYERS):
-        assert cache.get_expert_lengths(layer_idx).sum() == 0
+    assert cache.get_heads_lengths().sum() == 0
 
 
 def test_reset_zeroes_key_buffers():
-    """reset() zeroes the key buffer data across all layers."""
+    """reset() zeroes the key buffer data."""
     cache = make_cache()
-    seed_layer(cache, layer_idx=1, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
-
+    seed_cache(cache, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
     cache.reset()
-
-    for layer_idx in range(NUM_LAYERS):
-        assert cache._keys[layer_idx].sum() == 0
+    assert cache.keys.sum() == 0
 
 
-def test_reset_is_initialized_false_afterward():
-    """is_initialized returns False after reset."""
+def test_reset_is_initialized_remains_true():
+    """is_initialized remains True after reset — storage is still allocated."""
     cache = make_cache()
-    seed_layer(cache, layer_idx=0, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
+    seed_cache(cache, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
     cache.reset()
-    assert cache.is_initialized is False
+    assert cache.is_initialized is True
 
 
 def test_reset_on_fresh_cache_is_idempotent():
     """reset() on a fresh cache does not raise and leaves state unchanged."""
     cache = make_cache()
     cache.reset()
-    assert cache.is_initialized is False
+    assert cache.is_initialized is True
+
+
+def test_get_heads_lengths_zeros_after_reset():
+    """get_heads_lengths() returns all zeros after reset()."""
+    cache = make_cache()
+    seed_cache(cache, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
+    cache.reset()
+    assert cache.get_heads_lengths().sum() == 0
 
 
 def test_reset_allows_reuse():
     """After reset(), counts can be re-seeded and read back correctly."""
     cache = make_cache()
-    seed_layer(cache, layer_idx=0, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
+    seed_cache(cache, counts=torch.ones(BATCH, NUM_HEADS, dtype=torch.long))
     cache.reset()
 
     new_counts = torch.tensor([[1, 0, 2, 0], [0, 3, 1, 2]])
-    seed_layer(cache, layer_idx=0, counts=new_counts)
-    assert torch.equal(cache.get_expert_lengths(0), new_counts)
+    seed_cache(cache, counts=new_counts)
+    assert torch.equal(cache.get_heads_lengths(), new_counts)
 
 
 # ---------------------------------------------------------------------------
@@ -292,153 +307,223 @@ def test_reset_allows_reuse():
 # ---------------------------------------------------------------------------
 
 def test_reorder_cache_permutes_keys():
-    """reorder_cache() permutes dim 0 of the key buffer for all layers."""
-    cache = make_cache(num_layers=1, batch=3)
-    seed_layer(cache, layer_idx=0, counts=torch.zeros(3, NUM_HEADS, dtype=torch.long))
-    original_keys = cache._keys[0].clone()
+    """reorder_cache() permutes dim 0 of the key buffer."""
+    cache = make_cache(batch=3)
+    seed_cache(cache, counts=torch.zeros(3, NUM_HEADS, dtype=torch.long))
+    original_keys = cache.keys.clone()
 
     beam_idx = torch.tensor([2, 0, 1])
     cache.reorder_cache(beam_idx)
 
-    assert torch.allclose(cache._keys[0][0], original_keys[2])
-    assert torch.allclose(cache._keys[0][1], original_keys[0])
-    assert torch.allclose(cache._keys[0][2], original_keys[1])
+    assert torch.allclose(cache.keys[0], original_keys[2])
+    assert torch.allclose(cache.keys[1], original_keys[0])
+    assert torch.allclose(cache.keys[2], original_keys[1])
 
 
 def test_reorder_cache_permutes_values():
-    """reorder_cache() permutes dim 0 of the value buffer for all layers."""
-    cache = make_cache(num_layers=1, batch=3)
-    seed_layer(cache, layer_idx=0, counts=torch.zeros(3, NUM_HEADS, dtype=torch.long))
-    original_values = cache._values[0].clone()
+    """reorder_cache() permutes dim 0 of the value buffer."""
+    cache = make_cache(batch=3)
+    seed_cache(cache, counts=torch.zeros(3, NUM_HEADS, dtype=torch.long))
+    original_values = cache.values.clone()
 
     beam_idx = torch.tensor([2, 0, 1])
     cache.reorder_cache(beam_idx)
 
-    assert torch.allclose(cache._values[0][0], original_values[2])
-    assert torch.allclose(cache._values[0][1], original_values[0])
-    assert torch.allclose(cache._values[0][2], original_values[1])
+    assert torch.allclose(cache.values[0], original_values[2])
+    assert torch.allclose(cache.values[1], original_values[0])
+    assert torch.allclose(cache.values[2], original_values[1])
 
 
 def test_reorder_cache_permutes_counts():
-    """reorder_cache() permutes dim 0 of the count tensor for all layers."""
-    cache = make_cache(num_layers=1, batch=3)
+    """reorder_cache() permutes dim 0 of the count tensor."""
+    cache = make_cache(batch=3)
     counts = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
-    seed_layer(cache, layer_idx=0, counts=counts)
+    seed_cache(cache, counts=counts)
 
     beam_idx = torch.tensor([2, 0, 1])
     cache.reorder_cache(beam_idx)
 
-    assert torch.equal(cache._counts[0][0], counts[2])
-    assert torch.equal(cache._counts[0][1], counts[0])
-    assert torch.equal(cache._counts[0][2], counts[1])
-
-
-def test_reorder_cache_applies_to_all_layers():
-    """reorder_cache() reorders every allocated layer, not just the first."""
-    cache = make_cache(batch=2)
-    for layer_idx in range(NUM_LAYERS):
-        seed_layer(
-            cache,
-            layer_idx=layer_idx,
-            counts=torch.zeros(2, NUM_HEADS, dtype=torch.long),
-        )
-    original_keys = [cache._keys[i].clone() for i in range(NUM_LAYERS)]
-
-    beam_idx = torch.tensor([1, 0])
-    cache.reorder_cache(beam_idx)
-
-    for layer_idx in range(NUM_LAYERS):
-        assert torch.allclose(cache._keys[layer_idx][0], original_keys[layer_idx][1])
-        assert torch.allclose(cache._keys[layer_idx][1], original_keys[layer_idx][0])
+    assert torch.equal(cache._counts[0], counts[2])
+    assert torch.equal(cache._counts[1], counts[0])
+    assert torch.equal(cache._counts[2], counts[1])
 
 
 # ---------------------------------------------------------------------------
-# update() — oracle comparison against SlowMoSRAHCache
+# update() return value
+# ---------------------------------------------------------------------------
+
+def test_update_returns_correct_shapes():
+    """update() returns (keys, values, active_mask) with the correct shapes."""
+    cache = make_cache()
+    B, L, T = BATCH, NUM_HEADS, 1
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    keys, values, active_mask = cache.update(
+        torch.zeros(B, L, T, HEAD_DIM), torch.zeros(B, L, T, HEAD_DIM), mask
+    )
+    assert keys.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
+    assert values.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
+    assert active_mask.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE)
+
+
+def test_update_active_mask_dtype():
+    """update() returns active_mask as a bool tensor."""
+    cache = make_cache()
+    B, L, T = BATCH, NUM_HEADS, 1
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    _, _, active_mask = cache.update(
+        torch.zeros(B, L, T, HEAD_DIM), torch.zeros(B, L, T, HEAD_DIM), mask
+    )
+    assert active_mask.dtype == torch.bool
+
+
+def test_update_active_mask_all_false_on_empty_write():
+    """update() with all-False mask returns an all-False active_mask."""
+    cache = make_cache()
+    B, L, T = BATCH, NUM_HEADS, 1
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    _, _, active_mask = cache.update(
+        torch.zeros(B, L, T, HEAD_DIM), torch.zeros(B, L, T, HEAD_DIM), mask
+    )
+    assert not active_mask.any()
+
+
+def test_update_active_mask_reflects_written_slots():
+    """Returned active_mask is True exactly for slots that have been written."""
+    cache = make_cache(batch=1)
+    B, L, T = 1, NUM_HEADS, 3
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 0, 0] = True
+    mask[0, 0, 1] = True
+    mask[0, 1, 2] = True
+
+    _, _, active_mask = cache.update(
+        torch.randn(B, L, T, HEAD_DIM), torch.randn(B, L, T, HEAD_DIM), mask
+    )
+
+    assert active_mask[0, 0, 0].item() is True
+    assert active_mask[0, 0, 1].item() is True
+    assert active_mask[0, 0, 2].item() is False
+    assert active_mask[0, 1, 0].item() is True
+    assert active_mask[0, 1, 1].item() is False
+    for h in [2, 3]:
+        assert not active_mask[0, h, :].any()
+
+
+def test_update_roundtrip():
+    """Keys and values written via update() are retrievable in the returned tuple."""
+    cache = make_cache(batch=1)
+    B, L, T = 1, NUM_HEADS, 1
+    key = torch.randn(B, L, T, HEAD_DIM)
+    val = torch.randn(B, L, T, HEAD_DIM)
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 2, 0] = True
+
+    keys_out, vals_out, _ = cache.update(key, val, mask)
+
+    assert torch.equal(keys_out[0, 2, 0, :], key[0, 2, 0, :])
+    assert torch.equal(vals_out[0, 2, 0, :], val[0, 2, 0, :])
+
+
+# ---------------------------------------------------------------------------
+# Oracle agreement — MoSRAHCache vs SlowMoSRAHCache
 #
-# Each test runs identical inputs through both MoSRAHCache and SlowMoSRAHCache and
-# asserts that the resulting key buffers and count tensors are exactly equal.
-# SlowMoSRAHCache was independently verified in test_slow_mosrah_cache.py; agreement
-# with it licenses trust in the vectorized implementation.
+# Each test runs identical inputs through both implementations and asserts that
+# the resulting key buffers, value buffers, count tensors, and returned tuples
+# are exactly equal. SlowMoSRAHCache was independently verified in
+# test_slow_mosrah_cache.py; agreement with it licenses trust in the vectorized
+# implementation.
 # ---------------------------------------------------------------------------
 
-def test_oracle_single_token_single_head():
-    """Single token routed to one head: vectorized matches oracle."""
-    fast, slow = _run_both(
-        head_idx=torch.tensor([[[2]]]),
-        key_states=torch.randn(1, 1, 1, HEAD_DIM),
-        value_states=torch.randn(1, 1, 1, HEAD_DIM),
-        batch=1,
-    )
-    _assert_agree(fast, slow)
+def test_oracle_single_active_position():
+    """Single active position in one head: vectorized matches oracle."""
+    B, L, T = 1, NUM_HEADS, 1
+    key = torch.randn(B, L, T, HEAD_DIM)
+    val = torch.randn(B, L, T, HEAD_DIM)
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 2, 0] = True
+    fast, slow, fr, sr = _run_both(key, val, mask, batch=B)
+    _assert_agree(fast, slow, fr, sr)
 
 
-def test_oracle_single_token_multiple_heads():
-    """Single token routed to K=2 heads: vectorized matches oracle."""
-    fast, slow = _run_both(
-        head_idx=torch.tensor([[[0, 3]]]),
-        key_states=torch.randn(1, 1, 2, HEAD_DIM),
-        value_states=torch.randn(1, 1, 2, HEAD_DIM),
-        batch=1,
-    )
-    _assert_agree(fast, slow)
+def test_oracle_multiple_heads_same_step():
+    """Multiple heads active in the same update() call: vectorized matches oracle."""
+    B, L, T = 1, NUM_HEADS, 1
+    key = torch.randn(B, L, T, HEAD_DIM)
+    val = torch.randn(B, L, T, HEAD_DIM)
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 0, 0] = True
+    mask[0, 3, 0] = True
+    fast, slow, fr, sr = _run_both(key, val, mask, batch=B)
+    _assert_agree(fast, slow, fr, sr)
 
 
-def test_oracle_multiple_tokens_same_head():
-    """Multiple tokens all routed to the same head: causal order preserved."""
-    fast, slow = _run_both(
-        head_idx=torch.tensor([[[0], [0], [0], [0]]]),
-        key_states=torch.randn(1, 4, 1, HEAD_DIM),
-        value_states=torch.randn(1, 4, 1, HEAD_DIM),
-        batch=1,
-    )
-    _assert_agree(fast, slow)
+def test_oracle_multiple_tokens_one_head():
+    """Multiple active positions in the same head: causal order preserved."""
+    B, L, T = 1, NUM_HEADS, 4
+    key = torch.randn(B, L, T, HEAD_DIM)
+    val = torch.randn(B, L, T, HEAD_DIM)
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 0, :] = True
+    fast, slow, fr, sr = _run_both(key, val, mask, batch=B)
+    _assert_agree(fast, slow, fr, sr)
 
 
-def test_oracle_multiple_tokens_different_heads():
-    """Multiple tokens routed to different heads: each slot correct."""
-    fast, slow = _run_both(
-        head_idx=torch.tensor([[[0, 1], [2, 3], [1, 0]]]),
-        key_states=torch.randn(1, 3, 2, HEAD_DIM),
-        value_states=torch.randn(1, 3, 2, HEAD_DIM),
-        batch=1,
-    )
-    _assert_agree(fast, slow)
+def test_oracle_sparse_mask():
+    """Not all T positions active — only True positions written."""
+    B, L, T = 1, NUM_HEADS, 3
+    key = torch.randn(B, L, T, HEAD_DIM)
+    val = torch.randn(B, L, T, HEAD_DIM)
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 0, 0] = True
+    mask[0, 0, 2] = True
+    mask[0, 1, 1] = True
+    fast, slow, fr, sr = _run_both(key, val, mask, batch=B)
+    _assert_agree(fast, slow, fr, sr)
 
 
 def test_oracle_multi_call_accumulation():
     """Two sequential update() calls accumulate correctly."""
-    fast = make_cache(num_layers=1, batch=1)
-    slow = make_slow_cache(num_layers=1, batch=1)
+    B, L, T = 1, NUM_HEADS, 1
+    fast = make_cache(batch=B)
+    slow = make_slow_cache(batch=B)
+    last_fr = last_sr = None
     for _ in range(2):
-        h = torch.tensor([[[0, 1]]])
-        k = torch.randn(1, 1, 2, HEAD_DIM)
-        v = torch.randn(1, 1, 2, HEAD_DIM)
-        fast.update(layer_idx=0, head_idx=h, key_states=k, value_states=v)
-        slow.update(layer_idx=0, head_idx=h, key_states=k, value_states=v)
-    _assert_agree(fast, slow)
+        key = torch.randn(B, L, T, HEAD_DIM)
+        val = torch.randn(B, L, T, HEAD_DIM)
+        mask = torch.zeros(B, L, T, dtype=torch.bool)
+        mask[0, 0, 0] = True
+        mask[0, 1, 0] = True
+        last_fr = fast.update(key, val, mask)
+        last_sr = slow.update(key, val, mask)
+    _assert_agree(fast, slow, last_fr, last_sr)
 
 
 def test_oracle_uneven_batch():
-    """Different batch items route to different heads: independence preserved."""
-    fast, slow = _run_both(
-        head_idx=torch.tensor([[[0, 1]], [[2, 3]]]),  # (2, 1, 2)
-        key_states=torch.randn(2, 1, 2, HEAD_DIM),
-        value_states=torch.randn(2, 1, 2, HEAD_DIM),
-        batch=2,
-    )
-    _assert_agree(fast, slow)
+    """Different batch items have different active heads — independence preserved."""
+    B, L, T = 2, NUM_HEADS, 1
+    key = torch.randn(B, L, T, HEAD_DIM)
+    val = torch.randn(B, L, T, HEAD_DIM)
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 0, 0] = True
+    mask[0, 1, 0] = True
+    mask[1, 2, 0] = True
+    mask[1, 3, 0] = True
+    fast, slow, fr, sr = _run_both(key, val, mask, batch=B)
+    _assert_agree(fast, slow, fr, sr)
 
 
 def test_oracle_buffer_expansion():
     """Vectorized expansion produces the same result as the oracle expansion."""
-    fast = make_cache(num_layers=1, batch=1, initial_t_max=2)
-    slow = make_slow_cache(num_layers=1, batch=1, initial_t_max=2)
-    # Two calls — first fills capacity, second triggers expansion.
+    B, L, T = 1, NUM_HEADS, 2
+    fast = make_cache(batch=B, initial_buffer_size=2)
+    slow = make_slow_cache(batch=B, initial_buffer_size=2)
+    last_fr = last_sr = None
     for _ in range(2):
-        h = torch.tensor([[[0], [0]]])
-        k = torch.randn(1, 2, 1, HEAD_DIM)
-        v = torch.randn(1, 2, 1, HEAD_DIM)
-        fast.update(layer_idx=0, head_idx=h, key_states=k, value_states=v)
-        slow.update(layer_idx=0, head_idx=h, key_states=k, value_states=v)
-    assert fast._t_max[0] == 4
-    _assert_agree(fast, slow)
+        key = torch.randn(B, L, T, HEAD_DIM)
+        val = torch.randn(B, L, T, HEAD_DIM)
+        mask = torch.zeros(B, L, T, dtype=torch.bool)
+        mask[0, 0, :] = True
+        last_fr = fast.update(key, val, mask)
+        last_sr = slow.update(key, val, mask)
+    assert fast.buffer_capacity == 4
+    _assert_agree(fast, slow, last_fr, last_sr)

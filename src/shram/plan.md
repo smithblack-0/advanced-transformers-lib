@@ -1,4 +1,4 @@
-# Implementation Plan: advanced-transformers-lib — SHRAM
+**# Implementation Plan: advanced-transformers-lib — SHRAM
 
 ## What This Document Is
 
@@ -33,17 +33,14 @@ is being achieved, one verified unit at a time.
 - [X] Unit 5.C — RotaryEmbedding: rewrite with explicit constructor and paper math
 - [X] Unit 5.C.1 — RotaryEmbedding: revision pass (maintainability blocker; see unit)
 - [X] Unit 6.0 — Cache architecture: situation statement, design decisions, folder refactor
-- [X] Unit 6.A.A — MoSRAHCache: custom buffer storage and HF Cache protocol
-- [X] Unit 6.A.B — MoSRAHCache: vectorized scatter update
-- [ ] Unit 6.A.C — MoSRAHCache: test audit and trust verification
-- [ ] Unit 6.B — ShramCache: HF interface shim holding both sub-caches
-- [ ] Unit 6.C — ShramCache generation pipeline wiring dispatch as blocker via _prepare_cache_for_generation
-- [ ] Unit 6.D — MoSRAH sequence position decoder: formal specification and blocker registration
+- [X] Unit 6.A — MoSRAHCache and SlowMoSRAHCache: update/get_heads_lengths interface with oracle validation
+- [X] Unit 6.B — ShramCache: HF interface shim holding both sub-caches
 - [ ] Unit 7 — Local sliding-window attention module (h_l)
 - [ ] Unit 8 — Expert packing and unpacking: permutation machinery, padding, masks
 - [ ] Unit 9 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensors
-- [ ] Unit 10 — MoSRAH sparse path: routing → packing → BEA → unpacking → weighted reduction
-- [ ] Unit 11 — SHRAM hybrid layer: assemble H(x) = h_l (Unit 7) + h_s (Unit 10)
+- [ ] Unit 10.A — MoSRAH position computation: P tensor for both modes and all cache states
+- [ ] Unit 10.B — MoSRAH sparse path: routing → packing → position computation → BEA → unpacking → weighted reduction
+- [ ] Unit 11 — SHRAM hybrid layer: assemble H(x) = h_l (Unit 7) + h_s (Unit 10.B)
 - [ ] Unit 12 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
 - [ ] Unit 13 — ShramModel: aggregate load_balance_loss in output
 - [ ] Unit 14 — ShramForCausalLM: expose load_balance_loss; KV cache resolution
@@ -56,7 +53,7 @@ is being achieved, one verified unit at a time.
 
 ## Status
 
-**Current state:** Units 5.A, 5.B, 5.C, 5.C.1, 6.0, 6.A.A, and 6.A.B complete. Unit 6.A.C (test audit and trust verification) is next. Network tests deselected (Hub repo not yet created).
+**Current state:** Unit 6.B complete (18/18 tests passing). Unit 6.C next. Network tests deselected (Hub repo not yet created).
 
 ---
 
@@ -317,7 +314,7 @@ Resolutions recorded here. Unresolved items must be resolved before the indicate
   `self.values` each of shape `(B, L, T_max, u)` per layer, with a `(B, L)` integer count
   tensor `self.counts` tracking valid occupancy per (batch, head) slot. `T_max` doubles
   when any slot overflows. Data beyond the count is junk; consumers use
-  `get_expert_lengths(layer_idx)` to obtain the counts and are responsible for masking.
+  `get_heads_lengths()` to obtain the counts and are responsible for masking.
   Must implement before Unit 11.
   Resolution: RESOLVED — custom buffer design; DynamicCache virtual-index approach
   superseded due to ragged-batch routing.
@@ -538,340 +535,286 @@ requires test updates.
 
 ---
 
-### Unit 6.0 — Cache Architecture: Situation, Decisions, Folder Refactor
+### Unit 6 — Cache Architecture: Situation, Decisions, Folder Refactor
 
-**Situation:** The existing `mosrah_cache.py` was written before the position tracking
-architecture was understood. The design was, however, done incorrectly. 
+Overall, a competing set of circumstances shaped the implementation of the cache system
 
-**Refactor**:
+- Huggingface desired to use a Cache class and a per layer CacheLayerMixin to handle the concrete responsibilities. 
+- BEA and the sliding window attention formulation desire individual caches for a custom cache approach to handle expert-choice caching and sliding window attention. All at one 'attention' slot in the standard transformer cache.
+- The SHRAM layer exists to decode and dispatch as needed.
 
-All caches and cache code should be placed in src/shram/model/cache instead. Likewise tests should be moved to tests/shram/model/tests
+These together resulted in the following series of decisions.
 
-*Why several cache classes exist:*
-SHRAM has two attention paths with fundamentally different KV semantics. h_l processes
-every token with a sliding window; MoSRAH processes only routed tokens per head,
-unboundedly. No single cache class can serve both correctly. ShramCache exists because
-HF infrastructure requires one object in `past_key_values` — it is a shim, not a
-functional cache. These three roles are genuinely distinct and must not be collapsed. It has been designed to 
+- Top level cache will be a huggingface Cache object as standard.
+- Each huggingface cache will be implemented as a series of ShramLayerCache using CacheLayerMixin. 
+- Each ShramLayerCache will in turn contain a .sliding_window_cache (provided by huggingface) and a .mosrah_cache to handle the custom varieties of it.
 
-*Generation, Training, and Sequences*
+This is correct as it most strongly lines up with the huggingface ecosystem while still responding to the necessities of the architecture. 
 
-Sequence position was an enormous component that had to be carefully handled in order to ensure rope worked for all layers in all modes during both training and evaluation.
+### 6.A MoSRAH cache
 
-Huggingface will natively pass in a tensor of positional ids during evaluation which is normally compatible with rope. However, MoSRAH can operate in an alternative mode in which only the sequence length inside the headed dimensions mattered. This required handling getting the lengths of each head in order to be able to decode what rope position each would be in in these modes. 
+**Responsibility:** Define and verify the sparse cache subsystem for one MoSRAH decoder layer.
 
-Both training and evaluation would need to handle these challenges. As a result, this decoding code is now planned to be placed on the MoSRAH unit. It handles whatever positional shifting is needed internally, and the cache system just needs to display the perntient information. This allows the same underlying process to handle both issues just by modifying where a cumsum starts at.
+**Context of Correctness**
 
-**Invariants this unit must satisfy:**
-- `src/shram/model/cache/` exists as a package with `__init__.py`. All cache classes live under
-  `src/shram/model/cache/`.
-- `tests/shram/model/cache/` mirrors the cache package structure.
-
-**Notes**
-
-- The semantic sequence mode can be implemented by the following sequence of vectorized operation. Make a batch x sequence_length x number_of_total_heads boolean tensor filled with false. Scatter by vector indexing along the total heads dimension the selected heads tensor (I) a value of true. Now, cumsum along the sequence length direction. This gives the number of times this block of operations has routed to this head in this unit. Subtract one from this and add it to the length of each head sequence, then gather using I from this tensor array for the final rope positions. This does not end up in MoSRAH cache but downstream
-- 
-
-### Unit 6.A.A — MoSRAHCache: Custom Buffer Storage and HF Cache Protocol
-
-MoSRAH routes each input token to K of L expert heads. In the generation setting this means
-the KV cache must accumulate keys and values per expert head independently — only the K heads
-selected for the current token are updated at each decode step, while the remaining L−K are
-untouched. The central problem is that this produces a ragged distribution of token counts
-across (batch, head) slots: different batch items may route different numbers of tokens to the
-same head within a single forward pass, and different heads accumulate at entirely different
-rates across decode steps. `DynamicCache` assumes a uniform sequence dimension per slot and
-concatenates along it; there is no mechanism for it to track valid occupancy independently per
-(batch, head). Forcing MoSRAH's ragged structure into `DynamicCache` would require external
-bookkeeping that bypasses the cache entirely — which is not acceptable.
-
-The solution is a custom buffer: `self.keys` and `self.values` each of shape `(B, L, T_max, u)`
-per layer, plus `self.counts` of shape `(B, L)` — an integer tensor tracking the valid
-occupancy of each (batch, head) slot. `T_max` is the shared current capacity per layer, doubled
-when any slot overflows. Everything in the buffer beyond the count for a given slot is junk;
-consumers use `get_expert_lengths(layer_idx)` to know what is valid and are responsible for masking.
-
-This unit establishes the storage foundation and all HF Cache protocol methods. `update()`
-raises `NotImplementedError` — the scatter logic that populates the buffer is the sole
-responsibility of Unit 6.A.B. The split exists because storage correctness is independently
-verifiable, and because the scatter is complex enough to be its own verified unit.
-
-**Responsibility:** Provides the `(B, L, T_max, u)` buffer structure and `(B, L)` counts per
-layer, `get_expert_lengths()`, and all coordination operations (`reset`, `reorder_cache`). Does
-NOT implement the scatter update.
+The MoSRAH system executes KV caching in expert-choice form, and its natural downstream
+consumer, BEA, also works in expert-choice form. While other options were explored — most
+notably a separate token-choice inference pathway — for the initial probe work it was decided
+to keep this simple. As such, the cache simply asks for keys, values, and an active-token mask;
+it inserts only active tokens into the underlying cache and returns the complete KV state with
+an active-token mask for attention processes to use if desired. Additionally, the occupancy of
+each individual head is critical information required for RoPE encoding and is exposed for
+downstream usage.
 
 **Invariants this unit must satisfy:**
-- `MoSRAHCache` subclasses `transformers.cache_utils.Cache`. `Cache.__init__` is called with
-  `layers=[]`; `self.layers` is unused.
-- `__init__(num_mosrah_heads: int, head_dim: int)` stores L and u. No tensors are allocated
-  until the first `update()` call — lazy allocation ensures device placement matches the
-  incoming tensors.
-- Per layer, `self.keys` and `self.values` are `(B, L, T_max, u)` float tensors and
-  `self.counts` is a `(B, L)` integer tensor. All three live on the same device. Per-layer
-  storage is allocated lazily and independently — earlier layers do not force later layers to
-  allocate.
-- `get_seq_length()` raises `NotImplementedError`. No single sequence length meaningfully
-  represents a cache where each (batch, head) slot accumulates independently.
-- `get_expert_lengths(layer_idx: int) -> torch.Tensor` returns the counts tensor of shape
-  `(B, L)` for that layer. This is the authoritative per-head occupancy consumed by BEA for
-  attention masking and by the position decoder (Unit 6.D) for semantic-sequence position
-  computation. Returns a zero tensor of the correct shape if the layer has not yet been
-  allocated.
-- `reset()` clears all per-layer storage. After reset, `get_expert_lengths()` returns zeros.
-- `reorder_cache(beam_idx)` reorders dim 0 of both the key/value buffers and counts across all
-  allocated layers. Beam search must apply atomically or buffer contents and occupancy counts
-  will diverge.
-- `update()` raises `NotImplementedError`.
-- Tests verify: `Cache` subclass; `get_seq_length` raises; `get_expert_lengths` returns `(B, L)`
-  shape and correct values after manual count and buffer assignment; `reset` clears all layers;
-  `reorder_cache` correctly permutes the batch dimension of both buffers and counts; `update`
-  raises `NotImplementedError`.
+- The unit defines the MoSRAH sparse cache for one decoder layer only. It does not own or
+  represent sparse state for any other layer.
+- The cache fulfills the HuggingFace per-layer cache role through `CacheLayerMixin`.
+- The cache implements API `.update(keys, values, active_mask)`.
+- `.update(keys, values, active_mask)` accepts expert-choice inputs, stores only active entries
+  in causal order, and returns the full accumulated `(keys, values, active_mask)` across the
+  cached sparse sequence for that layer.
+- The returned `active_mask` correctly distinguishes valid cached positions from unwritten or
+  junk positions.
+- The cache implements `get_heads_lengths()` and returns correct per-head occupancies for the
+  layer.
+- All necessary HuggingFace cache methods have been evaluated and implemented to a locally sane
+  standard.
+- Any HuggingFace cache method, such as `get_seq_length()`, that does not make sense in a ragged
+  packed sparse context instead raises `NotImplementedError()`.
+- The cache supports repeated updates across multiple forward passes, with later updates
+  extending prior sparse state rather than overwriting it.
+- The cache implements reset and reorder behavior to a locally sane standard for HuggingFace
+  cache usage.
+- All mechanisms are implemented for very rapid usage.
+- Tests and design are done in units which are verifiably correct as well.
 
-**Preliminary implementation notes:**
-- Initial `T_max` on first allocation: a small power of two (e.g. 64) is preferable to
-  starting at 1 to avoid repeated reallocation during prompt processing. Decide during
-  implementation.
-- Buffer expansion: when any `counts[b, h]` would exceed the current `T_max` for a layer,
-  allocate new `(B, L, 2*T_max, u)` tensors, copy old data, replace. `T_max` is shared
-  across all (batch, head) slots within a layer — the entire layer buffer doubles when any
-  slot overflows.
-- For tests that exercise `reset` and `reorder_cache`, populate buffers and counts directly
-  (e.g. `cache.counts[layer] = tensor; cache.keys[layer] = tensor`) rather than calling
-  `update()`, since `update()` is a placeholder in this unit.
+**Tests**
+- Verify `.update(keys, values, active_mask)` accepts expert-choice inputs and returns the full
+  accumulated `(keys, values, active_mask)` in the expected format.
+- Verify only active entries are inserted.
+- Verify causal insertion order is preserved within each `(batch, head)` slot.
+- Verify returned `active_mask` correctly identifies valid cached positions.
+- Verify `get_heads_lengths()` returns correct per-head occupancies before updates, after
+  updates, after repeated updates, and after reset.
+- Verify repeated updates extend prior sparse state rather than overwriting it.
+- Verify reset restores fresh-cache behavior.
+- Verify reorder behavior permutes all sparse cached state consistently.
+- Verify required HuggingFace per-layer cache behaviors are implemented sanely.
+- Verify unsupported operations fail explicitly.
+- If the final implementation is not obviously correct by inspection, certify it against a slow
+  oracle implementation.
 
----
+**Preliminary implementation strategy:**
+- Verifiable correctness may make a slow, for-loop-based strategy that is then used as an oracle
+  the preferred testing method.
+- A large unit of memory initialized at construction across batches, heads, and sequences, and
+  doubled in length any time storage runs low, is an excellent candidate for the underlying
+  storage. A corresponding set of `(batch, head)` occupancy counters can then maintain the
+  active-token masks and expose essential downstream information.
+- It should be possible to use the following high-level formulation to quickly compute scatter
+  indices under that design:
+  1. Count the active sequence lengths and form an `arange` to that length.
+  2. Add `get_heads_lengths()` to it. This broadcasts into the available sequences in order and
+     gives the locations to insert into.
+- If direct scatter over the provided storage is used, overwriting inactive or junk positions is verified to be fine. Masking will later ignore it, and any junk data inserted will just be overwritten in the next insertion cycle. 
 
-### Unit 6.A.B — MoSRAHCache: Vectorized Scatter Update
+### 6.B SHRAM layer cache
 
-The buffer established in 6.A.A has no mechanism for populating it — `update()` raises
-`NotImplementedError`. This unit implements the scatter operation that takes the token-choice
-routing output `(I, K_states, V_states)` and writes each token's key and value into the correct
-buffer slot at the correct position.
+**Responsibility:** Define and verify the cache subsystem for one SHRAM decoder layer. This unit
+owns, exposes, and transparently coordinates the two cache varieties required at a single SHRAM
+attention slot: the sliding-window cache for the local path and the MoSRAH sparse cache for the
+sparse path.
 
-The correctness constraint is causal ordering: for a given (batch, head) slot, tokens must
-appear in the same order they occupied the original sequence. This is the same invariant that
-makes stable sort a correctness requirement in expert packing (Unit 8). Violating it here
-corrupts the accumulated KV history — making the attention computed in BEA non-causal in a way
-that will not raise an error and may not surface until evaluation. The scatter uses the cumsum
-construction described in the Unit 6.D position decoder to derive within-slot target indices
-without a loop over sequence positions: a `(B, N, L)` boolean head-selection mask is formed
-from `head_idx`, cumulatively summed along N to give the within-slot index for each
-(batch, token, chosen-head) triple, offset by the pre-update counts to give the absolute
-buffer position.
+**Context of Correctness**
 
-The test strategy makes correctness visible: a non-vectorized reference implementation is
-written first — a Python loop over `(b, n, k)` that directly indexes into the buffer and is
-obviously correct by inspection. The vectorized implementation is then validated against it on
-all test cases. The reference is not a throwaway sketch; it is the ground truth that licenses
-trust in the production implementation. It can be used later in how 6.D is dispatched as well.
+A SHRAM decoder layer contains two distinct cache-bearing attention pathways at one attention
+slot. The local attention path wants a sliding-window cache, while the MoSRAH path wants the
+custom expert-choice sparse cache defined in 6.A. At the same time, HuggingFace wants cache
+responsibilities to exist at the per-layer level. For these reasons, the correct unit here is a
+`ShramLayerCache` that owns both `.sliding_window_cache` and `.mosrah_cache`.
 
-**Responsibility:** Implements `update(layer_idx, head_idx, key_states, value_states)` and
-triggers buffer expansion when needed. Callers receive the full `(B, L, T_max, u)` buffers as
-the return value; they obtain the counts needed to mask padding by calling
-`get_expert_lengths()` separately. NOT responsible for routing, BEA attention, or position
-computation.
-
-**Invariants this unit must satisfy:**
-- `update(layer_idx: int, head_idx: torch.Tensor, key_states: torch.Tensor,
-  value_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]` where `head_idx` is
-  `(B, N, K)` int, `key_states` and `value_states` are `(B, N, K, u)` float.
-- Returns `(self.keys[layer_idx], self.values[layer_idx])` — the full `(B, L, T_max, u)`
-  buffers after the update.
-- After `update()`, `self.counts[layer_idx][b, h]` equals the total number of tokens written
-  to head `h` for batch item `b` in that layer, accumulated across all calls since last reset.
-- Causal ordering: for a given `(b, h)`, tokens appear in the buffer in the order they
-  appeared along the N dimension of `head_idx`.
-- Buffer expansion: if any slot would overflow `T_max` after this update, the buffer is doubled
-  before the scatter proceeds.
-- `update()` and the reference implementation produce identical `(keys, counts)` on all test
-  inputs.
-- Tests verify: single-token round-trip; multi-call accumulation; scatter ordering correctness
-  (vectorized matches reference); sparse routing (only a subset of heads updated per step,
-  others unchanged); uneven per-head counts across batch items; buffer expansion triggers
-  correctly and preserves existing data.
-
-**Research notes:**
-- Cumsum scatter for within-slot positions: form `(B, N, L)` bool mask by scattering True at
-  positions given by `head_idx`; cumsum along N gives per-(b, n, h) cumulative count; subtract
-  1 for the zero-based within-slot index. Add `self.counts[layer_idx][b, head]` (the
-  pre-update count) for the absolute buffer index. This is the same construction used in
-  Unit 6.D for semantic-sequence positions.
-- Reference implementation (write first, use as test oracle): for each `(b, n, k)`, execute
-  `h = head_idx[b, n, k]; pos = counts[b, h]; keys[b, h, pos, :] = key_states[b, n, k, :];
-  counts[b, h] += 1`. Run this on the same inputs as the vectorized version and assert
-  identical results.
-- `torch.bincount` only handles 1D input. To count tokens per head per batch item from the
-  flattened `(B, N*K)` head index tensor, a strided multidimensional variant is needed — see
-  the paper's footnote on `bincount_multidimensional` for the approach.
-
-### Unit 6.A.C — MoSRAHCache: Test Audit and Trust Verification
-
-Units 6.A.A and 6.A.B produce a working cache. They are worth nothing until this unit is
-complete. A cache implementation that runs and passes tests it wrote for itself is not a
-verified cache — it is code that confirms its own behavior, which is a different and weaker
-thing. The scatter operation is novel, the storage design is custom, and the correctness
-invariants are subtle: causal ordering, per-batch ragged routing, expansion under load,
-multi-layer independence. Any one of these could be violated by an implementation that passes
-a test suite written by the same author who wrote the implementation, under the same
-assumptions, with the same blind spots.
-
-This unit is not about adding test cases. It is about asking, for every invariant in 6.A.A and
-6.A.B: do the existing tests actually enforce this, or do they merely confirm that the
-implementation does what it does? That is a harder question and it requires treating the tests
-themselves as objects of scrutiny, not as evidence of correctness. Where gaps exist — and there
-will be gaps — they must be closed. Where tests pass for the wrong reasons, they must be
-corrected. Where the space of valid inputs has not been adequately explored, it must be.
-
-The agent handling this unit must think through what it would take to convince a skeptical
-reader that the cache is correct — not merely that it passes its test suite.
-
-**Responsibility:** Audit the test suites produced in 6.A.A and 6.A.B. Identify every gap
-between what the tests enforce and what correctness requires. Close those gaps. Verify that the
-reference implementation in 6.A.B is genuinely independent — not sharing any code path with
-the vectorized implementation that could allow both to be wrong in the same way. Add lifecycle
-tests that require a working `update()` and therefore could not exist in 6.A.A. Produce a
-test suite that a skeptical reviewer could trust.
-
-**Known concrete cases that must be present:**
-- `reset()` with populated cache: update multiple layers and multiple heads, call reset, verify
-  `get_expert_lengths()` returns zeros for all layers and that subsequent updates start from
-  position 0.
-- `reorder_cache()` with real data: populate via `update()`, apply a non-trivial batch
-  permutation, verify that both buffer contents and counts are reordered consistently —
-  not just that the shapes are correct.
-- Multi-layer independence: writing to layer 0 does not affect layer 1, and vice versa. Verify
-  content, not just shape.
-- Buffer expansion preserves data: trigger an expansion (fill a slot past T_max), verify that
-  all previously written data is intact and correctly accessible after the resize.
-- Uneven batch routing: batch item 0 and batch item 1 route to different heads in the same
-  call. Verify each (batch, head) slot contains exactly the tokens written to it, with no
-  bleed between batch items.
-
-**Abstract variables the agent and user much reach consensus on**
-- Is the reference implementation in 6.A.B truly independent of the vectorized one? If they
-  share any utility function or data structure, find and eliminate the coupling.
-- What happens when the same head is selected multiple times within a single update call
-  (e.g. head_idx[b, n1, k1] == head_idx[b, n2, k2] == h for different (n1,k1), (n2,k2))?
-  Does the scatter handle this correctly and in causal order?
-- Are there edge cases at the boundaries of T_max expansion — e.g. filling exactly to T_max,
-  then adding one more token — where off-by-one errors could corrupt data?
-- Does `get_expert_lengths()` return a copy or a view? If a view, can the caller mutate it and
-  corrupt the cache state? Should it return a copy?
-- After `reorder_cache()`, does subsequent `update()` correctly target the reordered batch
-  slots, or does the reordering only affect retrieval?
-
----
-
-### Unit 6.B — ShramCache
-
-**Responsibility:** Satisfies the HF Cache protocol as the single object in
-`past_key_values`. Holds both sub-caches as named attributes. Coordinates protocol
-operations (reset, reorder_cache) atomically across both. Reports total tokens
-processed via get_seq_length(). NOT responsible for: attention computation, position
-semantics, routing decisions, or knowing anything about modes.
+This unit should behave externally as one layer cache wherever a truthful composite behavior
+exists, while still exposing the two internal cache systems directly for downstream usage by the
+corresponding attention pathways. This is more correct than attempting to merge the two cache
+systems behind a fake unified interface, because the two paths have different semantics and
+different downstream consumers. The SHRAM layer cache therefore exists as the ownership,
+dispatch, and transparent-composite boundary for one decoder layer.
 
 **Invariants this unit must satisfy:**
-- `ShramCache` subclasses `transformers.cache_utils.Cache`.
-- `self.local_cache` is a `DynamicSlidingWindowCache`; `self.mosrah_cache` is a
-  `MoSRAHCache`. Both are accessible as named attributes. Attention code accesses
-  them directly; HF infrastructure interacts only with `ShramCache`.
-- `update()` raises `NotImplementedError`. The two sub-caches have incompatible
-  update semantics; there is no correct single-entry-point routing. This is a
-  deliberate design boundary, not an oversight.
-- `get_seq_length()` delegates to `local_cache`. Conceptually this returns total
-  tokens processed — the quantity GenerationMixin needs to compute cache_position
-  for the next step. Implemented via local_cache because h_l processes every token
-  without exception, making its length equal to total tokens processed.
-- `reset()` resets both sub-caches.
-- `reorder_cache(beam_idx)` reorders both sub-caches — beam search must apply
-  atomically to both or the two paths diverge on different beam hypotheses.
-- Tests verify: local_cache and mosrah_cache accessible as attributes; update()
-  raises NotImplementedError; get_seq_length() reflects local cache length; reset()
-  clears both; reorder_cache() reorders both.
+- The unit defines the cache subsystem for one SHRAM decoder layer only. It does not own or
+  represent cache state for any other layer.
+- The cache fulfills the HuggingFace per-layer cache role through `CacheLayerMixin`.
+- The cache owns exactly two sub-caches:
+  - `.sliding_window_cache` for the local sliding-window path
+  - `.mosrah_cache` for the MoSRAH sparse path
+- The two sub-caches remain distinct and are not merged behind a misleading fake common cache
+  interface using .update
+- The unit exposes both sub-caches directly for downstream usage by the corresponding attention
+  pathways.
+- The unit transparently passes along reset and reorder commands to both sub-caches.
+- The unit behaves externally as a single SHRAM layer cache wherever a truthful composite
+  behavior exists, even though internally it owns multiple cache subsystems.
+- Any HuggingFace per-layer cache method with a truthful composite meaning is implemented at the
+  SHRAM layer cache boundary and dispatched appropriately to the owned sub-caches.
+- Any HuggingFace cache method whose semantics do not truthfully apply at the composite SHRAM
+  layer-cache boundary instead raises `NotImplementedError()`.
+- All necessary HuggingFace per-layer cache methods have been evaluated and implemented to a
+  locally sane standard.
+- The unit is implemented for very rapid usage.
+- Tests and design for this unit are themselves structured so the unit can be trusted as a
+  verified black box by later cache and attention units.
 
----
+**Tests**
+- Verify the unit owns both `.sliding_window_cache` and `.mosrah_cache`.
+- Verify the unit exposes the two sub-caches in a form directly usable by their downstream
+  attention paths.
+- Verify reset behavior clears both sub-caches through the SHRAM layer cache boundary.
+- Verify reorder behavior permutes both sub-caches consistently through the SHRAM layer cache
+  boundary.
+- Verify any supported HuggingFace per-layer cache operation exposed at the SHRAM layer boundary
+  dispatches correctly to the owned sub-caches.
+- Verify unsupported composite operations fail explicitly rather than partially mutating only one
+  sub-cache or returning misleading results.
+- Verify required HuggingFace per-layer cache behaviors are implemented sanely.
 
-### Unit 6.C — ShramCache: Generation Pipeline Wiring
+**Preliminary implementation strategy:**
+- If no contradictory ground truth is discovered during implementation, prefer a
+  `CacheLayerMixin` implementation so this unit matches the HuggingFace per-layer cache role.
+- If the HuggingFace-provided sliding-window cache continues to satisfy the local path cleanly,
+  it should be used directly as `.sliding_window_cache` rather than reimplemented.
+- The MoSRAH side should be owned through the 6.A cache unit directly as `.mosrah_cache`.
+- This unit should prefer straightforward ownership and transparent dispatch over abstraction
+  unification. If a proposed shared interface would hide materially different semantics between
+  the two cache paths, it should be rejected.
+- If a HuggingFace per-layer method has a truthful composite meaning here, it should be
+  implemented at this boundary and forwarded appropriately to the owned sub-caches.
+- If a HuggingFace per-layer method has no truthful composite meaning here, explicit
+  `NotImplementedError()` is preferable to a misleading partial implementation.
 
-**Responsibility:** Wire up plan features for appropriate revision unit to ensure ShramCache is always what our and huggingface infrastructure receives in
-`past_key_values` during generate() — never a plain DynamicCache. NOT responsible
-for: any caching behavior beyond ensuring the correct cache type is instantiated. Verify that strategy will work, and insert blockers above this point of plan into stack if issues arise. Basically, we need to asser this issue will be handled. Not necessarily it will happen right now. 
+### 6.C SHRAM cache
 
-**Invariants this unit must plan to satisfy:**
-- `ShramForCausalLM` overrides `_prepare_cache_for_generation` to instantiate
-  `ShramCache` with parameters derived from model config.
-- Calling `model.generate()` without an explicit `past_key_values` produces a
-  `ShramCache` internally — the caller does not need to construct it.
-- A caller who explicitly passes `past_key_values=ShramCache(...)` has it used
-  unchanged — the supplied cache is not replaced.
-- Tests verify: generate() without explicit cache produces ShramCache; generate()
-  with explicit ShramCache uses it unchanged.
+**Responsibility:** Define and verify the top-level cache object for the full SHRAM model. This
+unit owns the per-layer `ShramLayerCache` objects, presents them through the HuggingFace `Cache`
+interface, and transparently coordinates model-wide cache behaviors across all decoder layers.
 
-**Research notes (confirmed):**
-- `_prepare_cache_for_generation(generation_config, model_kwargs, generation_mode,
-  batch_size, max_cache_length)` is the override point. It writes to
-  `model_kwargs["past_key_values"]` as a side effect.
-- GenerationMixin computes cache_position as torch.arange(N, N+M) for a block of
-  M new tokens when N tokens are already cached — confirmed via web research.
----
+**Context of Correctness**
 
-### Unit 6.D — MoSRAH Sequence Position Decoder: Specification and Blocker
+HuggingFace wants the model-wide cache object to exist as a top-level `Cache`, while the actual
+SHRAM cache responsibilities live one layer lower in the per-layer `ShramLayerCache`. For this
+reason, the correct top-level cache unit is a `ShramCache` that owns one `ShramLayerCache` per
+decoder layer and transparently forwards model-wide cache operations across them.
 
-**Responsibility:** Promote the semantic-sequence position computation from informal notes
-in Unit 6.0 to a formal, verified specification. Register a blocker against Unit 10 (MoSRAH)
-requiring this specification to be satisfied before MoSRAH implementation begins. No code
-is written in this unit — the output is a plan entry with invariants that Unit 10 must
-implement.
+This unit should behave externally as the single cache object for the model, while internally
+preserving the layer structure required by both HuggingFace and the SHRAM architecture. In
+particular, any model-wide cache concept that has a truthful scalar meaning should be exposed
+here, while anything that does not should fail explicitly. The most important example is total
+sequence length: this belongs at the top-level cache boundary, and is derived from the
+sliding-window side because that path tracks the full causal sequence length while the MoSRAH
+path is ragged and does not.
 
 **Invariants this unit must satisfy:**
-- The semantic-sequence mode position algorithm (vectorized cumsum over selected_heads) is
-  written up as a formal specification. This may be a unit before unit 10, or part of unit 10.
-- The main-sequence mode (position_ids passed through unchanged) is also formally specified
-  in the Unit 10 entry for completeness.
-- The position comes before the current unit 10 so it acts as a blocker. 
+- The unit defines the top-level cache object for the SHRAM model. It owns the full collection
+  of per-layer `ShramLayerCache` objects and no lower-level cache state lives directly at this
+  boundary.
+- The cache fulfills the HuggingFace top-level `Cache` role.
+- The cache contains exactly one `ShramLayerCache` per decoder layer.
+- The cache behaves externally as the single cache object for the model while internally
+  preserving the per-layer cache structure.
+- Any top-level cache operation with a truthful model-wide meaning is implemented here and
+  transparently forwarded across the owned layer caches as needed.
+- Reset and reorder behavior are implemented model-wide by transparently applying them across all
+  owned `ShramLayerCache` objects.
+- The authoritative scalar sequence-length concept is implemented at this boundary.
+- That scalar sequence length is derived from the sliding-window side of the layer caches, since
+  that path tracks total causal sequence length while the MoSRAH sparse path does not.
+- All necessary HuggingFace top-level cache methods have been evaluated and implemented to a
+  locally sane standard.
+- Any HuggingFace top-level cache method whose semantics do not truthfully apply at the SHRAM
+  model-cache boundary instead raises `NotImplementedError()`.
+- The unit is implemented for very rapid usage.
+- Tests and design for this unit are themselves structured so the unit can be trusted as a
+  verified black box by later model and generation units.
 
-**Research notes (from Unit 6.0):**
-Semantic-sequence mode algorithm:
-1. Allocate a (B, N, L) boolean tensor, filled False.
-2. Scatter True along the L dimension using `selected_heads` (B, N, K) — marking which
-   heads each token routed to.
-3. Cumsum along the N (sequence) dimension. Result[b, n, l] = number of times head l
-   has been routed to by tokens 0..n in batch b.
-4. Subtract 1 to get zero-based local position within the head's slot.
-5. Add the expert lengths. Is zero when training, or get_expert_lengths during decoding. 
-6. Gather along the L dimension using `selected_heads` to produce the final position
-   tensor of shape (B, N, K).
+**Tests**
+- Verify the unit owns exactly one `ShramLayerCache` per decoder layer.
+- Verify the unit behaves externally as a single top-level cache object for the model.
+- Verify reset behavior clears all owned layer caches through the top-level boundary.
+- Verify reorder behavior applies consistently across all owned layer caches through the
+  top-level boundary.
+- Verify any supported HuggingFace top-level cache operation dispatches correctly across the
+  owned layer caches.
+- Verify the top-level scalar sequence length is exposed correctly.
+- Verify the scalar sequence length is sourced from the sliding-window side rather than the
+  MoSRAH sparse side.
+- Verify unsupported top-level operations fail explicitly rather than partially mutating only a
+  subset of layer caches or returning misleading results.
+- Verify required HuggingFace top-level cache behaviors are implemented sanely.
 
----
+**Preliminary implementation strategy:**
+- If no contradictory ground truth is discovered during implementation, prefer a standard
+  HuggingFace `Cache` implementation whose entries are the per-layer `ShramLayerCache` objects.
+- If a truthful scalar sequence length is needed, it should be sourced from the local
+  sliding-window cache path rather than inferred from MoSRAH sparse occupancy.
+- Top-level reset and reorder should be implemented as transparent passes over all owned layer
+  caches.
+- This unit should prefer straightforward ownership and transparent forwarding over introducing
+  additional abstraction layers.
+- If a HuggingFace top-level cache method has a truthful model-wide meaning here, it should be
+  implemented and forwarded appropriately.
+- If a HuggingFace top-level cache method has no truthful model-wide meaning here, explicit
+  `NotImplementedError()` is preferable to a misleading partial implementation.
 
 ### Unit 7 — Local Sliding-Window Attention Module
 
-Sliding window attention is required for the functionality of the SHRAM system. We shall implement it using flex attention. 
+**Responsibility:** Define and verify the local sliding-window attention path `h_l` for one SHRAM decoder layer.
 
-**Responsibility:** Implements h_l(x) as a standalone verified module before the
-hybrid layer (Unit 10) assembles it. Ensure RoPE is built in it such that it works from the absolute positional embeddings, and such that rope does not dilate when switching to long sequence mode. Interface with the cache correctly. During developement, halt and handle any blockers discovered.
+**Context of Correctness**
+
+This unit is the short-range sliding-window dot-product attention path inside SHRAM. It needs to be able to allow operation over the 64k sequence lengths during the experiment. The layer must support caching for later experimentation and have positional encoding. Because it is a local attention formulation it should not adjust its positional (RoPE) formulation when YaRN extrapolation occurs. It has to be causal as this is an autoregressive decoder context. It must be compatible with the broader SHRAM layer as well.
 
 **Invariants this unit must satisfy:**
-- Implements h_l(x): (B, N, d) → (B, N, d).
-- Local attention is enforced by the kernel natively — window size is passed to
-  the kernel itself. A boolean attn_mask constructed outside the kernel is not
-  acceptable (job.md Architecture §). OD-1 resolved: flex_attention with
-  create_block_mask is used. BlockMask skips fully-masked blocks at zero FLOP cost.
-  User has approved flex_attention as equivalent to FlashAttention for this purpose.
-- Window size is configurable via config. Nothing is hardcoded.
-- The module is causal within the window.
-- h_l constructs its own `RotaryEmbeddings. Positions are passed in externally as an argument
-- 
-- h_l calls `local_cache.update(k, v, layer_idx)` directly on the sub-cache — not
-  through ShramCache.update(). Returns the full window of accumulated K/V.
-- MHA (not GQA) — OD-3 resolution.
-- Tests verify: output shape; tokens outside the window receive zero attention
-  weight; causal ordering preserved within window; window_size equal to sequence
-  length degrades to standard causal attention.
+- The unit defines `h_l` for one SHRAM decoder layer only.
+- The unit implements the local short-range dot-product attention path inside SHRAM.
+- The unit implements causal sliding-window attention.
+- The unit supports the experimental long-sequence regime required by the project.
+- The unit accepts and uses the `.sliding_window_cache` belonging to its corresponding
+  `ShramLayerCache`.
+- The unit supports cached execution for later experimentation.
+- The unit implements positional encoding for the local path.
+- The local path's positional encoding uses `default` RoPE mode and does not respond to YaRN
+  dilation or long-context scaling changes elsewhere in the model.
+- The unit returns outputs in `(B, N, d)` form compatible with downstream SHRAM composition.
+- The unit is compatible with the broader SHRAM layer and cache architecture.
+- The unit is implemented for very rapid usage.
+- Tests and design for this unit are themselves structured so the unit can be trusted as a
+  verified black box by later SHRAM-layer assembly.
 
-**Paper refs:** Appendix A.Local Attention. **job.md ref:** Architecture § (local path).
+**Tests**
+- Verify output shape is correct.
+- Verify tokens outside the local window do not contribute to attention.
+- Verify causal ordering is preserved within the active local window.
+- Verify the unit consumes and updates the provided `.sliding_window_cache` correctly.
+- Verify repeated cached forward passes produce correct accumulated local-cache behavior.
+- Verify local positional encoding is constructed in `default` mode.
+- Verify local positional behavior does not change when YaRN / long-context scaling changes
+  elsewhere in the model configuration.
+- Verify required cache- and backend-facing behaviors are implemented sanely.
+- Verify the returned output remains compatible with later SHRAM composition.
 
-
+**Preliminary implementation strategy:**
+- If no contradictory ground truth is discovered during implementation, the local path should
+  receive and consume the layer-local `.sliding_window_cache` directly rather than re-resolving
+  broader cache ownership internally.
+- If FlexAttention continues to satisfy the required sliding-window, causal, and long-sequence
+  behavior cleanly, it should be the preferred backend for this unit.
+- If the current `RotaryEmbedding` design continues to support `default` mode that ignores
+  dilation, that mode should be used for the local path.
+- If cached and uncached execution diverge in behavior, correctness takes priority and the
+  divergence should be surfaced explicitly rather than hidden behind fallback logic.
+- If the chosen backend introduces a limitation that breaks any of the above invariants, that
+  limitation should be surfaced and the backend choice reconsidered explicitly rather than worked
+  around silently.
 ---
 
 ### Unit 8 — Expert Packing and Unpacking
@@ -893,6 +836,7 @@ hybrid layer (Unit 10) assembles it. Ensure RoPE is built in it such that it wor
 - Tests verify: stable sort causality (a test that fails with unstable sort),
   `active_mask` entry count, `packed_positions` correctness, round-trip identity, padding
   is zero.
+- Inference modes will need to know what sections are padding vs active once unpacked. 
 
 **Paper refs:** Appendix A.Expert Packing and Unpacking.
 
@@ -900,41 +844,93 @@ hybrid layer (Unit 10) assembles it. Ensure RoPE is built in it such that it wor
 
 ### Unit 9 — Bottlenecked Ensemble Attention (BEA)
 
+BEA is a pure attention operator: given a packed expert-choice tensor, a position tensor, a
+mask, and an optional cache, it projects Q/K/V, applies RoPE, writes K̃ and V to the cache if
+present, reads back accumulated K̃/V, and attends. BEA does not compute positions — the caller
+(Unit 10.B) supplies the position tensor P. BEA does not choose the RoPE mode — that is
+MoSRAH's responsibility. This keeps BEA's contract simple and independently testable.
+
+Storing post-RoPE K̃ in the cache (rather than raw K) means cached keys are already rotated;
+subsequent reads use them directly without re-applying RoPE. This is a correctness requirement:
+applying RoPE again to a cached K̃ would corrupt positional encoding.
+
 **Invariants this unit must satisfy:**
-- BEA operates on `packed_hidden` (B, L, T, d); output y (B, L, T, d).
-- W_Q, W_K, W_V have shape (L, d, `mosrah_head_dim`); W_O has shape (L, `mosrah_head_dim`,
-  d). Each of L heads has independent parameters — no weight sharing across heads.
+- Interface: `forward(packed_hidden, position_ids, active_mask, cache=None, layer_idx=None)`
+  where `packed_hidden` is `(B, L, T, d)`, `position_ids` is `(B, L, T)` int,
+  `active_mask` is `(B, L, T)` bool. Returns `y` of shape `(B, L, T, d)`.
+- `W_Q`, `W_K`, `W_V` shape `(L, d, u)`; `W_O` shape `(L, u, d)`. Independent parameters
+  per head — no weight sharing across heads. `u = d / K` (mosrah_head_dim from config).
 - BEA constructs its own `RotaryEmbedding(mode="yarn", head_dim=config.head_dim,
   theta=config.mosrah_rope_theta, initial_seq_length=config.training_sequence_length,
-  dilation=config.scale, alpha=config.alpha, beta=config.beta)`.
-  The returned `A_rope` is applied to attention logits before softmax.
-- RoPE is applied with the supplied position tensor (either `packed_positions` for
-  main-sequence mode or local slot indices for semantic-sequence mode). BEA passes the
-  tensor; it does not choose the mode — that is the caller's (MoSRAH's) responsibility.
+  dilation=config.scale, alpha=config.alpha, beta=config.beta)`. The returned `A_rope`
+  scales attention logits before softmax.
+- RoPE is applied to Q and K using `position_ids`. The result K̃ is post-RoPE.
+- If `cache is not None`: `cache.mosrah_cache.write(layer_idx, K̃, V, active_mask)`, then
+  `K̃_all, V_all, full_mask = cache.mosrah_cache.read(layer_idx)`. Attention uses
+  `K̃_all`, `V_all`, `full_mask`.
+- If `cache is None`: attention uses K̃, V, `active_mask` directly.
 - Causal masking is a triangular mask over the T (packed) dimension.
-- Padded positions (`active_mask` == False) do not contribute to attention output.
-- Tests verify: output shape, head independence (perturbing one head's weights changes only
-  that head's output), RoPE passthrough (both position tensors produce different outputs),
-  padding positions do not influence real-token outputs, causal masking holds.
+- Padded positions (`active_mask == False`) do not contribute to attention output.
+- Tests verify: output shape; head independence (perturbing one head's weights changes only
+  that head's output); RoPE passthrough (different position tensors produce different outputs);
+  padding positions do not influence real-token outputs; causal masking holds; with cache,
+  accumulated K̃/V grow correctly across calls and are used in attention.
 
 **Paper refs:** Appendix A.BEA, Appendix B.RoPE Mechanics.
 
 ---
 
-### Unit 10 — MoSRAH Sparse Path
+### Unit 10.A — MoSRAH Position Computation (Blocker for 10.B)
+
+BEA receives a position tensor P of shape `(B, L, T)` from its caller. This unit specifies
+exactly how P is computed under both rope modes and both cache states. It is a blocker for
+Unit 10.B — MoSRAH assembly must not begin until this computation is specified and verified.
+
+There are two rope modes (config-selected) and two cache states (training vs inference),
+giving four cases that reduce to two formulas:
+
+**Main-sequence mode:** `P = J` always. `J` is the packed original-token position tensor
+produced by expert packing (Unit 8), shape `(B, L, T)`. Cache state is irrelevant.
+
+**Semantic-sequence mode:** `P = base + arange(T)` where:
+- `base = 0` if `cache is None` (training). Positions are 0, 1, 2, ... within each head slot.
+- `base = cache.mosrah_cache.get_expert_lengths(layer_idx)` if `cache is not None` (inference).
+  Shape `(B, L)`, broadcast to `(B, L, T)`. Positions are offset by the current slot
+  occupancy so the new token(s) continue the semantic sequence already in the cache.
+
+`get_expert_lengths()` must be read **before** BEA calls `write()`, since `write()` increments
+the counts. The call order in Unit 10.B is: compute P (this unit) → call BEA (which writes,
+then reads). This ordering is the invariant — it must not be violated.
 
 **Invariants this unit must satisfy:**
-- MoSRAH forward: (`selected_heads`, `routing_probs`) = Router(x); `packed_hidden` =
-  Pack(x, `selected_heads`); y = BEA(`packed_hidden`); `unpacked_output` = Unpack(y);
-  o = sum_k `unpacked_output`_k * `routing_probs`_k. Matches Algorithm 1 in the paper.
+- Main-sequence mode returns `J` unchanged regardless of cache state.
+- Semantic mode, no cache: returns `arange(T)` broadcast to `(B, L, T)`.
+- Semantic mode, with cache: returns `get_expert_lengths(layer_idx).unsqueeze(-1) + arange(T)`
+  broadcast to `(B, L, T)`.
+- Position computation reads `get_expert_lengths()` before any `write()` occurs in this
+  forward pass.
+- Tests verify: main-sequence returns J; semantic no-cache returns slot indices; semantic
+  with-cache returns count-offset positions; bulk update (T > 1) produces contiguous positions;
+  positions read before write confirmed by populating cache and asserting offset is correct.
+
+---
+
+### Unit 10.B — MoSRAH Sparse Path
+
+**Invariants this unit must satisfy:**
+- MoSRAH forward: `(selected_heads, routing_probs) = Router(x)`; `packed_hidden, J, active_mask
+  = Pack(x, selected_heads)`; `P = PositionComputation(J, cache, layer_idx)` (Unit 10.A);
+  `y = BEA(packed_hidden, P, active_mask, cache, layer_idx)`; `unpacked_output = Unpack(y)`;
+  `o = sum_k unpacked_output_k * routing_probs_k`. Matches Algorithm 1 in the paper.
 - Weighted reduction uses `routing_probs` (unbiased, renormalized) — not biased scores,
   not `selected_heads` indices.
-- load_balance_loss from Router is propagated through MoSRAH's return.
-- Input/output shape: (B, N, d) → (B, N, d). MoSRAH presents the same interface as a
-  standard attention operator to the SHRAM hybrid layer.
-- Tests verify: output shape, gradient flows through `routing_probs` to router weights (not
-  just through direct attention path), load_balance_loss is present, weighted reduction is
-  correct.
+- `load_balance_loss` from Router is propagated through MoSRAH's return.
+- MoSRAH receives `cache` (a `ShramCache` or `None`) and `layer_idx`. It accesses
+  `cache.mosrah_cache` directly; it does not call `cache.update()`.
+- Input/output shape: `(B, N, d)` → `(B, N, d)`.
+- Tests verify: output shape; gradient flows through `routing_probs` to router weights;
+  `load_balance_loss` present; weighted reduction correct; cache accumulates correctly
+  across calls.
 
 **Paper refs:** §3 Design, Algorithm 1, Appendix A throughout.
 
@@ -944,7 +940,7 @@ hybrid layer (Unit 10) assembles it. Ensure RoPE is built in it such that it wor
 
 **Invariants this unit must satisfy:**
 - SHRAM forward: H(x) = h_l(x) + h_s(x), where h_l is the local sliding-window module
-  (Unit 7, verified black box) and h_s is MoSRAH (Unit 10, verified black box).
+  (Unit 7, verified black box) and h_s is MoSRAH (Unit 10.B, verified black box).
 - h_l and h_s have fully independent parameters. Their outputs are summed.
 - load_balance_loss from h_s is propagated through the hybrid layer's return.
 - Output shape: (B, N, d) — same interface as GroupedQueryAttention it replaces.
@@ -981,17 +977,25 @@ hybrid layer (Unit 10) assembles it. Ensure RoPE is built in it such that it wor
 ### Unit 14 — ShramForCausalLM Update
 
 **Invariants this unit must satisfy:**
-- load_balance_loss is accessible from the forward output so the training loop can weight and
+- `load_balance_loss` is accessible from the forward output so the training loop can weight and
   apply it. The consumer is responsible for the weight (1e-2 in the paper; job.md Architecture
   § confirms this is the training loop's responsibility).
-- KV cache uses DynamicCache with virtual layer indexing (OD-2 resolution): each SHRAM layer
-  computes `virtual_layer = layer_idx * num_mosrah_heads + head_idx` and accesses the cache
-  directly. Total virtual layers = num_hidden_layers * num_mosrah_heads. ShramForCausalLM
-  creates a DynamicCache of this size and passes it down. use_cache=True is supported.
-- If virtual layer indexing proves unworkable during implementation, push a custom cache unit
-  as a blocker before continuing.
-- Tests verify: load_balance_loss in output, weighted combination works end-to-end, KV cache
-  accumulates correctly across decode steps, virtual layer mapping is correct.
+- `ShramForCausalLM` overrides `_prepare_cache_for_generation` to instantiate `ShramCache`
+  with parameters derived from model config. `generate()` called without an explicit
+  `past_key_values` produces a `ShramCache` internally. A caller who passes an explicit
+  `ShramCache` has it used unchanged.
+- `use_cache=True` is supported. The `past_key_values` flowing through the model is always a
+  `ShramCache` — never a plain `DynamicCache`.
+- Tests verify: `load_balance_loss` in output; `generate()` without explicit cache produces
+  `ShramCache`; `generate()` with explicit `ShramCache` uses it unchanged; KV cache
+  accumulates correctly across decode steps.
+
+**Research notes:**
+- `_prepare_cache_for_generation(generation_config, model_kwargs, generation_mode,
+  batch_size, max_cache_length)` is the override point. It writes to
+  `model_kwargs["past_key_values"]` as a side effect.
+- GenerationMixin computes `cache_position` as `torch.arange(N, N+M)` for M new tokens
+  when N tokens are already cached.
 
 ---
 

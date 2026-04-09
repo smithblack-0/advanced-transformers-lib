@@ -7,11 +7,13 @@ from .mlp import SwiGLUMLP
 from .model import ShramModel
 from .rope import RotaryEmbedding
 from .router import MoSRAHRouter
+from .cache import MoSRAHCache
 
 __all__ = [
     "DecoderLayer",
     "GroupedQueryAttention",
     "LoadBalanceLoss",
+    "MoSRAHCache",
     "MoSRAHRouter",
     "ShramConfig",
     "ShramForCausalLM",
