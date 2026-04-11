@@ -502,6 +502,83 @@ def test_update_roundtrip():
     assert torch.equal(vals_out[0, 2, 0, :], val[0, 2, 0, :])
 
 
+def test_update_padding_does_not_advance_count_and_later_write_overwrites_junk():
+    """Padding is ignored: counts advance only for real tokens, and later writes
+    fill the next valid slot rather than skipping over padded width.
+    """
+    cache = make_cache(batch=1, initial_buffer_size=4)
+
+    # Poison the whole buffer so we can detect whether a later real write
+    # actually overwrites previously junk/unwritten storage.
+    cache.keys.fill_(1111.0)
+    cache.values.fill_(-1111.0)
+
+    B, L, T1 = 1, NUM_HEADS, 4
+
+    key1 = torch.zeros(B, L, T1, HEAD_DIM)
+    val1 = torch.zeros(B, L, T1, HEAD_DIM)
+
+    first_key = torch.full((HEAD_DIM,), 10.0)
+    first_val = torch.full((HEAD_DIM,), 20.0)
+    second_key = torch.full((HEAD_DIM,), 30.0)
+    second_val = torch.full((HEAD_DIM,), 40.0)
+
+    # Real tokens at positions 0 and 2; positions 1 and 3 are padding.
+    key1[0, 0, 0] = first_key
+    val1[0, 0, 0] = first_val
+    key1[0, 0, 2] = second_key
+    val1[0, 0, 2] = second_val
+
+    mask1 = torch.zeros(B, L, T1, dtype=torch.bool)
+    mask1[0, 0, 0] = True
+    mask1[0, 0, 2] = True
+
+    keys1, vals1, active1 = cache.update(key1, val1, mask1)
+
+    # Padding must not advance the count.
+    assert cache.get_heads_lengths()[0, 0].item() == 2
+
+    # The two real tokens are packed causally into slots 0 and 1.
+    assert torch.equal(keys1[0, 0, 0], first_key)
+    assert torch.equal(vals1[0, 0, 0], first_val)
+    assert torch.equal(keys1[0, 0, 1], second_key)
+    assert torch.equal(vals1[0, 0, 1], second_val)
+
+    # Only the written prefix is active.
+    assert active1[0, 0, :4].tolist() == [True, True, False, False]
+
+    # Second update: one more real token. It must land in slot 2, not slot 4.
+    T2 = 2
+    key2 = torch.zeros(B, L, T2, HEAD_DIM)
+    val2 = torch.zeros(B, L, T2, HEAD_DIM)
+
+    third_key = torch.full((HEAD_DIM,), 50.0)
+    third_val = torch.full((HEAD_DIM,), 60.0)
+
+    key2[0, 0, 0] = third_key
+    val2[0, 0, 0] = third_val
+
+    mask2 = torch.zeros(B, L, T2, dtype=torch.bool)
+    mask2[0, 0, 0] = True  # position 1 is padding
+
+    keys2, vals2, active2 = cache.update(key2, val2, mask2)
+
+    # Count advances by exactly one more real token.
+    assert cache.get_heads_lengths()[0, 0].item() == 3
+
+    # The new token overwrites the first junk slot.
+    assert torch.equal(keys2[0, 0, 2], third_key)
+    assert torch.equal(vals2[0, 0, 2], third_val)
+
+    # Earlier real tokens remain intact.
+    assert torch.equal(keys2[0, 0, 0], first_key)
+    assert torch.equal(vals2[0, 0, 0], first_val)
+    assert torch.equal(keys2[0, 0, 1], second_key)
+    assert torch.equal(vals2[0, 0, 1], second_val)
+
+    # Valid region is now length 3.
+    assert active2[0, 0, :4].tolist() == [True, True, True, False]
+
 # ---------------------------------------------------------------------------
 # Oracle agreement — MoSRAHCache vs SlowMoSRAHCache
 #

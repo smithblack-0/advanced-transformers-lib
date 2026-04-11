@@ -12,7 +12,7 @@ Invariants verified:
 import pytest
 import torch
 
-from src.shram.model.load_balance_loss import LoadBalanceLoss
+from src.shram.model.attention.load_balance_loss import LoadBalanceLoss
 
 
 # ---------------------------------------------------------------------------

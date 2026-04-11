@@ -61,6 +61,7 @@ def setup_packing(
 
 def pack_experts(
     hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
     selected_heads: torch.Tensor,
     num_experts: int,
     flattened_selected_heads: torch.Tensor,
@@ -75,11 +76,18 @@ def pack_experts(
 
     The routed hidden-state copies are not stored explicitly in token-choice form.
     Instead, the same token hidden state is conceptually copied once per selected expert.
-    The packing step reconstructs those copies by expanding token positions, reordering
-    those positions with Pi, then gathering hidden states in that packed order.
+    The packing step reconstructs those copies by expanding local source-token indices,
+    reordering those indices with Pi, then gathering hidden states in that packed order.
+
+    Packed positions, however, are no longer synthesized locally from arange(N).
+    They are sourced from the authoritative upstream position_ids tensor and carried
+    through the same expert-major rearrangement. This preserves advanced positions
+    correctly during cached inference while leaving training/full-sequence behavior
+    unchanged when position_ids is the ordinary sequential token positions.
 
     Args:
         hidden_states: Token-choice hidden states x of shape (B, N, d).
+        position_ids: Authoritative upstream token positions J of shape (B, N).
         selected_heads: Routed head selections I of shape (B, N, K).
         num_experts: Total number of experts L.
         flattened_selected_heads: H from setup_packing(), shape (B, N*K).
@@ -88,21 +96,21 @@ def pack_experts(
     Returns:
         Tuple of:
           - packed_hidden_states: x' of shape (B, L, T, d)
-          - packed_positions: J of shape (B, L, T)
+          - packed_positions: J' of shape (B, L, T)
           - active_mask: M of shape (B, L, T)
     """
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     _, _, num_selected_heads = selected_heads.shape
 
     # -----------------------------------------------------------------------
-    # Reconstruct routed token positions in token-choice order.
+    # Reconstruct routed local source-token indices in token-choice order.
     #
-    # U in the paper is an expanded arange(N): each original token position is
-    # repeated K times so there is one position entry per routed token copy.
-    # Flattening U into Z gives a (B, N*K) tensor aligned with H's token-major
-    # routed-copy order.
+    # The internal arange(N) is no longer the packed position tensor. It is only
+    # the local source-row index object used to gather from the current chunk
+    # tensor x. Flattening this object gives a (B, N*K) tensor aligned with H's
+    # token-major routed-copy order.
     # -----------------------------------------------------------------------
-    token_positions = torch.arange(
+    source_token_indices = torch.arange(
         sequence_length,
         device=hidden_states.device,
         dtype=torch.long,
@@ -111,22 +119,30 @@ def pack_experts(
         sequence_length,
         num_selected_heads,
     )
-    flattened_positions = token_positions.reshape(
+    flattened_source_indices = source_token_indices.reshape(
         batch_size,
         sequence_length * num_selected_heads,
     )
 
     # -----------------------------------------------------------------------
-    # Reorder token positions and hidden states into expert-major order.
+    # Reorder source-token indices into expert-major order.
     #
-    # Applying Pi to Z yields the packed original-token positions J before padding.
-    # The same packed positions are then used to gather the hidden states in the
-    # exact expert-major order required by the paper.
+    # Applying Pi yields the local source-token rows in the packed expert-major
+    # order required by the paper. Those same reordered source indices are then
+    # used to gather both hidden states and authoritative upstream positions so
+    # the two remain aligned under the exact same packing transformation.
     # -----------------------------------------------------------------------
-    sorted_positions = flattened_positions.gather(dim=1, index=permutation)
+    sorted_source_indices = flattened_source_indices.gather(
+        dim=1,
+        index=permutation,
+    )
     sorted_hidden_states = hidden_states.gather(
         dim=1,
-        index=sorted_positions.unsqueeze(-1).expand(-1, -1, hidden_dim),
+        index=sorted_source_indices.unsqueeze(-1).expand(-1, -1, hidden_dim),
+    )
+    sorted_positions = position_ids.gather(
+        dim=1,
+        index=sorted_source_indices,
     )
 
     # -----------------------------------------------------------------------
@@ -159,7 +175,7 @@ def pack_experts(
     # -----------------------------------------------------------------------
     # Materialize the padded packed tensors.
     #
-    # The packed hidden states x' and packed original-token positions J are allocated
+    # The packed hidden states x' and packed original-token positions J' are allocated
     # as zero-filled tensors. Active entries are then written into those buffers in
     # the expert-major order established above. Padding remains zero / inactive.
     # -----------------------------------------------------------------------
@@ -169,7 +185,7 @@ def pack_experts(
         max_tokens_per_expert,
         hidden_dim,
     )
-    packed_positions = sorted_positions.new_zeros(
+    packed_positions = position_ids.new_zeros(
         batch_size,
         num_experts,
         max_tokens_per_expert,
@@ -179,7 +195,6 @@ def pack_experts(
     packed_positions[active_mask] = sorted_positions.reshape(-1)
 
     return packed_hidden_states, packed_positions, active_mask
-
 
 # ---------------------------------------------------------------------------
 # Unpacking

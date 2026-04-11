@@ -38,9 +38,10 @@ is being achieved, one verified unit at a time.
 - [X] Unit 6.C — ShramCache: top-level HF Cache owning all layer caches
 - [X] Unit 7 — Local sliding-window attention module (h_l)
 - [X] Unit 8 — Expert packing and unpacking: permutation machinery, padding, masks
-- [ ] Unit 9 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensors
-- [ ] Unit 10.A — MoSRAH position computation: P tensor for both modes and all cache states
-- [ ] Unit 10.B — MoSRAH sparse path: routing → packing → position computation → BEA → unpacking → weighted reduction
+- [X] Unit 9 — Bottlenecked Ensemble Attention (BEA): per-head attention on packed tensors
+- [X] Unit 10.A (Blocker) - Expert packing and unpackign was implemented incorrectly for compatibility with inference, including in the paper. change pushed to paper. Packing revisions.
+- [X] Unit 10.B — MoSRAH position computation: P tensor for both modes and all cache states
+- [X] Unit 10.C — MoSRAH sparse path: routing → packing → position computation → BEA → unpacking → weighted reduction
 - [ ] Unit 11 — SHRAM hybrid layer: assemble H(x) = h_l (Unit 7) + h_s (Unit 10.B)
 - [ ] Unit 12 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
 - [ ] Unit 13 — ShramModel: aggregate load_balance_loss in output
@@ -49,12 +50,6 @@ is being achieved, one verified unit at a time.
 - [ ] Unit 16 — documentation
 - [ ] Unit 17 — end-to-end tests
 - [ ] Unit 18 — final audit
-
----
-
-## Status
-
-**Current state:** Units 6.A–6.C complete (127/127 tests passing). Unit 7 next. Network tests deselected (Hub repo not yet created).
 
 ---
 
@@ -88,24 +83,16 @@ complete until its tests pass and accurately describe the intended behaviour.
 pushed onto a stack. Complete and verify the blocker, then return. Only make the changes needed
 for compatibility — do not expand scope.
 
-**Surface decisions.** Autonomous decisions are permitted but must be reported to the user for
-review. Uncertain decisions must be escalated before proceeding. Do not resolve ambiguity silently.
+**Surface decisions.** Autonomous decisions are permitted but must be reported to the user for review. Uncertain decisions must be escalated before proceeding. Do not resolve ambiguity silently.
 
-**Keep this plan current.** Update the status section and unit checklist continuously. The plan
-must reflect actual state at all times so work can be resumed after a session break without loss.
+**Keep this plan current.** Update the status section and unit checklist continuously. The plan must reflect actual state at all times so work can be resumed after a session break without loss.
 
-**Plan first within each unit.** At the start of each unit, state the invariants the unit must
-satisfy before considering any implementation. Implementation follows from invariants. A unit
-whose implementation is planned before its invariants are stated is not planned — it is guessed.
+**Plan first within each unit.** At the start of each unit, state the invariants the unit must satisfy before considering any implementation. Implementation follows from invariants. A unit whose implementation is planned before its invariants are stated is not planned — it is guessed.
 
-**Close the testing gap.** When a defect is found — in audit or anywhere else — the resolution is
-not complete until two questions are answered: (1) what invariant did the existing tests fail to
-enforce, and (2) what test change closes that gap? The fix and the test correction are a single
+**Close the testing gap.** When a defect is found — in audit or anywhere else — the resolution is not complete until two questions are answered: (1) what invariant did the existing tests fail to enforce, and (2) what test change closes that gap? The fix and the test correction are a single
 unit of work.
 
-**Surface paper↔implementation conflicts.** Where the paper is silent, incomplete, or leaves a
-value undetermined, that is a decision point — not a license to fill the gap. Surface it, resolve
-it with the user, and record the resolution here before proceeding.
+**Surface paper↔implementation conflicts.** Where the paper is silent, incomplete, or leaves a value undetermined, that is a decision point — not a license to fill the gap. Surface it, resolve it with the user, and record the resolution here before proceeding.
 
 ---
 
@@ -879,42 +866,32 @@ This unit sits at the conversion boundary between routing and BEA. Routing produ
 
 ### Unit 9 — Bottlenecked Ensemble Attention (BEA)
 
-**Responsibility:** Define and verify the Bottlenecked Ensemble Attention operator used by the
-MoSRAH sparse path. This unit consumes packed expert-choice tensors together with a supplied
-position tensor and optional layer-local sparse cache, and returns expert-choice outputs in the same packed space.
+**Responsibility:** Define and verify the Bottlenecked Ensemble Attention operator used by the MoSRAH sparse path. This unit consumes packed expert-choice tensors together with a supplied position tensor and optional layer-local sparse cache, and returns expert-choice outputs in the same packed space.
 
 **Context of Correctness**
 
-BEA is the expert-choice attention operator in the sparse path. It consumes the packed expert
-tensors produced by Unit 8 rather than token-choice state. Queries, keys, and values are projected per head from packed expert-choice tensors; RoPE is
-applied using a supplied position tensor; a standard triangular causal mask or equivalent mathematical behavior is used over packed positions; and the output is projected back into `(B, L, T, d)` expert-choice form. BEA does not compute positions and does not choose the RoPE mode; both are supplied from outside to distribute complexity between BEA and its MoSRAH parent. Cached keys must be stored post-RoPE as `K̃`, because reapplying RoPE to cached keys would corrupt positional encoding. Since the resulting tensors are
-ordinary headed attention tensors, this unit is expected to use a fast attention backend rather than a naive attention implementation wherever possible. The implementation is already highly constrained by the requirements of the paper.
+BEA is the expert-choice attention operator in the MoSRAH system. It consumes packed expert tensors with some amount of padding that will later be removed during unpacking. It is essencial it operates causally with some sort of attention formulation. Importantly, BEA does not directly determine its rope position and must operate correctly in an inference mode. It will receive a cache for this purpose. The implementation is already highly constrained by the requirements of the paper.
 
 **Invariants this unit must satisfy:**
 - BEA is implemented as the packed expert-choice attention operator for the sparse MoSRAH path.
 - The unit consumes packed expert-choice hidden states, a supplied position tensor, an
   active-token mask, and an optional layer-local MoSRAH cache.
-- The unit does not compute positions.
-- The unit does not choose the RoPE mode.
+- The unit does not compute RoPE positions but uses the provided one. 
+- The unit instances its RoPE mode in the YaRN capable mode. 
 - The unit implements interface
   `forward(packed_embeddings, position_ids, active_mask, cache=None)` where:
   - `packed_embeddings` has shape `(B, L, T, d)`
   - `position_ids` has shape `(B, L, T)`
   - `active_mask` has shape `(B, L, T)`
   - return value has shape `(B, L, T, d)`
-- The BEA projection parameters are independent per head. No cross-head parameter sharing is
-  introduced here.
-- BEA applies RoPE to `Q` and `K` using the supplied `position_ids` and consumes the returned
-  attention scaling `A_rope` in the attention computation. It does so in the YaRN capable mode.
-- If a cache is provided, BEA stores post-RoPE `K̃` and raw `V` into that layer-local sparse
-  cache and performs attention against the accumulated cached state returned by the cache.
+- The BEA projection parameters are independent per head. No cross-head parameter sharing is introduced here. See the paper.
+- BEA applies RoPE to `Q` and `K` using the supplied `position_ids` and consumes the returned attention scaling `A_rope` in the attention computation. It does so in the YaRN capable mode.
+- If a cache is provided, BEA stores post-RoPE `K̃` and raw `V` into that layer-local sparse  cache and performs attention against the accumulated cached state returned by the cache.
 - If no cache is provided, BEA performs attention against the current-step `K̃`, `V`, and
   `active_mask` directly.
-- Causal masking is triangular over the packed sequence dimension or an equivalent mathematical system is utilized to support causality.
-- Inactive / padded positions do not contribute to attention outputs.
-- The unit returns packed expert-choice outputs in the same `(B, L, T, d)` space expected by
-  later unpacking.
-- The unit is implemented for very rapid usage and is not a naive attention implementation.
+- Causal masking is triangular over the packed sequence dimension or an equivalent mathematical system is utilized to support causality. Care is taken to maintain causality in inference mode as well.
+- Inactive / padded positions do not contribute to SHRAM system outputs. This is not the same as not contributing to the BEA output. Largely this means we do not have to zero out junk queries, we just have to avoid attending to it. 
+- The unit returns packed expert-choice outputs in the same `(B, L, T, d)` space expected by later unpacking.
 - Tests and design for this unit are themselves structured so the unit can be trusted as a
   verified black box by later sparse-path assembly.
 
@@ -924,49 +901,101 @@ ordinary headed attention tensors, this unit is expected to use a fast attention
 - Verify per-head parameter independence.
 - Verify different supplied position tensors produce different RoPE-adjusted attention behavior.
 - Verify BEA does not internally compute positions or override the supplied RoPE mode when RoPE is activated in YaRN.
-- Verify inactive / padded positions do not influence active-token outputs.
+- Verify junk attention positions do not influence active-token outputs.
 - Verify causal masking is preserved over packed positions.
 - Verify cached execution stores post-RoPE `K̃` and raw `V`.
 - Verify cached execution uses accumulated cached state returned by the provided local MoSRAH
   cache.
 - Verify uncached execution uses the current `K̃`, `V`, and `active_mask` directly.
-- Verify cached and uncached execution both satisfy the same externally visible BEA contract.
+- Verify cached and uncached execution both satisfy the same externally visible BEA contract and produce identical results.
 - Verify the implementation uses a non-naive attention path compatible with the tensor form.
 - Verify the system responds to rescales under YaRN
 
 **Preliminary implementation strategy:**
-- Cached and uncached BEA should share one public operator contract, with a small branch on
-  whether a local sparse cache was actually passed.
-- If a cache is passed, the operator should route through that cache using post-RoPE in the expert-packing mode. `K̃`, raw
-  `V`, and the active-token mask; otherwise it should attend directly over the current-step
-  tensors.
+- Cached and uncached BEA should share one public operator contract, with a small branch on whether a local sparse cache was actually passed.
+- It is almost assuredly the case that the same mask can be used in both RoPE modes, as both modes in essence just care about causal connections. This should be verified against the paper, however.
+- The causal mask requirements will shift when operating in inference mode, as keys may only raggedly corrolate with queries. This will require generating masks based on the actual query positions.
+- If the underlying kernel supports it, it would be a good idea to exclude dead query calls from being attended to to save flops. Naturally, dead keys should never be attended to, and dead queries would nonetheles be removed by unpacking, but this would safe flops.
+- If a cache is passed, the operator should route through that cache using post-RoPE in the expert-packing mode. `K̃`, raw `V`, and the active-token mask; otherwise it should attend directly over the current-step  tensors.
 - If the tensor forms remain ordinary headed attention tensors, a fast attention backend such as FlashAttention or FlexAttention should be preferred over a naive implementation.
 - If any implementation choice would cause RoPE to be applied twice to cached keys, it should be  rejected.
 - If a more efficient backend is introduced later, it must preserve the same externally visible  packed-space behavior, masking behavior, and cache semantics.
-
+- If assumptions are not satisfied, they should instead be explicitly surfaced, handled, and documented as plan deviations.
 
 ---
-### Unit 10.A — MoSRAH Position Computation
+### Unit 10.A — Main-Sequence Position Packing Fix
 
-**Responsibility:** Define and verify the position-tensor computation used by the MoSRAH sparse path before BEA is called.
+**Responsibility:** Define and verify the blocker fix required to make packed original-token
+positions correct under both training and cached inference.
 
 **Context of Correctness**
 
-A degree of ambiguity exists in what form of RoPE to use in this kind of model. Does the position as measured in the expert choice packing, or original token-choice packing matter more? The paper was unable to determine it so we must support both. . In main-sequence mode, the packed original-token positions from Unit 8 are used directly. In semantic-sequence mode, positions are instead local to each expert bucket. This is a separate unit as it was deemed sufficiently complex it should be it's own module. The algorithm is highly constrained as research was already performed during the implementation of unit 6.
+Originally, it was not caught that positional index tensors had to be packed too. This functionality needed to be added to the paper and needs to be added to the packing functions. While the paper has been corrected and is now again the authorative algorithmic source, the fix needs to be put in place. This change is needed as during inference RoPE needs to start at positions beyond just zero.
 
 **Invariants this unit must satisfy:**
+- This unit fixes the packing path so that original-token positions used for main-sequence RoPE
+  are sourced from upstream position state rather than synthesized locally from the current chunk.
+- The updated paper is the source of truth for the algorithmic requirement this unit implements.
+- The packing path preserves upstream-provided original-token positions through the same
+  expert-choice rearrangement used for routed token copies.
+- Training/full-sequence execution remains valid when upstream position state is the ordinary
+  sequential token positions.
+- Cached inference remains valid when upstream position state is already advanced beyond the
+  current local chunk.
+- The resulting packed original-token positions remain aligned with the packed expert-choice
+  hidden-state ordering.
+- This fix does not change the externally visible expert-major ordering, active-mask semantics,
+  padding semantics, or inverse mapping behavior of the packing/unpacking subsystem, except where
+  necessary to correct the source of packed positions.
+- This blocker exists specifically to make main-sequence position handling correct under cached
+  inference; semantic-sequence position logic remains a separate concern.
+- Tests and design for this unit are themselves structured so the corrected packing path can be
+  trusted by later position and sparse-path units.
 
-- This unit computes the position tensor `P` supplied to BEA for the MoSRAH sparse path.
+**Tests**
+- Verify the packing path accepts authoritative upstream original-token position state.
+- Verify training/full-sequence behavior remains correct when upstream position state is the
+  ordinary sequential token positions.
+- Verify cached inference preserves advanced upstream positions through packing rather than
+  collapsing them to local chunk indices.
+- Verify packed position outputs remain aligned with packed hidden-state ordering.
+- Verify active-mask behavior is unchanged by this fix.
+- Verify unpacking/inverse-mapping behavior is unchanged by this fix.
+- Verify main-sequence cached inference no longer depends on locally regenerated chunk positions.
+
+**Preliminary implementation strategy:**
+- The updated paper should be treated as the primary algorithmic specification for this blocker.
+- If upstream position state is already available at the caller boundary, packing should treat it
+  as authoritative and only rearrange it.
+- If any current implementation path regenerates original-token positions from local sequence
+  length, that path should be removed or restricted to the special case where upstream position
+  state is explicitly that same sequence.
+- If later refactors change packing internals, they must continue to preserve authoritative
+  upstream original-token positions exactly through the packing transformation.
+
+### Unit 10.B — SparseMoSRAHPositions
+
+**Responsibility:** Define and verify the `SparseMoSRAHPositions` layer used to compute the position tensor supplied to BEA for the MoSRAH sparse path.
+
+**Context of Correctness**
+
+A degree of ambiguity exists in what form of RoPE to use in this kind of model. Does the position as measured in the expert choice packing, or original token-choice packing matter more? The paper was unable to determine it so we must support both. In main-sequence mode, the packed original-token positions from Unit 8 are used directly. In semantic-sequence mode, positions are instead local to each expert bucket. This is a separate unit as it was deemed sufficiently complex it should be it's own module. The algorithm is highly constrained as research was already performed during the implementation of unit 6. The responsibility is implemented as a layer.
+
+**Invariants this unit must satisfy:**
+- This unit is implemented as a `SparseMoSRAHPositions` layer configured from config.
+- This unit computes the position tensor `P` supplied to BEA for the MoSRAH sparse path in both inference and training configrations.
 - There are two supported RoPE modes:
   - `main_sequence`
   - `semantic_sequence`
 - In `main_sequence` mode, `P = J` always, where `J` is the packed original-token position
   tensor produced by Unit 8.
 - In `semantic_sequence` mode with no sparse cache present, `P` is the per-expert local sequence
-  `0, 1, 2, ...` over the packed sequence dimension.
-- In `semantic_sequence` mode with a sparse cache present, `P` is the same local sequence offset by the current per-head occupancies returned by `get_heads_lengths()`.
-- The cached and uncached semantic-sequence computations produce contiguous per-expert position that are equivalent in nature.
+  `0, 1, 2, ...` over the packed sequence dimension when training, or the equivant shifted formulation n, n+1, n+2... in inference. 
+- In `semantic_sequence` mode with a sparse cache present, `P` is that same local sequence
+  offset by the current per-head occupancies returned by `get_heads_lengths()`.
+- The cached and uncached semantic-sequence computations produce contiguous per-expert positions and are the same (equivalent in nature).
 - The resulting `P` has shape `(B, L, T)` and is compatible with BEA.
+- The layer receives the MoSRAH cache for inference mode computations.
 - Tests and design for this unit are themselves structured so the unit can be trusted as a
   verified black box by Unit 10.B.
 
@@ -980,28 +1009,26 @@ A degree of ambiguity exists in what form of RoPE to use in this kind of model. 
 - Verify cached semantic-sequence computation reads `get_heads_lengths()` before any cache update
   in the same forward pass.
 - Verify returned position tensors have the correct shape for BEA.
+- Verify the configured layer selects the correct computation for each supported RoPE mode.
 
 **Preliminary implementation strategy:**
-- If  `semantic_sequence` mode is selected and no contradictory ground truth is discovered during implementation this unit should first generate the offsets as a set of zeros, add to it the cache offsets if the cache exists, then add them to the generative arange when in semantic mode.
-- If `main_sequence` mode is selected, the unit should forward the packed position tensor `J`
+- If `semantic_sequence` mode is selected and no contradictory ground truth is discovered during
+  implementation, this layer should first generate the local `arange` positions, then add cache
+  offsets if a sparse cache is present.
+- If `main_sequence` mode is selected, the layer should forward the packed position tensor `J`
   directly.
-- If any later implementation change would cause BEA to update the cache before this unit reads cached occupancies, that change should be rejected.
+- If any later implementation change would cause BEA to update the cache before this layer reads
+  cached occupancies, that change should be rejected.
+- If the layer can cleanly encapsulate all RoPE-position branching without duplicating logic in
+  the parent MoSRAH path, that should be preferred.
 
+### Unit 10.C — MoSRAH Path
 
-### Unit 10.B — MoSRAH Path
-
-**Responsibility:** Define and verify the full MoSRAH sparse path from routed token-choice input to
-final model-space sparse output.
+**Responsibility:** Define and verify the full MoSRAH sparse path from routed token-choice input to final model-space sparse output.
 
 **Context of Correctness**
 
-The MoSRAH path bridges two different representational regimes. Routing begins in token-choice
-form, while BEA executes in packed expert-choice form. As such, this unit must perform the full
-bridge in order: route, pack, compute positions, attend, unpack, and reduce. The weighted
-reduction at the end must use the unbiased renormalized routing probabilities rather than the
-biased routing scores used for selection. This unit also has to support both RoPE position modes
-through Unit 10.A and must support inference through the layer-local MoSRAH cache. The routing
-system's load-balancing signal is also generated here and must be propagated out of the unit.
+The SHRAM system requires packing into an expert choice form to surface the long-sequence guarentees. The MosRAH system has to put the pieces together. Routing funtions produced in the routing unit, and the BEA layer, have to work together to attend correctly. Additionally, it is essential that position be correctly encoded for the two modes of rope MoSRAH supports. It must support inference through the layer-local MoSRAH cache, and generate the needed load-balancing signal. Ultimately, this is largely a coordinator and constructor.
 
 **Invariants this unit must satisfy:**
 - The MoSRAH path is implemented as specified by Algorithm 1 and the surrounding appendix
@@ -1023,56 +1050,85 @@ system's load-balancing signal is also generated here and must be propagated out
   directly if caching is enabled.
 - Unpacking restores token-choice ordering from BEA's packed expert-choice outputs.
 - The final weighted reduction uses the unbiased renormalized `routing_probs`.
-- The final weighted reduction does **not** use biased selection scores and does **not** use the
-  selected-head indices as weighting values.
-- The unit supports both RoPE position modes provided by Unit 10.A.
+- The unit supports both RoPE position modes provided by Unit 10.B.
 - The unit supports both cached and uncached execution.
 - `load_balance_loss` from the router is propagated through the MoSRAH path return.
-- The unit is implemented for very rapid usage.
+- Underlying features and code are utilized to accomplish this without reinventing the wheel.
 - Tests and design for this unit are themselves structured so the unit can be trusted as a
   verified black box by later SHRAM-layer assembly.
 
 **Tests**
+
+*Note: As an orchestrator, what is required is that between this and it's subunits all parts are tested*
+
 - Verify output shape is correct.
 - Verify `load_balance_loss` is present in the unit return.
-- Verify the routed forward path follows the expected route → pack → position → BEA → unpack →
-  reduce structure.
 - Verify the final weighted reduction uses `routing_probs`.
 - Verify the final weighted reduction does not use biased routing scores.
-- Verify gradients flow through `routing_probs` back to the router weights.
-- Verify both supported position modes are accepted and produce valid outputs through Unit 10.A.
+- Verify manually configured weights and manually specified inputs operate as expected based on the paper. 
+- Verify gradients flow through the loss and through the SHRAM layer. 
 - Verify uncached execution works correctly.
 - Verify cached execution uses the provided layer-local MoSRAH cache and accumulates correctly
+- Verify uncached and cached execution arrive at the same result.
   across calls.
 - Verify cached and uncached execution both satisfy the same external MoSRAH-path contract.
 
 **Preliminary implementation strategy:**
-- The paper should be treated as the primary algorithmic specification for this unit.
-- If no contradictory ground truth is discovered during implementation, this unit should be
-  written as a straightforward orchestration of the already-verified subunits rather than as a
-  fused monolith that hides the bridge steps.
-- If caching is enabled, the unit should pass the layer-local MoSRAH cache directly into BEA;
-  otherwise it should execute the uncached path with the current packed tensors and active mask.
-- If both position modes remain supported, this unit should delegate position computation
-  entirely to Unit 10.A rather than reproducing position logic locally.
-- If a more aggressive fused implementation is later introduced for performance, it must preserve
-  the same externally visible routing, packing, position, attention, unpacking, reduction, and
-  cache semantics.
----
+- The paper should be treated as the primary algorithmic specification for this unit. 
+- If no contradictory ground truth is discovered during implementation, this unit should be written as a straightforward orchestration of the already-verified subunits rather than as a fused monolith that hides the bridge steps.
+- If caching is enabled, the unit should pass the layer-local MoSRAH cache directly into BEA;  otherwise it should execute the uncached path with the current packed tensors and active mask.
 
 ### Unit 11 — SHRAM Hybrid Layer
 
+**Responsibility:** Define and verify the SHRAM hybrid attention layer that combines the local
+sliding-window path and the MoSRAH sparse path at one decoder attention slot.
+
+**Context of Correctness**
+
+SHRAM is the hybrid attention construction used by the model. The local path exists to preserve
+nearby-token behavior, while the MoSRAH sparse path is the theorem-facing long-range path. Both
+live at the same decoder attention slot and both must operate over the same input hidden state.
+The layer-local cache architecture already reflects this: each `ShramLayerCache` owns both a
+`.sliding_window_cache` and a `.mosrah_cache`. The hybrid layer therefore exists to dispatch the
+correct cache to each path, execute both paths, sum their outputs, and propagate the sparse-path
+load-balance signal.
+
 **Invariants this unit must satisfy:**
-- SHRAM forward: H(x) = h_l(x) + h_s(x), where h_l is the local sliding-window module
-  (Unit 7, verified black box) and h_s is MoSRAH (Unit 10.B, verified black box).
-- h_l and h_s have fully independent parameters. Their outputs are summed.
-- load_balance_loss from h_s is propagated through the hybrid layer's return.
-- Output shape: (B, N, d) — same interface as GroupedQueryAttention it replaces.
-- Tests verify: output shape, independence of paths (zeroing h_l parameters leaves only
-  h_s contribution and vice versa), load_balance_loss is present in the return.
+- The SHRAM hybrid layer implements the forward relation `H(x) = h_l(x) + h_s(x)`.
+- `h_l` is the verified local sliding-window attention path from Unit 7.
+- `h_s` is the verified MoSRAH sparse path from Unit 10.C.
+- Both paths consume the same input hidden state for the current decoder layer.
+- The hybrid layer receives the corresponding `ShramLayerCache` for this decoder layer.
+- The hybrid layer passes `DynamicSlidingWindowLayer` to the local path.
+- The hybrid layer passes `MoSRAHCache` to the MoSRAH sparse path.
+- `h_l` and `h_s` have fully independent parameters.
+- The hybrid output is the sum of the two path outputs in model space.
+- `load_balance_loss` from the sparse path is propagated through the hybrid layer's return.
+- The hybrid layer returns outputs in `(B, N, d)` form compatible with the decoder-layer
+  interface it replaces.
+- Tests and design for this unit are themselves structured so the unit can be trusted as a
+  verified black box by the decoder-layer unit.
 
-**Paper refs:** §3 Design Success Conditions.
+**Tests**
 
+*Note: As an orchestrator, what is required is that between this and it's subunits all parts are tested*
+
+- Verify output shape is `(B, N, d)`.
+- Verify zeroing or disabling the local path leaves only the sparse-path contribution.
+- Verify zeroing or disabling the sparse path leaves only the local-path contribution.
+- Verify `load_balance_loss` is present in the return and is propagated from the sparse path.
+- Verify the system responds to the load balancing loss when gradients occur. Verify movement occurs in the corret direction.
+- Verify the hybrid layer preserves the external attention-layer interface expected by the
+  decoder layer.
+
+**Preliminary implementation strategy:**
+- This unit should be a straightforward coordinator over the already-verified local and sparse sublayers rather than a from-scratch implementation.
+- If the local and sparse paths already return model-space tensors of matching shape, the hybrid
+  layer should sum them directly rather than introducing any additionallogic here.
+- If a `ShramLayerCache` is provided, this unit should dispatch its two owned sub-caches to the
+  corresponding paths rather than re-resolving cache ownership internally.
+- If later performance work attempts to fuse the two paths more aggressively, it must preserve
+  the same externally visible sum, cache dispatch behavior, and load-balance-loss propagation.
 ---
 
 ### Unit 12 — DecoderLayer Update

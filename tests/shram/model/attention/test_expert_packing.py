@@ -3,9 +3,9 @@
 Invariants verified: paper-specified packing behavior, stable-sort-based causal
 order preservation within expert buckets, failure of a deliberately unstable
 alternative, active-mask cardinality and padding identification, left-justified
-active packing, packed original-token positions, restoration of token-choice
-shape on unpacking, round-trip identity on active entries, and padding
-inactivity through unpacking.
+active packing, authoritative upstream original-token positions, restoration of
+token-choice shape on unpacking, round-trip identity on active entries, and
+padding inactivity through unpacking.
 """
 
 import torch
@@ -21,7 +21,9 @@ from src.shram.model.attention.expert_packing import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_example() -> tuple[torch.Tensor, torch.Tensor, int]:
+def make_example(
+    position_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Construct a small hand-checkable packing example.
 
     selected_heads is arranged so that stable expert-major packing has a clear
@@ -46,6 +48,9 @@ def make_example() -> tuple[torch.Tensor, torch.Tensor, int]:
             [40.0, 41.0],
         ]]
     )
+    if position_ids is None:
+        position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+
     selected_heads = torch.tensor(
         [[
             [1, 0],
@@ -56,10 +61,12 @@ def make_example() -> tuple[torch.Tensor, torch.Tensor, int]:
         dtype=torch.long,
     )
     num_experts = 3
-    return hidden_states, selected_heads, num_experts
+    return hidden_states, position_ids, selected_heads, num_experts
 
 
-def make_batch_example() -> tuple[torch.Tensor, torch.Tensor, int]:
+def make_batch_example(
+    position_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Construct a batch-sized example for mask and round-trip checks."""
     hidden_states = torch.tensor(
         [
@@ -77,6 +84,15 @@ def make_batch_example() -> tuple[torch.Tensor, torch.Tensor, int]:
             ],
         ]
     )
+    if position_ids is None:
+        position_ids = torch.tensor(
+            [
+                [0, 1, 2, 3],
+                [0, 1, 2, 3],
+            ],
+            dtype=torch.long,
+        )
+
     selected_heads = torch.tensor(
         [
             [
@@ -95,7 +111,7 @@ def make_batch_example() -> tuple[torch.Tensor, torch.Tensor, int]:
         dtype=torch.long,
     )
     num_experts = 3
-    return hidden_states, selected_heads, num_experts
+    return hidden_states, position_ids, selected_heads, num_experts
 
 
 def make_unstable_permutation(flattened_selected_heads: torch.Tensor) -> torch.Tensor:
@@ -136,11 +152,12 @@ def assert_left_justified(active_mask: torch.Tensor) -> None:
 class TestPaperAlgorithmBehavior:
     def test_pack_matches_hand_computed_example(self):
         """Packing should match the paper-specified expert-major layout on a known example."""
-        hidden_states, selected_heads, num_experts = make_example()
+        hidden_states, position_ids, selected_heads, num_experts = make_example()
 
         flattened_selected_heads, permutation, _ = setup_packing(selected_heads)
         packed_hidden_states, packed_positions, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,
@@ -178,28 +195,108 @@ class TestPaperAlgorithmBehavior:
         torch.testing.assert_close(packed_positions, expected_positions)
         torch.testing.assert_close(active_mask, expected_active_mask)
 
-    def test_packed_positions_match_original_sequence_positions_in_packed_order(self):
-        """Packed positions J should record original token positions in expert-major order."""
-        hidden_states, selected_heads, num_experts = make_example()
+    def test_packing_preserves_advanced_upstream_positions_through_expert_rearrangement(self):
+        """Advanced upstream positions should survive packing rather than collapse to local indices."""
+        hidden_states, _, selected_heads, num_experts = make_example(
+            position_ids=torch.tensor([[100, 101, 102, 103]], dtype=torch.long)
+        )
 
         flattened_selected_heads, permutation, _ = setup_packing(selected_heads)
-        _, packed_positions, active_mask = pack_experts(
+        packed_hidden_states, packed_positions, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=torch.tensor([[100, 101, 102, 103]], dtype=torch.long),
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,
             permutation=permutation,
         )
 
-        expected_active_positions = [
-            [0, 1, 3],  # expert 0
-            [0, 2, 3],  # expert 1
-            [1, 2],     # expert 2
-        ]
+        expected_positions = torch.tensor(
+            [[
+                [100, 101, 103],
+                [100, 102, 103],
+                [101, 102, 0],
+            ]],
+            dtype=torch.long,
+        )
+        expected_hidden_states = torch.tensor(
+            [[
+                [[10.0, 11.0], [20.0, 21.0], [40.0, 41.0]],
+                [[10.0, 11.0], [30.0, 31.0], [40.0, 41.0]],
+                [[20.0, 21.0], [30.0, 31.0], [0.0, 0.0]],
+            ]]
+        )
 
-        for expert_idx, expected in enumerate(expected_active_positions):
-            actual = packed_positions[0, expert_idx][active_mask[0, expert_idx]].tolist()
-            assert actual == expected
+        torch.testing.assert_close(packed_hidden_states, expected_hidden_states)
+        torch.testing.assert_close(packed_positions, expected_positions)
+
+        # The blocker fix exists precisely so these positions are not regenerated
+        # from the local chunk as 0, 1, 2, 3 during cached inference.
+        assert not torch.equal(
+            packed_positions[active_mask],
+            torch.tensor([0, 1, 3, 0, 2, 3, 1, 2], dtype=torch.long),
+        )
+
+    def test_packed_positions_remain_aligned_with_packed_hidden_state_ordering(self):
+        """Packed positions should stay aligned with the packed hidden-state ordering."""
+        hidden_states, position_ids, selected_heads, num_experts = make_example(
+            position_ids=torch.tensor([[100, 101, 102, 103]], dtype=torch.long)
+        )
+
+        flattened_selected_heads, permutation, _ = setup_packing(selected_heads)
+        packed_hidden_states, packed_positions, active_mask = pack_experts(
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            selected_heads=selected_heads,
+            num_experts=num_experts,
+            flattened_selected_heads=flattened_selected_heads,
+            permutation=permutation,
+        )
+
+        expected_hidden_by_position = {
+            100: hidden_states[0, 0],
+            101: hidden_states[0, 1],
+            102: hidden_states[0, 2],
+            103: hidden_states[0, 3],
+        }
+
+        for expert_idx in range(num_experts):
+            active_positions = packed_positions[0, expert_idx][active_mask[0, expert_idx]].tolist()
+            active_hidden_states = packed_hidden_states[0, expert_idx][active_mask[0, expert_idx]]
+            for position, hidden_state in zip(active_positions, active_hidden_states):
+                torch.testing.assert_close(
+                    hidden_state,
+                    expected_hidden_by_position[position],
+                )
+
+    def test_main_sequence_positions_no_longer_depend_on_locally_regenerated_chunk_positions(self):
+        """Changing only upstream positions should change packed positions but not packed hidden states."""
+        hidden_states, _, selected_heads, num_experts = make_example()
+        sequential_position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+        advanced_position_ids = torch.tensor([[100, 101, 102, 103]], dtype=torch.long)
+
+        flattened_selected_heads, permutation, _ = setup_packing(selected_heads)
+
+        packed_hidden_states_a, packed_positions_a, active_mask_a = pack_experts(
+            hidden_states=hidden_states,
+            position_ids=sequential_position_ids,
+            selected_heads=selected_heads,
+            num_experts=num_experts,
+            flattened_selected_heads=flattened_selected_heads,
+            permutation=permutation,
+        )
+        packed_hidden_states_b, packed_positions_b, active_mask_b = pack_experts(
+            hidden_states=hidden_states,
+            position_ids=advanced_position_ids,
+            selected_heads=selected_heads,
+            num_experts=num_experts,
+            flattened_selected_heads=flattened_selected_heads,
+            permutation=permutation,
+        )
+
+        torch.testing.assert_close(packed_hidden_states_a, packed_hidden_states_b)
+        torch.testing.assert_close(active_mask_a, active_mask_b)
+        assert not torch.equal(packed_positions_a, packed_positions_b)
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +306,12 @@ class TestPaperAlgorithmBehavior:
 class TestStableSortBehavior:
     def test_stable_sort_preserves_causal_order_within_each_expert_bucket(self):
         """Stable expert-major packing must preserve original token order within each expert."""
-        hidden_states, selected_heads, num_experts = make_example()
+        hidden_states, position_ids, selected_heads, num_experts = make_example()
 
         flattened_selected_heads, permutation, _ = setup_packing(selected_heads)
         _, packed_positions, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,
@@ -226,13 +324,14 @@ class TestStableSortBehavior:
 
     def test_deliberately_unstable_alternative_breaks_causal_order(self):
         """A non-stable expert-major ordering should fail the causal-order invariant."""
-        hidden_states, selected_heads, num_experts = make_example()
+        hidden_states, position_ids, selected_heads, num_experts = make_example()
 
         flattened_selected_heads, _, _ = setup_packing(selected_heads)
         unstable_permutation = make_unstable_permutation(flattened_selected_heads)
 
         _, packed_positions, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,
@@ -257,11 +356,12 @@ class TestStableSortBehavior:
 class TestActiveMask:
     def test_active_mask_has_correct_cardinality(self):
         """The active mask should contain exactly B * N * K true entries."""
-        hidden_states, selected_heads, num_experts = make_batch_example()
+        hidden_states, position_ids, selected_heads, num_experts = make_batch_example()
 
         flattened_selected_heads, permutation, _ = setup_packing(selected_heads)
         _, _, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,
@@ -271,13 +371,40 @@ class TestActiveMask:
         batch_size, sequence_length, num_selected_heads = selected_heads.shape
         assert active_mask.sum().item() == batch_size * sequence_length * num_selected_heads
 
+    def test_active_mask_behavior_is_unchanged_by_position_sourcing_fix(self):
+        """Changing only upstream positions should not change the active-mask layout."""
+        hidden_states, _, selected_heads, num_experts = make_example()
+        sequential_position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+        advanced_position_ids = torch.tensor([[100, 101, 102, 103]], dtype=torch.long)
+
+        flattened_selected_heads, permutation, _ = setup_packing(selected_heads)
+        _, _, active_mask_a = pack_experts(
+            hidden_states=hidden_states,
+            position_ids=sequential_position_ids,
+            selected_heads=selected_heads,
+            num_experts=num_experts,
+            flattened_selected_heads=flattened_selected_heads,
+            permutation=permutation,
+        )
+        _, _, active_mask_b = pack_experts(
+            hidden_states=hidden_states,
+            position_ids=advanced_position_ids,
+            selected_heads=selected_heads,
+            num_experts=num_experts,
+            flattened_selected_heads=flattened_selected_heads,
+            permutation=permutation,
+        )
+
+        torch.testing.assert_close(active_mask_a, active_mask_b)
+
     def test_active_mask_correctly_distinguishes_active_tokens_from_padding(self):
         """Active mask should mark real packed tokens and exclude padding slots."""
-        hidden_states, selected_heads, num_experts = make_example()
+        hidden_states, position_ids, selected_heads, num_experts = make_example()
 
         flattened_selected_heads, permutation, _ = setup_packing(selected_heads)
         packed_hidden_states, packed_positions, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,
@@ -289,11 +416,12 @@ class TestActiveMask:
 
     def test_active_tokens_are_left_justified(self):
         """Within each expert slot, active entries should appear before all padding."""
-        hidden_states, selected_heads, num_experts = make_batch_example()
+        hidden_states, position_ids, selected_heads, num_experts = make_batch_example()
 
         flattened_selected_heads, permutation, _ = setup_packing(selected_heads)
         _, _, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,
@@ -310,11 +438,12 @@ class TestActiveMask:
 class TestUnpacking:
     def test_unpack_restores_token_choice_shape(self):
         """Unpacking should return a tensor of shape (B, N, K, d)."""
-        hidden_states, selected_heads, num_experts = make_batch_example()
+        hidden_states, position_ids, selected_heads, num_experts = make_batch_example()
 
         flattened_selected_heads, permutation, inverse_permutation = setup_packing(selected_heads)
         packed_hidden_states, _, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,
@@ -338,11 +467,12 @@ class TestUnpacking:
 
     def test_round_trip_identity_on_active_entries(self):
         """unpack(pack(x, I)) should recover the original active token copies."""
-        hidden_states, selected_heads, num_experts = make_batch_example()
+        hidden_states, position_ids, selected_heads, num_experts = make_batch_example()
 
         flattened_selected_heads, permutation, inverse_permutation = setup_packing(selected_heads)
         packed_hidden_states, _, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,
@@ -363,13 +493,54 @@ class TestUnpacking:
         )
         torch.testing.assert_close(restored, expected)
 
+    def test_unpacking_behavior_is_unchanged_by_position_sourcing_fix(self):
+        """Changing only upstream positions should not change unpacking / inverse mapping behavior."""
+        hidden_states, _, selected_heads, num_experts = make_example()
+        sequential_position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+        advanced_position_ids = torch.tensor([[100, 101, 102, 103]], dtype=torch.long)
+
+        flattened_selected_heads, permutation, inverse_permutation = setup_packing(selected_heads)
+
+        packed_hidden_states_a, _, active_mask_a = pack_experts(
+            hidden_states=hidden_states,
+            position_ids=sequential_position_ids,
+            selected_heads=selected_heads,
+            num_experts=num_experts,
+            flattened_selected_heads=flattened_selected_heads,
+            permutation=permutation,
+        )
+        packed_hidden_states_b, _, active_mask_b = pack_experts(
+            hidden_states=hidden_states,
+            position_ids=advanced_position_ids,
+            selected_heads=selected_heads,
+            num_experts=num_experts,
+            flattened_selected_heads=flattened_selected_heads,
+            permutation=permutation,
+        )
+
+        restored_a = unpack_experts(
+            expert_outputs=packed_hidden_states_a,
+            selected_heads=selected_heads,
+            active_mask=active_mask_a,
+            inverse_permutation=inverse_permutation,
+        )
+        restored_b = unpack_experts(
+            expert_outputs=packed_hidden_states_b,
+            selected_heads=selected_heads,
+            active_mask=active_mask_b,
+            inverse_permutation=inverse_permutation,
+        )
+
+        torch.testing.assert_close(restored_a, restored_b)
+
     def test_padding_regions_remain_inactive_through_unpacking(self):
         """Padding data should not become active outputs during unpacking."""
-        hidden_states, selected_heads, num_experts = make_example()
+        hidden_states, position_ids, selected_heads, num_experts = make_example()
 
         flattened_selected_heads, permutation, inverse_permutation = setup_packing(selected_heads)
         packed_hidden_states, _, active_mask = pack_experts(
             hidden_states=hidden_states,
+            position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=num_experts,
             flattened_selected_heads=flattened_selected_heads,

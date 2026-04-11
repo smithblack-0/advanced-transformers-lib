@@ -10,11 +10,10 @@ Invariants verified:
 - routing_projection has no bias parameter
 """
 
-import pytest
 import torch
 
 from src.shram.model.configuration import ShramConfig
-from src.shram.model.router import MoSRAHRouter
+from src.shram.model.attention.router import MoSRAHRouter
 
 
 # ---------------------------------------------------------------------------
