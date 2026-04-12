@@ -126,7 +126,12 @@ class TestLocalWindowBehavior:
         torch.testing.assert_close(out_original[:, 5:6, :], out_modified[:, 5:6, :])
 
     def test_future_tokens_do_not_affect_past_outputs(self):
-        """Replacing future tokens must leave earlier outputs unchanged."""
+        """Replacing future tokens must leave earlier outputs unchanged.
+
+        With window_size=4 and seq=6, positions 4-5 are unreachable by any token
+        in positions 0-3 under any causal formulation. This test confirms global
+        causal isolation: no future context leaks backward through the mask.
+        """
         config = small_config(window_size=4)
         attn = SlidingWindowAttention(config)
         attn.eval()
@@ -140,6 +145,33 @@ class TestLocalWindowBehavior:
         out_modified = attn(x_modified, position_ids)
 
         torch.testing.assert_close(out_original[:, :4, :], out_modified[:, :4, :])
+
+    def test_causal_ordering_is_preserved_within_active_window(self):
+        """Token i must not attend to token j > i even when both are inside the active window.
+
+        This is distinct from the global causal test above. There, future tokens are
+        unreachable by the window boundary itself. Here, both i and i+1 are inside the
+        same active window — a bidirectional sliding window would allow i to attend to
+        i+1 and would fail this check. The causal constraint must hold strictly within
+        the window, not only at its boundary.
+
+        With window_size=4 and seq=5, position 2 and position 3 are both inside the
+        active window for position 3 (positions 0-3 are all reachable). Changing
+        position 3 must leave position 2's output unchanged.
+        """
+        config = small_config(window_size=4)
+        attn = SlidingWindowAttention(config)
+        attn.eval()
+        torch.manual_seed(5)
+
+        x, position_ids = make_input(config, batch=1, seq=5)
+        out_original = attn(x, position_ids)
+
+        x_modified = x.clone()
+        x_modified[:, 3:4, :] = torch.randn_like(x_modified[:, 3:4, :])
+        out_modified = attn(x_modified, position_ids)
+
+        torch.testing.assert_close(out_original[:, 2:3, :], out_modified[:, 2:3, :])
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +194,14 @@ class TestSlidingWindowCache:
         assert cache.values.shape == expected_shape
 
     def test_repeated_cached_forward_retains_last_window_minus_one_tokens(self):
-        """Once the cache is full, it should retain only the last window_size - 1 tokens."""
+        """DynamicSlidingWindowLayer stores window_size - 1 keys after the cache is full.
+
+        update() appends the new key, returns the full concatenated tensor for the current
+        forward pass (giving the query its complete window of window_size keys), then trims
+        stored keys to window_size - 1. This means on the next decode step, appending one
+        more key again yields exactly window_size keys in k_full. The stored count is
+        window_size - 1 because update() contributes the final key at call time.
+        """
         config = small_config(window_size=4)
         attn = SlidingWindowAttention(config)
         attn.eval()
@@ -171,25 +210,26 @@ class TestSlidingWindowCache:
         x, position_ids = make_input(config, batch=1, seq=5)
         cache = make_cache(config)
 
-        # Prefill 2 tokens.
+        # Tokens 0-1: cache accumulates freely, no trimming yet.
         attn(x[:, :2, :], position_ids[:, :2], cache=cache)
         assert cache.get_seq_length() == 2
         assert cache.keys.shape[-2] == 2
         assert cache.values.shape[-2] == 2
 
-        # Add token 2.
+        # Token 2: still below window capacity, no trimming.
         attn(x[:, 2:3, :], position_ids[:, 2:3], cache=cache)
         assert cache.get_seq_length() == 3
         assert cache.keys.shape[-2] == 3
         assert cache.values.shape[-2] == 3
 
-        # Add token 3: cumulative length reaches window, retained cache stays at 3.
+        # Token 3: cumulative length reaches window_size. update() returned all 4 keys
+        # to this forward pass, then trimmed storage to window_size - 1 = 3.
         attn(x[:, 3:4, :], position_ids[:, 3:4], cache=cache)
         assert cache.get_seq_length() == 4
         assert cache.keys.shape[-2] == config.window_size - 1
         assert cache.values.shape[-2] == config.window_size - 1
 
-        # Add token 4: cumulative length grows again, retained cache still stays at 3.
+        # Token 4: steady state — update() appends to the 3 stored, returns 4, trims back to 3.
         attn(x[:, 4:5, :], position_ids[:, 4:5], cache=cache)
         assert cache.get_seq_length() == 5
         assert cache.keys.shape[-2] == config.window_size - 1

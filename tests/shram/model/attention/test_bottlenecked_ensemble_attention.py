@@ -12,6 +12,7 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import src.shram.model.attention.bottlenecked_ensemble_attention as bea_module
 from src.shram.model.attention.bottlenecked_ensemble_attention import BottleneckedEnsembleAttention
@@ -84,6 +85,35 @@ def gather_current_rows_from_full(
         dim=2,
         index=full_rows.unsqueeze(-1).expand(-1, -1, -1, full_outputs.shape[-1]),
     )
+
+# ---------------------------------------------------------------------------
+# Black-box fuzz causality helpers
+# ---------------------------------------------------------------------------
+
+def make_fuzz_causality_bea() -> tuple[BottleneckedEnsembleAttention, ShramConfig]:
+    """Construct one real random BEA instance for black-box causality fuzzing."""
+    config = small_config(
+        hidden_size=8,
+        num_mosrah_heads=1,
+        head_dim=4,
+        training_sequence_length=16,
+        inference_sequence_length=16,
+    )
+    torch.manual_seed(0)
+    bea = BottleneckedEnsembleAttention(config)
+    bea.eval()
+    return bea, config
+
+
+def query_rows_that_changed(
+    baseline_output: torch.Tensor,
+    perturbed_output: torch.Tensor,
+    change_threshold: float,
+) -> torch.Tensor:
+    """Return which query rows changed between two BEA outputs."""
+    max_row_delta = (perturbed_output - baseline_output).abs().amax(dim=-1)
+    return max_row_delta[0, 0] > change_threshold
+
 
 
 class SpyMoSRAHCache:
@@ -766,3 +796,208 @@ class TestBackendPath:
         bea(packed_embeddings, position_ids, active_mask)
 
         assert seen["called"]
+
+
+# ---------------------------------------------------------------------------
+# Black-box fuzz causality tests
+# ---------------------------------------------------------------------------
+
+class TestCausalityFuzz:
+    def test_uncached_fuzz_verifies_causal_reachability_and_future_blocking(self):
+        """Across many random uncached inputs, legal edges should respond at least once,
+        and illegal future edges should never respond.
+        """
+        bea, config = make_fuzz_causality_bea()
+
+        packed_length = 5
+        num_trials = 100
+        perturbation_scale = 5.0
+        change_threshold = 1e-5
+
+        expected_reachability = torch.tril(
+            torch.ones(packed_length, packed_length, dtype=torch.bool)
+        )
+        ever_changed = torch.zeros_like(expected_reachability)
+
+        position_ids = torch.arange(packed_length, dtype=torch.long).view(1, 1, packed_length)
+        active_mask = torch.ones(1, 1, packed_length, dtype=torch.bool)
+        query_indices = torch.arange(packed_length)
+
+        with torch.no_grad():
+            for trial_index in range(num_trials):
+                torch.manual_seed(1000 + trial_index)
+                packed_embeddings = torch.randn(
+                    1,
+                    config.num_mosrah_heads,
+                    packed_length,
+                    config.hidden_size,
+                )
+
+                baseline_output = bea(
+                    packed_embeddings,
+                    position_ids,
+                    active_mask,
+                    cache=None,
+                )
+
+                for source_index in range(packed_length):
+                    perturbed_embeddings = packed_embeddings.clone()
+                    perturbation = perturbation_scale * torch.randn(config.hidden_size)
+                    perturbed_embeddings[0, 0, source_index] += perturbation
+
+                    perturbed_output = bea(
+                        perturbed_embeddings,
+                        position_ids,
+                        active_mask,
+                        cache=None,
+                    )
+
+                    changed_queries = query_rows_that_changed(
+                        baseline_output=baseline_output,
+                        perturbed_output=perturbed_output,
+                        change_threshold=change_threshold,
+                    )
+
+                    legal_queries = query_indices >= source_index
+                    illegal_queries = ~legal_queries
+
+                    assert not torch.any(changed_queries[illegal_queries]), (
+                        f"Illegal uncached influence detected for source_index={source_index} "
+                        f"on trial_index={trial_index}. changed_queries={changed_queries.tolist()} "
+                        f"legal_queries={legal_queries.tolist()}"
+                    )
+
+                    ever_changed[:, source_index] |= changed_queries
+
+        missing_legal_responses = expected_reachability & ~ever_changed
+        assert not torch.any(missing_legal_responses), (
+            "Some legal uncached source->query pairs never produced any observed response. "
+            f"missing_legal_responses={missing_legal_responses.int().tolist()}"
+        )
+
+    def test_cached_fuzz_verifies_prefix_plus_local_causality(self):
+        """Across many random cached runs, prefix sources should influence every current query,
+        and current sources should influence only current queries at or after themselves.
+        """
+        bea, config = make_fuzz_causality_bea()
+
+        prefix_length = 3
+        current_length = 3
+        total_source_length = prefix_length + current_length
+        num_trials = 100
+        perturbation_scale = 5.0
+        change_threshold = 1e-5
+
+        expected_reachability = torch.zeros(
+            current_length,
+            total_source_length,
+            dtype=torch.bool,
+        )
+        expected_reachability[:, :prefix_length] = True
+        expected_reachability[:, prefix_length:] = torch.tril(
+            torch.ones(current_length, current_length, dtype=torch.bool)
+        )
+
+        ever_changed = torch.zeros_like(expected_reachability)
+
+        prefix_position_ids = torch.arange(prefix_length, dtype=torch.long).view(1, 1, prefix_length)
+        current_position_ids = torch.arange(
+            prefix_length,
+            prefix_length + current_length,
+            dtype=torch.long,
+        ).view(1, 1, current_length)
+
+        prefix_active_mask = torch.ones(1, 1, prefix_length, dtype=torch.bool)
+        current_active_mask = torch.ones(1, 1, current_length, dtype=torch.bool)
+        current_query_indices = torch.arange(current_length)
+
+        with torch.no_grad():
+            for trial_index in range(num_trials):
+                torch.manual_seed(2000 + trial_index)
+                prefix_embeddings = torch.randn(
+                    1,
+                    config.num_mosrah_heads,
+                    prefix_length,
+                    config.hidden_size,
+                )
+                current_embeddings = torch.randn(
+                    1,
+                    config.num_mosrah_heads,
+                    current_length,
+                    config.hidden_size,
+                )
+
+                baseline_cache = MoSRAHCache(
+                    num_mosrah_heads=config.num_mosrah_heads,
+                    head_dim=config.head_dim,
+                    batch_size=1,
+                    device=torch.device("cpu"),
+                    initial_buffer_size=8,
+                )
+                _ = bea(
+                    prefix_embeddings,
+                    prefix_position_ids,
+                    prefix_active_mask,
+                    cache=baseline_cache,
+                )
+                baseline_current_output = bea(
+                    current_embeddings,
+                    current_position_ids,
+                    current_active_mask,
+                    cache=baseline_cache,
+                )
+
+                for logical_source_index in range(total_source_length):
+                    perturbed_prefix_embeddings = prefix_embeddings.clone()
+                    perturbed_current_embeddings = current_embeddings.clone()
+                    perturbation = perturbation_scale * torch.randn(config.hidden_size)
+
+                    if logical_source_index < prefix_length:
+                        perturbed_prefix_embeddings[0, 0, logical_source_index] += perturbation
+                        legal_queries = torch.ones(current_length, dtype=torch.bool)
+                    else:
+                        current_source_index = logical_source_index - prefix_length
+                        perturbed_current_embeddings[0, 0, current_source_index] += perturbation
+                        legal_queries = current_query_indices >= current_source_index
+
+                    perturbed_cache = MoSRAHCache(
+                        num_mosrah_heads=config.num_mosrah_heads,
+                        head_dim=config.head_dim,
+                        batch_size=1,
+                        device=torch.device("cpu"),
+                        initial_buffer_size=8,
+                    )
+                    _ = bea(
+                        perturbed_prefix_embeddings,
+                        prefix_position_ids,
+                        prefix_active_mask,
+                        cache=perturbed_cache,
+                    )
+                    perturbed_current_output = bea(
+                        perturbed_current_embeddings,
+                        current_position_ids,
+                        current_active_mask,
+                        cache=perturbed_cache,
+                    )
+
+                    changed_queries = query_rows_that_changed(
+                        baseline_output=baseline_current_output,
+                        perturbed_output=perturbed_current_output,
+                        change_threshold=change_threshold,
+                    )
+
+                    illegal_queries = ~legal_queries
+
+                    assert not torch.any(changed_queries[illegal_queries]), (
+                        f"Illegal cached influence detected for logical_source_index={logical_source_index} "
+                        f"on trial_index={trial_index}. changed_queries={changed_queries.tolist()} "
+                        f"legal_queries={legal_queries.tolist()}"
+                    )
+
+                    ever_changed[:, logical_source_index] |= changed_queries
+
+        missing_legal_responses = expected_reachability & ~ever_changed
+        assert not torch.any(missing_legal_responses), (
+            "Some legal cached source->current_query pairs never produced any observed response. "
+            f"missing_legal_responses={missing_legal_responses.int().tolist()}"
+        )

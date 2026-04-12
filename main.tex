@@ -179,10 +179,17 @@ Writing the routing process as $R$, the expert-choice packing map as $E$, the to
 
 Here $I \in \mathbb{Z}^{B \times N \times K}$ denotes the selected heads per token, $P \in \mathbb{R}^{B \times N \times K}$ the corresponding routing probabilities, $\tilde{x} \in \mathbb{R}^{B \times L \times T \times d}$ the packed expert-choice representation, and $\tilde{y} \in \mathbb{R}^{B \times N \times K \times d}$ the restored token-choice responses prior to reduction. This architecture was deliberately engineered such that, in the transition from the token-choice form at $x, I$ to the expert-choice form $\tilde{x}$, the expected reduction in average token length $\approx \frac{NK}{L}$ occurs as desired while well load-balanced. Routing, expert-choice packing, and the Bottlenecked Ensemble Attention formulation are discussed in more detail in the Architecture Appendix, \ref{app:architecture}.
 
-\section{Experimental Design}
-\label{sec:experimental_design}
+\section{Methodology}
 
-The empirical goal of the study was to probe whether the tradeoff predicted by theorem \ref{theorem} appears in practice under controlled conditions. To do so, only the total routed head capacity of the sparse routed path was varied across the main comparison runs, while the remainder of the model and training configuration was held fixed unless otherwise noted. Concretely, the MoSRAH path always selected $K=16$ heads per token, while the total number of routed heads was varied across $L \in \{16, 32, 64\}$, corresponding respectively to sparsity ratios $K/L \in \{1.0, 0.5, 0.25\}$. Architectures of [Sizes] were examined.
+The empirical goal of this study was to probe whether the tradeoff predicted by theorem \ref{theorem} appears in practice under controlled conditions. To do so, only the total routed head capacity of the sparse routed path was varied across the main comparison runs, while the remainder of the model and training configuration was held fixed unless otherwise noted. Concretely, the MoSRAH path always selected $K=16$ heads per token, while the total number of routed heads was varied across $L \in \{16, 32, 64\}$, corresponding respectively to sparsity ratios $K/L \in \{1.0, 0.5, 0.25\}$. Architectures of [Sizes] were examined.
+
+\subsubsection{Standards}
+
+Research standards was executed in a theory-first, contract-first manner. The architectural design, theoretical framing, and implementation-relevant details of the apparatus were specified prior to experimental execution as an incomplete paper\footnote{Technically, this paper was written first, then the results were substituted into it when they became available. This is a benefit of theory-first ML}. The system was then implemented against this specification, with LLM assistance used in a contract-realization role rather than as an autonomous design authority with heavy human oversight.
+
+All research and coding was executed to a professional demonstrative standard suitable for reproduction and examination by third parties. Research specified exact hyperparameters and the ways to resolve uncertainties before the LLM build; this is required for LLM contract-first development to be successful. No research or coding was allowed to proceed while any ambiguity was detected; such events were viewed as a hard blocker that had to be documented and resolved by team consensus before the development trajectory could proceed. An exact log of the entire development trajectory as a living document was maintained in the 'plan.md' file in the codebase at all times; this later served as the foundation for the final audit.
+
+\subsection{Experimental Design}
 
 Theorem \ref{theorem} is stated in terms of supported sequence frontier at a fixed performance target. Long-context benchmarks such as RULER, however, report performance at specified sequence lengths rather than directly returning the maximum supported sequence length at a common score threshold. The central experimental-design problem was therefore to map benchmark outputs into a quantity that could serve as a probe of the theorem's predicted frontier behavior.
 \[
@@ -192,42 +199,26 @@ where $N$ denotes sequence length and $A$, $k$, and $B$ are fitted coefficients.
 \[
 N = a\Omega^2 + b\Omega + c.
 \]
-Where $\Omega$ designates parameters assigned to MoSRAH layers in total. Evidence for the predicted tradeoff was sought in regions exhibiting positive slope within the first quadrant, with either sign of curvature permitted. In this way, the experiment did not test theorem \ref{theorem} through raw benchmark scores alone, but through the geometry of the inferred frontier induced by those scores.
-
-All comparison runs were conducted on pretrained SHRAM-based 12-layer width-512 decoders trained on FineWeb-Edu under a shared AdamW regime with learning rate $6\times 10^{-4}$; exact hyperparameters, architectural details, optimization details, tuning notes, and evaluation details are deferred to appendix \ref{app:reproduction}. and how they were constrained can be consulted in appendix \ref{app:LLMs}
-
-\section{Methodology}
-
-The hypothesis was explored by examining varying level of sparsity in the same base model and checking for evidence of more beneficial long-sequence asymptotic behavior. Almost all hyperparameter were identical across all variations, with only the number of total heads allowed to vary.
-
-\subsection{Experimental Design}
-
-Theorem \ref{theorem} would be strongly supported if at the same performance level the spacing between predicted sequences lengths varied largely linearly with the number of parameters under isotoken conditions. Unfortunately, long range benchmarks such as RULER instead test the performance level at a given sequence length. To accommodate this, we instead fit power laws to the score then use the predicted sequence length at the given score and MoSRAH parameters to extrapolate supported sequence length at a single common performance level.
-
-The last checkpoint of pretraining for each model at each seed and each size was examined using RULER at context lengths of of 4k, 8k, 16k, 32k, and 64k; this formed data triplets of sequence length, head parameters, and score. This was then fit per-model-size to the power $score = A*N^{k}+B$ where $N$ is the sequence length and A, k, B are coefficients of the fit. Following this, a range of scores were selected for analysis based on stability of fit,  their associated $N's$ predicted, and a quadratic fit of $N = a\Omega^2 + b\Omega + c$ was performed. Evidence was sought of a region with positive slope, with positive or negative curvature, within the first quadrant. This will be discussed more concretely in results.
+Where $\Omega$ designates parameters assigned to MoSRAH layers in total. Evidence for the predicted tradeoff was sought in regions exhibiting positive slope within the first quadrant, with either sign of curvature permitted. Evidence against the predicted tradeoff would be detected if no such region of increasing slope could be detected on the fit.
 
 \subsection{Model Hyperparameters}
 \label{app:hyperparameters}
 
 [DEVELOPMENT NOTE [STRIP BEFORE PUBLISHING]: Exact parameters may need to vary. The invariant is we have to have the control model somewhere in the 180M-220M range. Exceeding 220M will invalidate the kaplan pretraining numbers and should be considered very carefully before usage.]
 
-The SHRAM layer was located at every location an attention layer would be located in a Llama3 model. The sliding window attention mechanism used a total of 16 heads with head embedding width of 16 and a window size of 128. The MoSRAH layers also each chose $K=16$ heads at head embedding width of 16. The total number of MoSRAH heads were tested at amount of $L$ = 16, 32, and 64  for sparsity ratios of 1.0, 0.5, and 0.25 respectively. SHRAM was specified such that its subcomponents divided compute roughly equally between the local attention formulation and the long-range MoSRAH layers.
+The SHRAM layer was loaded into a Llama3 model. The sliding window attention mechanism used a total of 16 heads with head embedding width of 16 and a window size of 128. The MoSRAH layers also chose $K=16$ heads at head embedding width of 16. The total number of MoSRAH heads were tested at amount of $L$ = 16, 32, and 64 for sparsity ratios of 1.0, 0.5, and 0.25 respectively.\footnote{This configuration was chosen to divide compute roughly equally between the local attention formulation and the long-range MoSRAH layers}
 
-All models were trained at an embedding width of 512, with 12 total decoder layers. A vocabulary size of 50277 was utilized to correlate with the chosen GPT-X Neo BPE tokenizer. A prenorm architecture with RMSNorm was used between all major layers in the style of Llama3. SwiGLU layers were executed at hidden widths of 1366. \footnote{This is the standard $\mathrm{embedding\_width}*\frac{8/3}$ applied at 512}
-
-Dropout was not used, and all long-sequence extrapolation was done using RoPE formulations operating in YaRN extrapolation mode. Details on hyperparameter tuning  -- or the lack of it -- are available in appendix \ref{app:hyperparameter_tuning}
+All models were trained at an embedding width of 512, with 12 total decoder layers. A vocabulary size of 50277 was utilized to correlate with the chosen GPT-X Neo BPE tokenizer. A prenorm architecture with RMSNorm was used between all major layers in the style of Llama3. SwiGLU layers were executed at hidden widths of 1366. \footnote{This is the standard $\mathrm{embedding\_width}*\frac{8/3}$ applied at 512} Dropout was not used, and all long-sequence extrapolation was done using RoPE formulations operating in YaRN extrapolation mode. Details on hyperparameter tuning  -- or the lack of it -- are available in appendix \ref{app:hyperparameter_tuning}
 
 \subsection{Pretraining}
 
-Pretrainined was executed on all models under torch Automatic Mixed Precision in hybrid float32/bfloat16 format at isotoken conditions.
+Pretrainined was executed on all models under torch Automatic Mixed Precision\footnote{This occurred in hybrid float32/bfloat16 format} at isotoken conditions. [Num] models were pretrained on the FineWeb-Edu dataset at the seeds of 44, 45, and 46. (\citep{penedo2024fineweb}) A total of $\approx 655\mathrm{M}$ tokens were processed over the course of 5000 batches for each at a batch size of 128. \footnote{This exceeds the Kaplan recommendations applicable to the small-sized control model. (\citep{kaplan2020scaling})}. Due to the small model size no epochs needed to be repeated.
 
-Pretraining occurred using the FineWeb-Edu dataset at the seeds of 44, 45, and 46. \cite{penedo2024fineweb} A total of $\approx 655\mathrm{M}$ tokens were processed over the course of 5000 batches. \footnote{This exceeds the Kaplan recommendations applicable to the small-sized control model. \cite{kaplan2020scaling}}. Due to the small model size no epochs needed to be repeated.
+Opimization was executed with AdamW optimizer at a learning rate of 6e-4 and betas of $\beta_1=0.9$ and $\beta_2 = 0.99$. Weight decay was set to a strength of $1e-1$. Gradient clipping occurred at a value of 1.0. A cosine annealing schedule from 6e-4 to 6e-5 was used with a warmup period of 500 batches. The main loss was cross-entropy configured for causal next-token-prediction in a teacher-forced configuration. The auxiliary loss for load balancing was weighed by 1e-2 before addition to the main loss following which backpropagation occurred. (\citep{fedus2021switch})
 
-The AdamW optimizer was used for training at a learning rate of 6e-4 and betas of $\beta_1=0.9$ and $\beta_2 = 0.99$. Weight decay was set to a strength of  $1e-1$. Gradient clipping occurred at a value of 1.0. A cosine annealing schedule from 6e-4 to 6e-5 was used with a warmup period of 500 batches. \cite{radford2019language}. The main loss was cross-entropy configured for causal next-token-prediction in a teacher-forced configuration. The auxiliary loss for load balancing was weighed by 1e-2 before addition to the main loss following which backpropagation occurred. \cite{fedus2021switch}
+Checkpoints were taken at every 1000 batches. Evaluation loss, accuracy, perplexity, wall time delta, and the MaxVio\footnote{Consult appendix \ref{app:maxvio} for more details on this definition, or alternatively the original source at \citet{wang2024auxiliarylossfree}} load balancing metric was taken every 200 batches. Due to the limited computational resource\footnote{The pretraining budget was 100\$} available an an anomaly recovery strategy \footnote{Consult appendix \ref{app:anomaly_recovery} for a clear definition} was utilized to not waste any pretraining run, even if it might degrade the data. This proved [necessary/not\_necessary]. Training occurred on [Hardware] for [Time].
 
-Checkpoints were taken at every 1000 batches. Evaluation loss, accuracy, perplexity, wall time delta, and the MaxVio\footnote{Consult appendix \ref{app:maxvio} for more details on this definition, or alternatively the original source at Wang\cite{wang2024auxiliarylossfree}} load balancing metric was taken every 200 batches. Due to the limited resources available anomaly recovery\footnote{Consult appendix \ref{app:anomaly_recovery} for a clear definition} was utilized to not waste any pretraining run. Any observation of a gradient norm above 1.5 resulted in a permanent halving of the effective learning rate. A MaxVio score exceeding 0.5 correspondingly permanently doubled the load balancing rate for the rest of training. This was [Used/Not Used].
-
-Training occurred on [Hardware] for [Time].
+\subsubsection{Processes and Auditing}
 
 
 \section{Results}
@@ -519,7 +510,7 @@ All of $H$, $\Pi$, and $\Pi^{-1}$ are required auxiliary data for the downstream
 
 \subsubsection{Expert Packing}
 
-Expert packing needs to fulfill three primary dependencies. It needs to produce a packed object $x' \in \mathbb{R}^{B \times L \times T \times d}$, corresponding to the expert-choice tensor $\tilde{x}$ in the main text, with the quirk that this may require extra padding. It must also produce a positional encoding tensor $J' \in \mathbb{Z}^{B \times L \times T}$ from the original encodings $J \in \mathbb{B \times N}$ that are passed into it. This is required for the functioning of rope. Finally all additional dependencies needed for unpacking and masking are required as well.
+Expert packing needs to fulfill three primary dependencies. It needs to produce a packed object $x' \in \mathbb{R}^{B \times L \times T \times d}$, corresponding to the expert-choice tensor $\tilde{x}$ in the main text, with the quirk that this may require extra padding. It must also produce a positional indexing tensor $J' \in \mathbb{Z}^{B \times L \times T}$ from the original positional indexing tensor $J \in \mathbb{Z}^{B \times N}$ that are passed into it. This is required for the functioning of rope. Finally all additional dependencies needed for unpacking and masking are required as well.
 
 We generate internally by arange, followed by expansion, a positions-indication tensor $U \in \mathbb{Z}^{B \times N \times K}$; the arange is against the N dimension. This now is a vector indexing operation which would, if gathered against a (B x N) tensor replicate it into a (B x N x K) tensor and is correlated with the sequence to draw against. This is now flattened for compatibility with the reording tensor $\Pi$
 
@@ -565,10 +556,10 @@ What remains to be formed is the mask to perform the transfer. We first define $
 M_{b,l,t} = A_t < S_{b,l}.
 \]
 
-This now has exactly $B \times N \times K$ true entries, and active tokens are left-justified; it is in essence the active token mask. However, it is not directly compatible with $\tilde{x}$ and $\tilde{P}$. These two tensors are of shape $(B, N \times K, d)$ and $(B, N \times K)$ respectively. However, masked transfers must be done with 1d tensors. As such a small additional reshape is necessary.\footnote{This can safely be executed as a view for memory efficiency.}
+This now has exactly $B \times N \times K$ true entries, and active tokens are left-justified; it is in essence the active token mask. However, it is not directly compatible with $\tilde{x}$ and $\tilde{J}$. These two tensors are of shape $(B, N \times K, d)$ and $(B, N \times K)$ respectively. However, masked transfers must be done with 1d indexing regions. As such a small additional reshape is necessary.\footnote{This can safely be executed as a view for memory efficiency.}
 
 \[
-\tilde{P}' = \mathrm{Reshape}(\tilde{P}) \in \mathbb{Z}^{B* N * K},
+\tilde{J}' = \mathrm{Reshape}(\tilde{J}) \in \mathbb{Z}^{B* N * K},
 \qquad
 \tilde{x}' = \mathrm{Reshape}(\tilde{x}) \in \mathbb{R}^{B * N * K \times d}.
 \]
@@ -578,7 +569,7 @@ which finally allows a like-to-like insert into the output buffers using advance
 \[
 x'[M] = \tilde{x}',
 \qquad
-J[M] = \tilde{P}'.
+J'[M] = \tilde{J}'.
 \]
 
 The output of this packing functionality are $x'$, $J'$, and $M$, with $M$ being required for unpacking later. Notably, $M$ could also easily be adapted in other noncausal models to provide masking.

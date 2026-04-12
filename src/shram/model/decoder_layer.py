@@ -1,20 +1,23 @@
 """Decoder layer — a single transformer block.
 
-Each block applies pre-norm attention followed by pre-norm MLP, with residual
-connections around both sublayers:
+Each block applies pre-norm hybrid attention followed by pre-norm MLP, with
+residual connections around both sublayers:
 
-    normed = RMSNorm(x)
-    h      = x + Attention(normed, ...)
-    normed = RMSNorm(h)
-    out    = h + MLP(normed)
+    normed_attn = RMSNorm(x)
+    attn_out, load_balance_loss = SHRAMHybridLayer(normed_attn, ...)
+    h = x + attn_out
+
+    normed_mlp = RMSNorm(h)
+    mlp_out = SwiGLUMLP(normed_mlp)
+    out = h + mlp_out
 
 Pre-norm keeps the residual stream unnormalised. Gradients flow more cleanly
 through unnormalised residuals at depth, and each sublayer receives a stable,
 normalised view of the signal.
 
-Two independent RMSNorm instances are used — one before attention, one before MLP.
-They learn different scalings because they precede layers with different dynamic
-ranges. Sharing them would be wrong.
+Two independent RMSNorm instances are used — one before attention, one before
+MLP. They learn different scalings because they precede layers with different
+dynamic ranges. Sharing them would be wrong.
 
 torch.nn.RMSNorm is used directly (available from PyTorch 2.4+). It omits mean
 subtraction, is faster than LayerNorm, and proved more stable at scale.
@@ -22,54 +25,56 @@ subtraction, is faster than LayerNorm, and proved more stable at scale.
 
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
-from transformers.cache_utils import Cache
 
-#from .attention import GroupedQueryAttention
+from .attention.shram import SHRAMHybridLayer
+from .cache.shram_layer_cache import ShramLayerCache
+from .configuration import ShramConfig
 from .mlp import SwiGLUMLP
 
 
 class DecoderLayer(nn.Module):
-    """A single pre-norm transformer decoder block.
+    """A single pre-norm SHRAM decoder block.
 
-    Composes GroupedQueryAttention and SwiGLUMLP with residual connections and
+    Composes SHRAMHybridLayer and SwiGLUMLP with residual connections and
     independent RMSNorm instances on each sublayer input.
 
     Args:
-        config: Model config passed through to attention and MLP. Must also expose
-            ``hidden_size`` and ``rms_norm_eps``.
+        config: SHRAM config. Must expose ``hidden_size`` and ``rms_norm_eps``
+            in addition to the fields required by SHRAMHybridLayer and
+            SwiGLUMLP.
     """
 
-    def __init__(self, config: PretrainedConfig) -> None:
+    def __init__(self, config: ShramConfig) -> None:
         super().__init__()
         self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp_norm  = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attention = GroupedQueryAttention(config)
-        self.mlp       = SwiGLUMLP(config)
+        self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention = SHRAMHybridLayer(config)
+        self.mlp = SwiGLUMLP(config)
 
     def forward(
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
-        cache: Cache | None = None,
-        layer_idx: int = 0,
-        causal_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        cache: ShramLayerCache | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply one decoder block to the input.
 
         Args:
             x: Input of shape (batch, seq_len, hidden_size).
-            position_ids: Absolute positions of shape (batch, seq_len).
-            cache: HuggingFace Cache object for KV accumulation, or None when
-                caching is disabled. Passed through to attention unchanged.
-            layer_idx: Cache slot index for this layer. Each layer has its own
-                index so they accumulate independently within the shared cache.
-            causal_mask: Optional boolean attention mask of shape
-                (1, 1, seq_len, kv_len). Passed through to attention unchanged.
+            position_ids: Authoritative positions of shape (batch, seq_len).
+            cache: Optional per-layer SHRAM cache passed through to the hybrid
+                attention layer unchanged.
 
         Returns:
-            Output tensor of shape (batch, seq_len, hidden_size).
+            output: Tensor of shape (batch, seq_len, hidden_size).
+            load_balance_loss: Scalar sparse-path load-balance loss propagated
+                from SHRAMHybridLayer.
         """
-        attn_out = self.attention(self.attn_norm(x), position_ids, cache, layer_idx, causal_mask)
-        h = x + attn_out
-        return h + self.mlp(self.mlp_norm(h))
+        attn_out, load_balance_loss = self.attention(
+            hidden_states=self.attn_norm(x),
+            position_ids=position_ids,
+            cache=cache,
+        )
+        hidden_states = x + attn_out
+        output = hidden_states + self.mlp(self.mlp_norm(hidden_states))
+        return output, load_balance_loss

@@ -1,21 +1,16 @@
 """Tests for ShramModel.
 
-Verifies the invariants documented in plan.md. Tests are scoped to the backbone
-only — decoder layer and attention correctness are covered by their own unit tests
-and are not replicated here.
-
-The backbone accepts pre-embedded inputs (inputs_embeds), not token IDs. Tests
-construct random float tensors of shape (batch, seq_len, hidden_size) directly,
-which is the correct interface.
-
-ShramModel is a plain nn.Module. It returns a plain dict. No HF lifecycle
-machinery (post_init, _init_weights, save/load) is present or tested here.
+Unit 13 coverage strategy:
+- real runtime smoke tests at the backbone public boundary
+- preserved output-dict and hidden-state contract checks
+- no fake decoder layers
+- no handwritten alternate forward path
+- no brittle internal seam instrumentation
 """
 
 import torch
-import pytest
-from transformers import DynamicCache
 
+from src.shram.model.cache.shram_cache import ShramCache
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.model import ShramModel
 
@@ -24,135 +19,122 @@ from src.shram.model.model import ShramModel
 # Helpers
 # ---------------------------------------------------------------------------
 
-def small_config(**kwargs) -> ShramConfig:
-    """Minimal-dimension config for fast tests."""
-    defaults = dict(
-        hidden_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        vocab_size=256,
+def small_config(**overrides) -> ShramConfig:
+    """Construct a small SHRAM config for fast backbone tests."""
+    config_kwargs = dict(
+        vocab_size=128,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=3,
+        num_sliding_window_heads=2,
+        num_mosrah_heads=5,
+        num_selected_heads=2,
+        head_dim=4,
+        window_size=4,
+        rope_mode="main_sequence",
+        local_rope_theta=10000.0,
+        mosrah_rope_theta=10000.0,
+        training_sequence_length=16,
+        inference_sequence_length=16,
+        alpha=1.0,
+        beta=32.0,
+        attention_dropout=0.0,
+        rms_norm_eps=1e-5,
+        use_cache=True,
     )
-    defaults.update(kwargs)
-    return ShramConfig(**defaults)
+    config_kwargs.update(overrides)
+    return ShramConfig(**config_kwargs)
 
 
-def random_embeds(batch: int, seq_len: int, hidden_size: int) -> torch.Tensor:
-    """Random float tensor standing in for pre-embedded inputs."""
-    return torch.randn(batch, seq_len, hidden_size)
+def make_model(
+    config: ShramConfig,
+    seed: int = 0,
+) -> ShramModel:
+    """Construct a deterministically initialized ShramModel."""
+    torch.manual_seed(seed)
+    return ShramModel(config).eval()
 
 
-def pos_ids(batch: int, seq_len: int, offset: int = 0) -> torch.Tensor:
-    """Absolute position ids of shape (batch, seq_len) starting from offset."""
-    return torch.arange(offset, offset + seq_len).unsqueeze(0).expand(batch, -1)
+def random_embeds(
+    batch_size: int,
+    sequence_length: int,
+    hidden_size: int,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Construct deterministic random pre-embedded inputs."""
+    random_generator = torch.Generator(device="cpu")
+    random_generator.manual_seed(seed)
+    return torch.randn(
+        batch_size,
+        sequence_length,
+        hidden_size,
+        generator=random_generator,
+    )
 
 
-def make_causal_mask(cache_position: torch.Tensor, k_len: int) -> torch.Tensor:
-    """Build a boolean causal mask of shape (1, 1, q_len, k_len).
+def position_ids(
+    batch_size: int,
+    sequence_length: int,
+    offset: int = 0,
+) -> torch.Tensor:
+    """Construct authoritative absolute position ids."""
+    return torch.arange(
+        offset,
+        offset + sequence_length,
+        dtype=torch.long,
+    ).unsqueeze(0).expand(batch_size, -1)
 
-    True at (q, k) means query q may attend to key k. Required for any decode
-    step where q_len < k_len — is_causal=True is only correct for square Q×K.
-    """
-    k_positions = torch.arange(k_len)
-    return (k_positions[None, :] <= cache_position[:, None]).unsqueeze(0).unsqueeze(0)
 
-
-@pytest.fixture
-def model() -> ShramModel:
-    return ShramModel(small_config()).eval()
+def make_cache(
+    config: ShramConfig,
+    batch_size: int,
+    initial_buffer_size: int = 8,
+) -> ShramCache:
+    """Construct a real top-level ShramCache."""
+    return ShramCache(
+        num_hidden_layers=config.num_hidden_layers,
+        sliding_window=config.window_size,
+        num_mosrah_heads=config.num_mosrah_heads,
+        mosrah_head_dim=config.head_dim,
+        batch_size=batch_size,
+        device=torch.device("cpu"),
+        initial_buffer_size=initial_buffer_size,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Output shape
+# Output contract
 # ---------------------------------------------------------------------------
 
-class TestOutputShape:
-    def test_last_hidden_state_shape(self, model):
-        """last_hidden_state must be (batch, seq_len, hidden_size)."""
-        embeds = random_embeds(2, 8, model.config.hidden_size)
-        out = model(embeds, pos_ids(2, 8))
-        assert out["last_hidden_state"].shape == (2, 8, model.config.hidden_size)
+class TestOutputContract:
+    def test_forward_returns_expected_output_dict_keys(self):
+        """ShramModel should expose the preserved output keys plus load_balance_loss."""
+        config = small_config()
+        model = make_model(config, seed=0)
 
-    def test_single_token_shape(self, model):
-        """Shape is correct for a single-token input — the typical generation step."""
-        embeds = random_embeds(1, 1, model.config.hidden_size)
-        out = model(embeds, pos_ids(1, 1))
-        assert out["last_hidden_state"].shape == (1, 1, model.config.hidden_size)
+        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=1)
+        out = model(inputs_embeds, position_ids(1, 4))
 
-
-# ---------------------------------------------------------------------------
-# Return type
-# ---------------------------------------------------------------------------
-
-class TestReturnType:
-    def test_returns_dict(self, model):
-        """forward() must return a plain dict, not a HF ModelOutput subclass."""
-        out = model(random_embeds(1, 4, model.config.hidden_size), pos_ids(1, 4))
         assert type(out) is dict
+        assert set(out.keys()) == {
+            "last_hidden_state",
+            "past_key_values",
+            "hidden_states",
+            "load_balance_loss",
+        }
 
-    def test_dict_has_expected_keys(self, model):
-        """Output dict must contain exactly the documented keys."""
-        out = model(random_embeds(1, 4, model.config.hidden_size), pos_ids(1, 4))
-        assert set(out.keys()) == {"last_hidden_state", "past_key_values", "hidden_states"}
+    def test_last_hidden_state_shape_and_load_balance_loss_scalar_are_valid(self):
+        """Real forward should preserve shape and return a finite scalar auxiliary loss."""
+        config = small_config()
+        model = make_model(config, seed=0)
 
+        inputs_embeds = random_embeds(2, 5, config.hidden_size, seed=2)
+        out = model(inputs_embeds, position_ids(2, 5))
 
-# ---------------------------------------------------------------------------
-# KV cache
-# ---------------------------------------------------------------------------
-
-class TestKVCache:
-    def test_with_cache_returns_populated_cache(self, model):
-        """When a DynamicCache is provided, it must be returned populated with
-        one entry per decoder layer.
-        """
-        embeds = random_embeds(1, 4, model.config.hidden_size)
-        cache = DynamicCache()
-        out = model(embeds, pos_ids(1, 4), past_key_values=cache)
-        assert out["past_key_values"] is cache
-        assert len(out["past_key_values"]) == model.config.num_hidden_layers
-
-    def test_without_cache_returns_none(self, model):
-        """When no cache is provided, past_key_values must be None in the output."""
-        embeds = random_embeds(1, 4, model.config.hidden_size)
-        out = model(embeds, pos_ids(1, 4))
-        assert out["past_key_values"] is None
-
-    def test_cached_generation_matches_full_forward(self, model):
-        """Hidden state at the final position via cached generation must equal
-        the same position from a full forward pass over the complete sequence.
-
-        This is the core correctness guarantee of the KV cache: caching must not
-        change what the model computes, only how efficiently it computes it.
-
-        The decode step requires an explicit causal mask: is_causal=True is only
-        correct for square Q×K matrices (prefill). For a single-token decode step
-        (q_len=1, k_len=5), PyTorch's built-in is_causal uses upper-left alignment
-        and gives wrong results.
-        """
-        torch.manual_seed(0)
-        seq = 5
-        embeds = random_embeds(1, seq, model.config.hidden_size)
-
-        with torch.no_grad():
-            full_hs = model(embeds, pos_ids(1, seq))["last_hidden_state"]
-
-        with torch.no_grad():
-            prefill = model(embeds[:, :-1, :], pos_ids(1, seq - 1), past_key_values=DynamicCache())
-
-        # The decode token sits at absolute position seq-1; k_len = seq after update.
-        past_len = prefill["past_key_values"].get_seq_length(0)
-        decode_mask = make_causal_mask(torch.tensor([past_len]), k_len=seq)
-
-        with torch.no_grad():
-            step = model(
-                embeds[:, -1:, :],
-                pos_ids(1, 1, offset=past_len),
-                past_key_values=prefill["past_key_values"],
-                causal_mask=decode_mask,
-            )
-
-        torch.testing.assert_close(step["last_hidden_state"][:, 0, :], full_hs[:, -1, :])
+        assert out["last_hidden_state"].shape == (2, 5, config.hidden_size)
+        assert out["load_balance_loss"].ndim == 0
+        assert torch.isfinite(out["last_hidden_state"]).all()
+        assert torch.isfinite(out["load_balance_loss"])
 
 
 # ---------------------------------------------------------------------------
@@ -160,20 +142,72 @@ class TestKVCache:
 # ---------------------------------------------------------------------------
 
 class TestHiddenStates:
-    def test_output_hidden_states_false_returns_none(self, model):
-        embeds = random_embeds(1, 4, model.config.hidden_size)
-        out = model(embeds, pos_ids(1, 4), output_hidden_states=False)
+    def test_output_hidden_states_false_returns_none(self):
+        """The hidden_states field should remain None unless explicitly requested."""
+        config = small_config()
+        model = make_model(config, seed=0)
+
+        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=3)
+        out = model(
+            inputs_embeds,
+            position_ids(1, 4),
+            output_hidden_states=False,
+        )
+
         assert out["hidden_states"] is None
 
-    def test_output_hidden_states_true_correct_count(self, model):
-        """Must return inputs_embeds plus one tensor per decoder layer."""
-        embeds = random_embeds(1, 4, model.config.hidden_size)
-        out = model(embeds, pos_ids(1, 4), output_hidden_states=True)
-        assert len(out["hidden_states"]) == model.config.num_hidden_layers + 1
+    def test_output_hidden_states_true_returns_inputs_plus_one_entry_per_layer(self):
+        """The hidden_states tuple should preserve the backbone's existing count semantics."""
+        config = small_config()
+        model = make_model(config, seed=0)
 
-    def test_output_hidden_states_correct_shape(self, model):
-        """Every collected hidden state must have shape (batch, seq_len, hidden_size)."""
-        embeds = random_embeds(1, 4, model.config.hidden_size)
-        out = model(embeds, pos_ids(1, 4), output_hidden_states=True)
-        for hs in out["hidden_states"]:
-            assert hs.shape == (1, 4, model.config.hidden_size)
+        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=4)
+        out = model(
+            inputs_embeds,
+            position_ids(1, 4),
+            output_hidden_states=True,
+        )
+
+        hidden_states = out["hidden_states"]
+
+        assert len(hidden_states) == config.num_hidden_layers + 1
+        torch.testing.assert_close(hidden_states[0], inputs_embeds)
+
+        for hidden_state in hidden_states:
+            assert hidden_state.shape == (1, 4, config.hidden_size)
+
+
+# ---------------------------------------------------------------------------
+# Cache boundary
+# ---------------------------------------------------------------------------
+
+class TestCacheBoundary:
+    def test_without_cache_returns_none_for_past_key_values(self):
+        """The no-cache backbone contract should remain unchanged."""
+        config = small_config()
+        model = make_model(config, seed=0)
+
+        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=5)
+        out = model(
+            inputs_embeds,
+            position_ids(1, 4),
+            cache=None,
+        )
+
+        assert out["past_key_values"] is None
+
+    def test_with_cache_returns_same_top_level_shram_cache_object(self):
+        """ShramModel should return the same top-level cache object it was given."""
+        config = small_config()
+        model = make_model(config, seed=0)
+
+        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=6)
+        cache = make_cache(config, batch_size=1)
+
+        out = model(
+            inputs_embeds,
+            position_ids(1, 4),
+            cache=cache,
+        )
+
+        assert out["past_key_values"] is cache

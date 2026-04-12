@@ -107,7 +107,7 @@ class BottleneckedEnsembleAttention(nn.Module):
         key_states = torch.einsum("bltd,ldu->bltu", packed_embeddings, self.k_proj)
         value_states = torch.einsum("bltd,ldu->bltu", packed_embeddings, self.v_proj)
 
-        query_states, rotated_key_states, attention_scaling = self.rope(
+        rotated_query_states, rotated_key_states, attention_scaling = self.rope(
             query_states,
             key_states,
             position_ids,
@@ -135,25 +135,20 @@ class BottleneckedEnsembleAttention(nn.Module):
             key_states = rotated_key_states
             key_active_mask = active_mask
 
-        # Flex attention is capable of skipping the flops that
-        # would otherwise be spent on the junk keys and queries
-        # This is used to heavy advantage.
-
         block_mask = self._make_block_mask(
-            query_active_mask=active_mask,
-            key_active_mask=key_active_mask,
-            num_tokens_processed=num_tokens_processed,
-            query_length=query_length,
-            key_length=key_states.shape[2],
-            device=packed_embeddings.device,
-        )
-
+             query_active_mask=active_mask,
+             key_active_mask=key_active_mask,
+             num_tokens_processed=num_tokens_processed,
+             query_length=query_length,
+             key_length=key_states.shape[2],
+             device=packed_embeddings.device,
+         )
         attended_states = flex_attention(
-            query_states,
-            key_states,
-            value_states,
-            block_mask=block_mask,
-            scale=attention_scaling / math.sqrt(self.head_dim),
+             rotated_query_states,
+             key_states,
+             value_states,
+             block_mask=block_mask,
+             scale=attention_scaling / math.sqrt(self.head_dim),
         )
 
         # Project back to model width:

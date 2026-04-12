@@ -1,24 +1,17 @@
-"""Tests for DecoderLayer.
+"""Smoke tests for DecoderLayer.
 
-Verifies shape, independent RMSNorm instances, residual connections, and that
-attention and MLP are correctly integrated (output feeds through both paths).
+Unit 12 coverage strategy:
+- light inspection guards for obvious structural ownership
+- real runtime smoke tests at the DecoderLayer public boundary
+- no re-proof of Unit 11 attention semantics or brittle symbolic rewrites
 """
 
 import torch
-from transformers import DynamicCache
 
+from src.shram.model.attention.shram import SHRAMHybridLayer
+from src.shram.model.cache.shram_layer_cache import ShramLayerCache
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.decoder_layer import DecoderLayer
-
-
-def make_causal_mask(cache_position: torch.Tensor, k_len: int) -> torch.Tensor:
-    """Build a boolean causal mask of shape (1, 1, q_len, k_len).
-
-    Required for decode steps where q_len < k_len — is_causal=True is only
-    correct for square Q×K matrices.
-    """
-    k_positions = torch.arange(k_len)
-    return (k_positions[None, :] <= cache_position[:, None]).unsqueeze(0).unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
@@ -27,146 +20,216 @@ def make_causal_mask(cache_position: torch.Tensor, k_len: int) -> torch.Tensor:
 
 def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
-        hidden_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        intermediate_size=128,
+        vocab_size=128,
+        hidden_size=8,
+        intermediate_size=16,
         num_hidden_layers=2,
+        num_sliding_window_heads=2,
+        num_mosrah_heads=5,
+        num_selected_heads=2,
+        head_dim=4,
+        window_size=4,
+        rope_mode="main_sequence",
+        local_rope_theta=10000.0,
+        mosrah_rope_theta=10000.0,
+        training_sequence_length=16,
+        inference_sequence_length=16,
+        alpha=1.0,
+        beta=32.0,
+        attention_dropout=0.0,
         rms_norm_eps=1e-5,
+        use_cache=True,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
 
 
+def make_layer(
+    config: ShramConfig,
+    seed: int = 0,
+) -> DecoderLayer:
+    torch.manual_seed(seed)
+    return DecoderLayer(config)
+
+
 def make_input(
     config: ShramConfig,
     batch: int = 2,
-    seq: int = 8,
+    seq: int = 4,
+    seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    x = torch.randn(batch, seq, config.hidden_size)
-    position_ids = torch.arange(seq).unsqueeze(0).expand(batch, -1)
+    random_generator = torch.Generator(device="cpu")
+    random_generator.manual_seed(seed)
+
+    x = torch.randn(
+        batch,
+        seq,
+        config.hidden_size,
+        generator=random_generator,
+    )
+    position_ids = torch.arange(seq, dtype=torch.long).unsqueeze(0).expand(batch, -1)
     return x, position_ids
 
 
+def make_layer_cache(
+    config: ShramConfig,
+    batch_size: int,
+    initial_buffer_size: int = 8,
+) -> ShramLayerCache:
+    return ShramLayerCache(
+        sliding_window=config.window_size,
+        num_mosrah_heads=config.num_mosrah_heads,
+        mosrah_head_dim=config.head_dim,
+        batch_size=batch_size,
+        device=torch.device("cpu"),
+        initial_buffer_size=initial_buffer_size,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Shape
+# Inspection guards
 # ---------------------------------------------------------------------------
 
-class TestShape:
-    def test_output_shape_matches_input(self):
-        """Input and output shapes must be identical."""
+class TestInspectionGuards:
+    def test_decoder_layer_uses_shram_hybrid_layer(self):
+        """DecoderLayer must wire in SHRAMHybridLayer, not legacy GQA."""
         config = small_config()
-        layer = DecoderLayer(config)
-        x, position_ids = make_input(config)
-        out = layer(x, position_ids)
-        assert out.shape == x.shape
+        layer = make_layer(config)
 
+        assert isinstance(layer.attention, SHRAMHybridLayer)
 
-# ---------------------------------------------------------------------------
-# Normalisation
-# ---------------------------------------------------------------------------
-
-class TestNormalisation:
-    def test_two_independent_rms_norms(self):
-        """attn_norm and mlp_norm must be distinct objects with separate parameters."""
+    def test_two_rms_norms_do_not_alias_parameter_storage(self):
+        """The two RMSNorm instances must have distinct learnable parameters."""
         config = small_config()
-        layer = DecoderLayer(config)
+        layer = make_layer(config)
+
         assert layer.attn_norm is not layer.mlp_norm
         assert layer.attn_norm.weight.data_ptr() != layer.mlp_norm.weight.data_ptr()
 
 
 # ---------------------------------------------------------------------------
-# Residual connections
+# Runtime smoke tests
 # ---------------------------------------------------------------------------
 
-class TestResidualConnections:
-    def test_attention_residual_is_present(self):
-        """Zeroing the attention sublayer output must not zero the full output.
-
-        With a residual connection, output = x + attn(norm(x)) + ..., so even if
-        attn produces zero, x still flows through. Without the residual, output
-        would depend solely on attn.
-        """
+class TestRuntimeSmoke:
+    def test_real_forward_returns_valid_output_and_scalar_load_balance_loss(self):
+        """DecoderLayer should preserve (B, N, d) and return finite scalar loss."""
         config = small_config()
-        layer = DecoderLayer(config)
-        layer.eval()
+        layer = make_layer(config, seed=0)
+        x, position_ids = make_input(config, batch=2, seq=4, seed=1)
 
-        # Zero all attention projection weights so attn always outputs zero.
-        for proj in (layer.attention.q_proj, layer.attention.k_proj,
-                     layer.attention.v_proj, layer.attention.o_proj):
-            torch.nn.init.zeros_(proj.weight)
+        output, load_balance_loss = layer(
+            x,
+            position_ids,
+            cache=None,
+        )
 
-        x, position_ids = make_input(config, batch=1, seq=4)
-        out = layer(x, position_ids)
+        assert output.shape == x.shape
+        assert load_balance_loss.ndim == 0
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(load_balance_loss)
 
-        # Output must not be zero — x flows through the residual.
-        assert not torch.all(out == 0)
-
-    def test_mlp_residual_is_present(self):
-        """Zeroing the MLP sublayer output must not zero the full output."""
+    def test_output_responds_to_input_perturbation(self):
+        """A real DecoderLayer should not be dead or bypassed with respect to x."""
         config = small_config()
-        layer = DecoderLayer(config)
-        layer.eval()
+        layer = make_layer(config, seed=0)
+        x, position_ids = make_input(config, batch=1, seq=4, seed=2)
 
-        # Zero all MLP weights so MLP always outputs zero.
-        for proj in (layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
-            torch.nn.init.zeros_(proj.weight)
+        baseline_output, baseline_load_balance_loss = layer(
+            x,
+            position_ids,
+            cache=None,
+        )
 
-        x, position_ids = make_input(config, batch=1, seq=4)
-        out = layer(x, position_ids)
+        perturbed_x = x.clone()
+        perturbed_x[:, 2, :] += 0.5
 
-        assert not torch.all(out == 0)
+        perturbed_output, perturbed_load_balance_loss = layer(
+            perturbed_x,
+            position_ids,
+            cache=None,
+        )
 
-    def test_removing_residual_changes_output(self):
-        """If residuals are bypassed, the output must differ from the full forward.
+        assert not torch.allclose(
+            baseline_output,
+            perturbed_output,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        assert torch.isfinite(baseline_load_balance_loss)
+        assert torch.isfinite(perturbed_load_balance_loss)
 
-        Verifies by monkey-patching forward to skip the residual addition and
-        confirming the outputs diverge.
-        """
+    def test_output_responds_to_position_change_on_at_least_one_deterministic_seed(self):
+        """Changing positions should affect the real DecoderLayer on at least one fixed input seed."""
         config = small_config()
-        layer = DecoderLayer(config)
-        layer.eval()
-        torch.manual_seed(0)
+        layer = make_layer(config, seed=0)
 
-        x, position_ids = make_input(config, batch=1, seq=4)
-        out_with_residual = layer(x, position_ids)
+        position_ids_a = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+        position_ids_b = torch.tensor([[0, 3, 6, 9]], dtype=torch.long)
 
-        # Patch: replace forward with a version that drops the residual additions.
-        def no_residual_forward(x, position_ids, cache=None, layer_idx=0):
-            attn_out = layer.attention(layer.attn_norm(x), position_ids, cache, layer_idx)
-            h = attn_out  # no residual
-            return layer.mlp(layer.mlp_norm(h))  # no residual
+        successful_distinctions = 0
+        input_seeds = list(range(10))
 
-        out_no_residual = no_residual_forward(x, position_ids)
+        for input_seed in input_seeds:
+            x, _ = make_input(config, batch=1, seq=4, seed=input_seed)
 
-        assert not torch.allclose(out_with_residual, out_no_residual)
+            output_a, _ = layer(
+                x,
+                position_ids_a,
+                cache=None,
+            )
+            output_b, _ = layer(
+                x,
+                position_ids_b,
+                cache=None,
+            )
 
+            outputs_are_distinct = not torch.allclose(
+                output_a,
+                output_b,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+            successful_distinctions += int(outputs_are_distinct)
 
-# ---------------------------------------------------------------------------
-# Integration
-# ---------------------------------------------------------------------------
+        assert successful_distinctions >= 1, (
+            "Changing position_ids never changed the DecoderLayer output across the fixed seed set. "
+            f"successful_distinctions={successful_distinctions}, total_trials={len(input_seeds)}"
+        )
 
-class TestIntegration:
-    def test_kv_cache_passes_through(self):
-        """KV cache updated during the layer must be usable in the next step."""
+    def test_real_cache_passthrough_smoke(self):
+        """A real per-layer SHRAM cache should pass cleanly through DecoderLayer."""
         config = small_config()
-        layer = DecoderLayer(config)
-        layer.eval()
-        torch.manual_seed(1)
+        layer = make_layer(config, seed=0)
 
-        x = torch.randn(1, 4, config.hidden_size)
-        pos_full = torch.arange(4).unsqueeze(0)
-        out_full = layer(x, pos_full)
+        x, position_ids = make_input(config, batch=1, seq=4, seed=3)
+        prefix_x = x[:, :2]
+        prefix_position_ids = position_ids[:, :2]
+        current_x = x[:, 2:]
+        current_position_ids = position_ids[:, 2:]
 
-        # Prefill first 2 tokens, then generate tokens 2 and 3 with cache.
-        # Decode steps require explicit causal masks — is_causal=True is wrong
-        # for non-square Q×K (see test_attention.py for the full explanation).
-        cache = DynamicCache()
-        layer(x[:, :2, :], torch.arange(2).unsqueeze(0), cache=cache, layer_idx=0)
-        mask_2 = make_causal_mask(torch.tensor([2]), k_len=3)
-        out_2 = layer(x[:, 2:3, :], torch.tensor([[2]]), cache=cache, layer_idx=0, causal_mask=mask_2)
-        mask_3 = make_causal_mask(torch.tensor([3]), k_len=4)
-        out_3 = layer(x[:, 3:4, :], torch.tensor([[3]]), cache=cache, layer_idx=0, causal_mask=mask_3)
+        layer_cache = make_layer_cache(
+            config,
+            batch_size=1,
+            initial_buffer_size=8,
+        )
 
-        torch.testing.assert_close(out_2, out_full[:, 2:3, :])
-        torch.testing.assert_close(out_3, out_full[:, 3:4, :])
+        prefix_output, prefix_load_balance_loss = layer(
+            prefix_x,
+            prefix_position_ids,
+            cache=layer_cache,
+        )
+        current_output, current_load_balance_loss = layer(
+            current_x,
+            current_position_ids,
+            cache=layer_cache,
+        )
+
+        assert prefix_output.shape == prefix_x.shape
+        assert current_output.shape == current_x.shape
+        assert prefix_load_balance_loss.ndim == 0
+        assert current_load_balance_loss.ndim == 0
+        assert torch.isfinite(prefix_output).all()
+        assert torch.isfinite(current_output).all()
+        assert torch.isfinite(prefix_load_balance_loss)
+        assert torch.isfinite(current_load_balance_loss)

@@ -320,7 +320,9 @@ class TestStableSortBehavior:
 
         for expert_idx in range(num_experts):
             active_positions = packed_positions[0, expert_idx][active_mask[0, expert_idx]]
-            assert torch.all(active_positions[1:] >= active_positions[:-1])
+            # Strictly increasing: each token has a unique position and routing assigns
+            # each token to K distinct experts, so no token appears twice in one bucket.
+            assert torch.all(active_positions[1:] > active_positions[:-1])
 
     def test_deliberately_unstable_alternative_breaks_causal_order(self):
         """A non-stable expert-major ordering should fail the causal-order invariant."""

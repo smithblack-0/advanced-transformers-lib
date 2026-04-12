@@ -42,10 +42,12 @@ is being achieved, one verified unit at a time.
 - [X] Unit 10.A (Blocker) - Expert packing and unpackign was implemented incorrectly for compatibility with inference, including in the paper. change pushed to paper. Packing revisions.
 - [X] Unit 10.B — MoSRAH position computation: P tensor for both modes and all cache states
 - [X] Unit 10.C — MoSRAH sparse path: routing → packing → position computation → BEA → unpacking → weighted reduction
-- [ ] Unit 11 — SHRAM hybrid layer: assemble H(x) = h_l (Unit 7) + h_s (Unit 10.B)
-- [ ] Unit 12 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
-- [ ] Unit 13 — ShramModel: aggregate load_balance_loss in output
-- [ ] Unit 14 — ShramForCausalLM: expose load_balance_loss; KV cache resolution
+- [X] Unit 11.A — Bug in MoSRAH, RoPe, or Attention Masking
+- [X] Unit 11.B — SHRAM hybrid layer: assemble H(x) = h_l (Unit 7) + h_s (Unit 10.B)
+- [X] Unit 12 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
+- [X] Unit 13 — ShramModel: aggregate load_balance_loss in output
+- [ ] Unit 14.A (Blocker) — MaxVio routing-imbalance metric: computation and end-to-end threading
+- [ ] Unit 14.B — ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
 - [ ] Unit 15 — upload_to_hub
 - [ ] Unit 16 — documentation
 - [ ] Unit 17 — end-to-end tests
@@ -1078,7 +1080,25 @@ The SHRAM system requires packing into an expert choice form to surface the long
 - If no contradictory ground truth is discovered during implementation, this unit should be written as a straightforward orchestration of the already-verified subunits rather than as a fused monolith that hides the bridge steps.
 - If caching is enabled, the unit should pass the layer-local MoSRAH cache directly into BEA;  otherwise it should execute the uncached path with the current packed tensors and active mask.
 
-### Unit 11 — SHRAM Hybrid Layer
+### Unit 11.A — Bug in RoPE or MoSRAH
+
+**Symptoms**
+
+Despite thorough verification of test setup, a bug persisted in which switching between a `main_sequence` RoPE configuration and a `semantic_sequence` configuration had no effect on the outcome, violating the test condition.
+
+**Debugging**
+
+The problem was tracked down to the flex attention and masking unit. Debugger inspection confirmed that RoPE was functioning correctly: queries and keys were being rotated differently under the two modes, and position IDs differed between them as expected. This made the subsequent observation deeply misleading — the attended states were identical despite the inputs being visibly different. This pointed squarely at a fault in the attention or masking logic rather than in RoPE, directing investigation toward the attention system on that basis.
+
+**Resolution**
+
+This turned out to be a horribly unlucky coincidence. RoPE encodes position as a phase relationship between pairs of tokens — what matters is not the absolute position of any token, but the difference between the query's position and the key's position. While the position IDs were different between modes, the active (unpadded) regions in both `semantic_sequence` and `main_sequence` modes happened to consist entirely of contiguous integer sequences. Any contiguous sequence produces the same pairwise differences regardless of where it starts, so both modes produced identical attention patterns despite carrying visibly different position tensors.
+
+What looked like a fault in the attention system was in reality a test design flaw: the structured input and the particular weight initialization colluded to produce contiguous position assignments in both modes, making them indistinguishable to the attention mechanism. The test has been fixed and the blocker cleared.
+
+This was an exceptionally unpleasant bug to work through, and honestly one of the worst I can remember — the evidence was internally consistent, the logic was sound at every step, and the actual problem was not where any of it pointed.
+
+### Unit 11.B — SHRAM Hybrid Layer
 
 **Responsibility:** Define and verify the SHRAM hybrid attention layer that combines the local
 sliding-window path and the MoSRAH sparse path at one decoder attention slot.
@@ -1140,37 +1160,205 @@ load-balance signal.
   x'' = x' + FFN(RMSNorm(x')). This structure transfers unchanged per Appendix A.
 - Tests verify: output shape unchanged, load_balance_loss present in output, structure holds.
 
----
 
 ### Unit 13 — ShramModel Update
 
+**Responsibility:** Define and verify the backbone-level model boundary above `DecoderLayer`.
+This unit owns stack composition of decoder layers, final normalization, model-level
+`load_balance_loss` aggregation, model-level cache routing through `ShramCache`, and preservation
+of the existing backbone output-dict semantics.
+
+**Context of Correctness**
+
+`ShramModel` is a simple orchestration unit, not a new semantics unit. It should not re-prove
+decoder, SHRAM, BEA, or cache-internal correctness already owned by lower units. Its job is to
+assemble already-verified decoder layers into the backbone contract the rest of the model depends
+on.
+
+Because this unit is small and structurally transparent, some facts are better verified by audit
+than by brittle internal tests. Runtime tests should focus on public behavior. Structural wiring
+facts that are obvious by direct inspection and would require implementation-shaped tests to
+enforce should instead be recorded here as audit requirements and checked independently during
+verification.
+
 **Invariants this unit must satisfy:**
-- ShramModel collects load_balance_loss from all decoder layers and includes an aggregated
-  scalar in the output dict.
-- The existing output dict keys (last_hidden_state, past_key_values, hidden_states) are
-  preserved with unchanged semantics.
-- Tests verify: load_balance_loss present in output dict, aggregation is correct (not just
-  the last layer's value — it must reflect all layers), existing output unchanged.
+- `ShramModel` iterates the decoder stack and applies the final RMSNorm.
+- `ShramModel` collects `load_balance_loss` from every decoder layer and exposes a single scalar
+  `load_balance_loss` in the output dict.
+- Model-level `load_balance_loss` is the **sum** of the per-layer decoder losses.
+- The existing output dict keys are preserved:
+  - `last_hidden_state`
+  - `past_key_values`
+  - `hidden_states`
+- `last_hidden_state` preserves its existing semantic role as the final normed backbone output.
+- `past_key_values` preserves its existing semantic role as the model-level cache object returned
+  from the backbone boundary.
+- `hidden_states` preserves its existing semantic role when `output_hidden_states=True`, and is
+  `None` when `output_hidden_states=False`.
+- The backbone continues to accept pre-embedded `inputs_embeds`, not token IDs.
+- The model-level cache boundary is `ShramCache`; per-layer routing is through `cache.layers[i]`.
+
+**Tests**
+- Verify the real forward pass returns a plain dict with the expected keys, including
+  `load_balance_loss`.
+- Verify `last_hidden_state` has the correct shape and `load_balance_loss` is a finite scalar.
+- Verify `hidden_states is None` when `output_hidden_states=False`.
+- Verify `hidden_states` has length `num_hidden_layers + 1` when `output_hidden_states=True`.
+- Verify `past_key_values is None` when no cache is provided.
+- Verify the same top-level `ShramCache` object is returned when one is provided.
+
+**Audit requirements**
+- Inspect `ShramModel.forward` and verify that every decoder layer is called exactly once, in
+  order, over the evolving hidden-state stream.
+- Inspect `ShramModel.forward` and verify that per-layer `load_balance_loss` values are summed
+  across all decoder layers rather than overwritten, ignored, averaged, or taken only from the
+  final layer.
+- Inspect `ShramModel.forward` and verify that `cache.layers[i]` is passed to decoder layer `i`.
+- Inspect `ShramModel.forward` and verify that `hidden_states` are collected with the preserved
+  backbone semantics rather than accidentally collecting tuples or post-final-norm values.
+- Inspect `ShramModel.forward` and verify that the final RMSNorm is applied exactly once at the
+  model boundary to produce `last_hidden_state`.
+
+**Preliminary implementation strategy:**
+- Treat this as a backbone-boundary update, not a semantic redesign.
+- Prefer real runtime smoke tests for public behavior and explicit audit for obvious wiring facts.
+- Do not introduce fake decoder layers, handwritten alternate forward passes, or re-proofs of
+  lower-level attention/cache semantics in this unit’s tests.
+
+### Unit 14.A (Blocker) — MaxVio Routing-Imbalance Metric
+
+**Responsibility:** Compute the MaxVio routing-imbalance scalar in the router and thread it
+through the MoSRAH sparse path, SHRAM hybrid layer, decoder layer, and ShramModel so that it
+is available at the ShramForCausalLM boundary for Unit 14.B to expose.
+
+**Context of Correctness**
+
+MaxVio is a scalar summary of routing imbalance defined in the paper (§MaxVio):
+
+    MaxVio = L · max_l(f_l − 1/L)
+
+where f_l is the realized routing frequency of head l and 1/L is the perfectly balanced target.
+A value of zero indicates perfect balance.
+
+This metric was not included when the router, MoSRAH sparse path, hybrid layer, decoder layer,
+and ShramModel were originally implemented and verified (Units 4, 10.C, 11.B, 12, 13). Those
+units are complete and their audit records stand. This blocker surfaces as a new requirement at
+the boundary of Unit 14.B, which must expose MaxVio in the model output. Because those earlier
+units are append-only audit records, the threading work is a new forward step rather than a
+revision of prior work.
+
+The router already computes `routing_freqs` (f_l) internally as part of the load-balance loss
+machinery. MaxVio is a one-line derivation from that quantity and belongs in the router, which
+is the only component with direct access to per-head assignment counts. No other component in
+the threading path should recompute or reinterpret it — they pass it through unchanged. MaxVio
+is a monitoring scalar, not a loss; it must be detached from the autograd graph at the point of
+computation and must never contribute gradients to any parameter.
+
+**Invariants this unit must satisfy:**
+
+- The router computes MaxVio as `L · (routing_freqs − 1/L).max()` from the already-computed
+  `routing_freqs` and returns it as an additional output alongside `selected_heads`,
+  `routing_probs`, and `load_balance_loss`.
+- MaxVio is detached from the autograd graph at the point of computation in the router. No
+  downstream component re-attaches it.
+- MaxVio flows from the router through MoSRAH, through the SHRAM hybrid layer, through the
+  decoder layer, and through ShramModel without modification or reinterpretation.
+- ShramModel aggregates per-layer MaxVio values as the maximum across all decoder layers. The
+  maximum is the correct aggregation because the anomaly recovery protocol responds to the
+  worst-case head imbalance across the model, not an average.
+- The threading additions to MoSRAH, SHRAMHybridLayer, DecoderLayer, and ShramModel do not
+  alter any existing return values, invariants, or behavior verified in prior units.
+- Tests and design for this unit are structured so that the MaxVio threading can be trusted as
+  a verified contract by Unit 14.B.
+
+**Tests:**
+
+- Verify MaxVio is exactly 0 when all heads receive equal routing frequency.
+- Verify MaxVio is exactly 1 when the most overloaded head receives double its fair share.
+- Verify MaxVio produces the correct value for a known intermediate routing imbalance.
+- Verify MaxVio is detached (`requires_grad` is False and it does not appear in any parameter's
+  gradient graph).
+- Verify MaxVio propagates through the SHRAM hybrid layer and is present in the decoder layer
+  output.
+- Any existing output-existence tests in the units this value threads through (MoSRAH,
+  SHRAMHybridLayer, DecoderLayer, ShramModel) must be updated to also verify the presence of
+  `max_vio` in their return values.
+
+**Audits**
+
+- Verify the threading additions do not alter `load_balance_loss`, hidden state outputs, or any
+  other previously verified return values.
+- Verify ShramModel's output contains a MaxVio scalar equal to the maximum across all decoder
+  layers.
+
+**Preliminary implementation strategy:**
+
+- Extract the MaxVio formula into a private helper (e.g. `_compute_max_vio(routing_freqs,
+  num_heads)`) on the router. The router calls it after computing `routing_freqs`; tests call
+  it directly with synthetic inputs, bypassing TopK entirely. This avoids the tie-breaking
+  ambiguity that arises when all routing scores are equal.
+- Threading through MoSRAH, SHRAMHybridLayer, and DecoderLayer is purely additive — receive,
+  pass through. No logic change is needed at any intermediate layer. A minimal amount of
+  adaptation is needed at each signature boundary.
+- ShramModel collects one MaxVio per decoder layer and reduces with `.max()` before including
+  it in the output. This finds the maximum imbalance and aligns with the existing max system at
+  the frequency level.
+- If any existing tests break due to the changed return signature of an intermediate component,
+  those tests must be updated to reflect the new correct signature before this blocker is
+  considered verified. If how to update them is not clear, a team decision is needed.
 
 ---
 
-### Unit 14 — ShramForCausalLM Update
+### Unit 14.B — ShramForCausalLM
+
+**Responsibility:** Extend ShramForCausalLM to expose `load_balance_loss` and `max_vio` in the
+forward output, and to override cache instantiation so that `generate()` always produces a
+`ShramCache` rather than a plain `DynamicCache`.
+
+**Context of Correctness**
+
+ShramForCausalLM is the top-level HuggingFace-facing model class. Its responsibilities at this
+unit divide cleanly into two.
+
+The first is output exposure. The training loop cannot scale and apply `load_balance_loss`
+unless it appears in the forward output. Equally, the anomaly recovery protocol cannot monitor
+routing imbalance unless `max_vio` is accessible at the same boundary. ShramModel already
+aggregates both scalars across decoder layers (Units 13 and 14.A); this unit surfaces them at
+the interface the training loop sees.
+
+The second is cache instantiation. HuggingFace's GenerationMixin instantiates a cache via
+`_prepare_cache_for_generation`. Without an override, it produces a plain `DynamicCache` that
+does not understand the MoSRAH per-head ragged structure. This unit overrides that method to
+instantiate `ShramCache` from model config. These two responsibilities are independent of each
+other and of the inner model logic — they are interface obligations at the outermost boundary.
 
 **Invariants this unit must satisfy:**
-- `load_balance_loss` is accessible from the forward output so the training loop can weight and
-  apply it. The consumer is responsible for the weight (1e-2 in the paper; job.md Architecture
-  § confirms this is the training loop's responsibility).
-- `ShramForCausalLM` overrides `_prepare_cache_for_generation` to instantiate `ShramCache`
-  with parameters derived from model config. `generate()` called without an explicit
-  `past_key_values` produces a `ShramCache` internally. A caller who passes an explicit
-  `ShramCache` has it used unchanged.
+
+- `load_balance_loss` is present in the forward output as a scalar. The training loop is
+  responsible for the scaling weight (1e-2 per the paper); this model does not apply it.
+- `max_vio` is present in the forward output as a detached scalar. It is the layer-maximum
+  value produced by ShramModel and is not modified here.
+- `ShramForCausalLM` overrides `_prepare_cache_for_generation` to instantiate a `ShramCache`
+  derived from model config. A call to `generate()` without an explicit `past_key_values`
+  produces a `ShramCache` internally.
+- A caller who supplies an explicit `ShramCache` as `past_key_values` has it used unchanged.
 - `use_cache=True` is supported. The `past_key_values` flowing through the model is always a
   `ShramCache` — never a plain `DynamicCache`.
-- Tests verify: `load_balance_loss` in output; `generate()` without explicit cache produces
-  `ShramCache`; `generate()` with explicit `ShramCache` uses it unchanged; KV cache
-  accumulates correctly across decode steps.
+- Tests and design for this unit are structured so that the unit can be trusted as a verified
+  black box by downstream consumers.
+
+**Tests:**
+
+- Verify `load_balance_loss` is present in the forward output and is a finite scalar.
+- Verify `max_vio` is present in the forward output, is a finite scalar, and has
+  `requires_grad == False`.
+- Verify `generate()` called without an explicit cache produces a `ShramCache` as
+  `past_key_values`.
+- Verify `generate()` called with an explicit `ShramCache` uses it unchanged.
+- Verify KV cache accumulates correctly across decode steps under `generate()`.
 
 **Research notes:**
+
 - `_prepare_cache_for_generation(generation_config, model_kwargs, generation_mode,
   batch_size, max_cache_length)` is the override point. It writes to
   `model_kwargs["past_key_values"]` as a side effect.
