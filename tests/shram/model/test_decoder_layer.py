@@ -118,7 +118,7 @@ class TestRuntimeSmoke:
         layer = make_layer(config, seed=0)
         x, position_ids = make_input(config, batch=2, seq=4, seed=1)
 
-        output, load_balance_loss = layer(
+        output, load_balance_loss, max_vio = layer(
             x,
             position_ids,
             cache=None,
@@ -126,8 +126,11 @@ class TestRuntimeSmoke:
 
         assert output.shape == x.shape
         assert load_balance_loss.ndim == 0
+        assert max_vio.ndim == 0
         assert torch.isfinite(output).all()
         assert torch.isfinite(load_balance_loss)
+        assert torch.isfinite(max_vio)
+        assert not max_vio.requires_grad
 
     def test_output_responds_to_input_perturbation(self):
         """A real DecoderLayer should not be dead or bypassed with respect to x."""
@@ -135,7 +138,7 @@ class TestRuntimeSmoke:
         layer = make_layer(config, seed=0)
         x, position_ids = make_input(config, batch=1, seq=4, seed=2)
 
-        baseline_output, baseline_load_balance_loss = layer(
+        baseline_output, baseline_load_balance_loss, _ = layer(
             x,
             position_ids,
             cache=None,
@@ -144,7 +147,7 @@ class TestRuntimeSmoke:
         perturbed_x = x.clone()
         perturbed_x[:, 2, :] += 0.5
 
-        perturbed_output, perturbed_load_balance_loss = layer(
+        perturbed_output, perturbed_load_balance_loss, _ = layer(
             perturbed_x,
             position_ids,
             cache=None,
@@ -173,12 +176,12 @@ class TestRuntimeSmoke:
         for input_seed in input_seeds:
             x, _ = make_input(config, batch=1, seq=4, seed=input_seed)
 
-            output_a, _ = layer(
+            output_a, _, _ = layer(
                 x,
                 position_ids_a,
                 cache=None,
             )
-            output_b, _ = layer(
+            output_b, _, _ = layer(
                 x,
                 position_ids_b,
                 cache=None,
@@ -214,12 +217,12 @@ class TestRuntimeSmoke:
             initial_buffer_size=8,
         )
 
-        prefix_output, prefix_load_balance_loss = layer(
+        prefix_output, prefix_load_balance_loss, _ = layer(
             prefix_x,
             prefix_position_ids,
             cache=layer_cache,
         )
-        current_output, current_load_balance_loss = layer(
+        current_output, current_load_balance_loss, _ = layer(
             current_x,
             current_position_ids,
             cache=layer_cache,

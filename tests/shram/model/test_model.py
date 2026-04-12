@@ -108,7 +108,7 @@ def make_cache(
 
 class TestOutputContract:
     def test_forward_returns_expected_output_dict_keys(self):
-        """ShramModel should expose the preserved output keys plus load_balance_loss."""
+        """ShramModel should expose the preserved output keys plus load_balance_loss and max_vio."""
         config = small_config()
         model = make_model(config, seed=0)
 
@@ -121,10 +121,11 @@ class TestOutputContract:
             "past_key_values",
             "hidden_states",
             "load_balance_loss",
+            "max_vio",
         }
 
     def test_last_hidden_state_shape_and_load_balance_loss_scalar_are_valid(self):
-        """Real forward should preserve shape and return a finite scalar auxiliary loss."""
+        """Real forward should preserve shape and return finite scalar auxiliary losses."""
         config = small_config()
         model = make_model(config, seed=0)
 
@@ -133,8 +134,11 @@ class TestOutputContract:
 
         assert out["last_hidden_state"].shape == (2, 5, config.hidden_size)
         assert out["load_balance_loss"].ndim == 0
+        assert out["max_vio"].ndim == 0
         assert torch.isfinite(out["last_hidden_state"]).all()
         assert torch.isfinite(out["load_balance_loss"])
+        assert torch.isfinite(out["max_vio"])
+        assert not out["max_vio"].requires_grad
 
 
 # ---------------------------------------------------------------------------

@@ -46,7 +46,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 11.B — SHRAM hybrid layer: assemble H(x) = h_l (Unit 7) + h_s (Unit 10.B)
 - [X] Unit 12 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
 - [X] Unit 13 — ShramModel: aggregate load_balance_loss in output
-- [ ] Unit 14.A (Blocker) — MaxVio routing-imbalance metric: computation and end-to-end threading
+- [X] Unit 14.A (Blocker) — MaxVio routing-imbalance metric: computation and end-to-end threading
 - [ ] Unit 14.B — ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
 - [ ] Unit 15 — upload_to_hub
 - [ ] Unit 16 — documentation

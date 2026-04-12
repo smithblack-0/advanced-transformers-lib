@@ -40,7 +40,7 @@ class SHRAMHybridLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         cache: ShramLayerCache | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply the SHRAM hybrid attention layer.
 
         Args:
@@ -53,6 +53,8 @@ class SHRAMHybridLayer(nn.Module):
         Returns:
             hybrid_output: Model-space hybrid attention output of shape (B, N, d).
             load_balance_loss: Scalar sparse-path load-balance loss.
+            max_vio: Detached scalar routing-imbalance summary. Passed through
+                unchanged from MoSRAHLayer; see MoSRAHRouter for semantics.
         """
         # ------------------------------------------------
         # It is not possible, due to how bea constructs its block mask,
@@ -91,7 +93,7 @@ class SHRAMHybridLayer(nn.Module):
             position_ids=position_ids,
             cache=sliding_window_cache,
         )
-        sparse_output, load_balance_loss = self.sparse_attention(
+        sparse_output, load_balance_loss, max_vio = self.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
             cache=mosrah_cache,
@@ -105,4 +107,4 @@ class SHRAMHybridLayer(nn.Module):
         # -------------------------------------------------------------------
         hybrid_output = local_output + sparse_output
 
-        return hybrid_output, load_balance_loss
+        return hybrid_output, load_balance_loss, max_vio

@@ -33,7 +33,8 @@ class MoSRAHLayer(nn.Module):
 
     The MoSRAH path consumes model-space hidden states together with
     authoritative per-token positions and returns the model-space sparse-path
-    contribution plus the router's load-balance loss.
+    contribution, the router's load-balance loss, and the router's MaxVio
+    routing-imbalance scalar.
     """
 
     def __init__(self, config: ShramConfig) -> None:
@@ -49,7 +50,7 @@ class MoSRAHLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         cache: MoSRAHCache | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the full MoSRAH sparse path.
 
         Args:
@@ -61,6 +62,8 @@ class MoSRAHLayer(nn.Module):
         Returns:
             sparse_output: Model-space sparse-path output of shape (B, N, d).
             load_balance_loss: Scalar router load-balance loss.
+            max_vio: Detached scalar routing-imbalance summary. Passed through
+                unchanged from the router; see MoSRAHRouter for semantics.
         """
 
         # -------------------------------------------------------------------
@@ -72,7 +75,7 @@ class MoSRAHLayer(nn.Module):
         # authoritative upstream positions through the same rearrangement so
         # packed hidden states and packed positions remain aligned.
         # -------------------------------------------------------------------
-        selected_heads, routing_probs, load_balance_loss = self.router(hidden_states)
+        selected_heads, routing_probs, load_balance_loss, max_vio = self.router(hidden_states)
 
         flattened_selected_heads, permutation, inverse_permutation = setup_packing(
             selected_heads
@@ -123,4 +126,4 @@ class MoSRAHLayer(nn.Module):
             token_choice_outputs * routing_probs.unsqueeze(-1)
         ).sum(dim=2)
 
-        return final_output, load_balance_loss
+        return final_output, load_balance_loss, max_vio

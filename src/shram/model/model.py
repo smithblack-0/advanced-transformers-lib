@@ -28,6 +28,7 @@ Returns a plain dict with keys:
 - "past_key_values": the ShramCache object passed in, or None
 - "hidden_states": tuple of per-layer activations if output_hidden_states=True, else None
 - "load_balance_loss": scalar sum of per-layer SHRAM load-balance losses
+- "max_vio": detached scalar maximum routing-imbalance across all decoder layers
 """
 
 import torch
@@ -93,19 +94,24 @@ class ShramModel(nn.Module):
               unnormalised residual stream at that depth.
             - ``"load_balance_loss"``: scalar sum of per-layer SHRAM
               load-balance losses.
+            - ``"max_vio"``: detached scalar maximum routing-imbalance across
+              all decoder layers. Zero means perfectly balanced routing across
+              every layer; higher values identify the worst-case head imbalance.
         """
         hidden_states = inputs_embeds
         all_hidden_states = (hidden_states,) if output_hidden_states else None
         total_load_balance_loss = inputs_embeds.new_zeros(())
+        max_vio = inputs_embeds.new_zeros(())
 
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache.layers[layer_idx]
-            hidden_states, layer_load_balance_loss = layer(
+            hidden_states, layer_load_balance_loss, layer_max_vio = layer(
                 hidden_states,
                 position_ids,
                 cache=layer_cache,
             )
             total_load_balance_loss = total_load_balance_loss + layer_load_balance_loss
+            max_vio = torch.maximum(max_vio, layer_max_vio)
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -117,4 +123,5 @@ class ShramModel(nn.Module):
             "past_key_values": cache,
             "hidden_states": all_hidden_states,
             "load_balance_loss": total_load_balance_loss,
+            "max_vio": max_vio,
         }

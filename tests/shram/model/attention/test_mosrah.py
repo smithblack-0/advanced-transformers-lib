@@ -1,10 +1,11 @@
 """Tests for the full MoSRAH sparse path.
 
 Invariants verified: model-space output shape, propagation of load_balance_loss,
-weighted reduction semantics, support for both RoPE position modes, uncached
-execution, cached execution with the real layer-local cache, cached/uncached
-external-contract equivalence on the sparse output, and preservation of the two
-distinct gradient paths exposed by the assembled layer.
+propagation of max_vio as a detached scalar, weighted reduction semantics, support
+for both RoPE position modes, uncached execution, cached execution with the real
+layer-local cache, cached/uncached external-contract equivalence on the sparse
+output, and preservation of the two distinct gradient paths exposed by the
+assembled layer.
 """
 
 import pytest
@@ -84,7 +85,7 @@ class TestRealExecution:
         layer = MoSRAHLayer(config)
         hidden_states, position_ids = make_inputs()
 
-        sparse_output, load_balance_loss = layer(
+        sparse_output, load_balance_loss, max_vio = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             cache=None,
@@ -92,8 +93,11 @@ class TestRealExecution:
 
         assert sparse_output.shape == hidden_states.shape
         assert load_balance_loss.ndim == 0
+        assert max_vio.ndim == 0
         assert torch.isfinite(sparse_output).all()
         assert torch.isfinite(load_balance_loss)
+        assert torch.isfinite(max_vio)
+        assert not max_vio.requires_grad
 
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
     def test_cached_execution_accumulates_in_the_real_layer_local_cache(self, rope_mode):
@@ -110,21 +114,21 @@ class TestRealExecution:
 
         cache = make_cache(config, batch_size=hidden_states.shape[0])
 
-        prefix_output, prefix_load_balance_loss = layer(
+        prefix_output, prefix_load_balance_loss, _ = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
             cache=cache,
         )
         lengths_after_prefix = cache.get_heads_lengths().clone()
 
-        current_output, current_load_balance_loss = layer(
+        current_output, current_load_balance_loss, _ = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             cache=cache,
         )
         lengths_after_current = cache.get_heads_lengths().clone()
 
-        uncached_current_output, uncached_current_load_balance_loss = layer(
+        uncached_current_output, uncached_current_load_balance_loss, _ = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             cache=None,
@@ -163,7 +167,7 @@ class TestRealExecution:
         current_hidden_states = hidden_states[:, 2:]
         current_position_ids = position_ids[:, 2:]
 
-        full_output, full_load_balance_loss = layer(
+        full_output, full_load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             cache=None,
@@ -171,12 +175,12 @@ class TestRealExecution:
 
         cache = make_cache(config, batch_size=hidden_states.shape[0])
 
-        _, prefix_load_balance_loss = layer(
+        _, prefix_load_balance_loss, _ = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
             cache=cache,
         )
-        current_output, current_load_balance_loss = layer(
+        current_output, current_load_balance_loss, _ = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             cache=cache,
@@ -214,7 +218,7 @@ class TestGradientFlow:
         layer = MoSRAHLayer(config)
         hidden_states, position_ids = make_inputs(requires_grad=True)
 
-        sparse_output, load_balance_loss = layer(
+        sparse_output, load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             cache=None,
@@ -247,7 +251,7 @@ class TestGradientFlow:
         layer = MoSRAHLayer(config)
         hidden_states, position_ids = make_inputs(requires_grad=True)
 
-        sparse_output, load_balance_loss = layer(
+        sparse_output, load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             cache=None,

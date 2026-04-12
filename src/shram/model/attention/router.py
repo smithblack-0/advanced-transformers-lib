@@ -17,7 +17,15 @@ The router also computes and returns the load balance loss via the LoadBalanceLo
 autograd operator (see load_balance_loss.py). This loss is a scalar that the training
 loop can weight and add to the language modeling loss.
 
-Paper ref: Appendix A.Routing, Appendix A.Load Balancing.
+The router additionally computes and returns MaxVio, a detached scalar summarising
+routing imbalance for the current forward pass:
+
+    MaxVio = L · max_l(f_l − 1/L)
+
+where f_l is the realised routing frequency of head l and 1/L is the perfectly balanced
+target. MaxVio is a monitoring quantity only; it never contributes gradients.
+
+Paper ref: Appendix A.Routing, Appendix A.Load Balancing, §MaxVio.
 """
 
 import torch
@@ -62,7 +70,7 @@ class MoSRAHRouter(nn.Module):
 
     def forward(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route input tokens to K expert heads each and compute routing probabilities.
 
         Args:
@@ -76,6 +84,9 @@ class MoSRAHRouter(nn.Module):
                 indices and renormalized to sum to 1 per token.
             load_balance_loss: Scalar load balance imbalance loss for this forward pass.
                 Training loop scales this by a weight and adds it to the main loss.
+            max_vio: Detached scalar routing-imbalance summary for this forward pass.
+                Equal to L · max_l(f_l − 1/L). Zero means perfect balance. Not a loss;
+                never contributes gradients.
         """
         B, N, _ = x.shape
         L = self.num_mosrah_heads
@@ -115,4 +126,30 @@ class MoSRAHRouter(nn.Module):
         # correction gradient to expert_bias.grad for the optimizer to consume.
         load_balance_loss = LoadBalanceLoss.apply(self.expert_bias, routing_freqs)
 
-        return selected_heads, routing_probs, load_balance_loss
+        # MaxVio is a detached monitoring scalar derived from routing_freqs. It must
+        # not contribute gradients under any circumstance, so it is detached at the
+        # point of computation rather than left to callers to detach.
+        max_vio = self._compute_max_vio(routing_freqs, L)
+
+        return selected_heads, routing_probs, load_balance_loss, max_vio
+
+    @staticmethod
+    def _compute_max_vio(routing_freqs: torch.Tensor, num_heads: int) -> torch.Tensor:
+        """Compute the MaxVio routing-imbalance scalar.
+
+        MaxVio = L · max_l(f_l − 1/L), where f_l is the realised routing frequency of
+        head l and 1/L is the perfectly balanced target. A value of zero indicates
+        perfect balance; a value of 1 means the most overloaded head received exactly
+        double its fair share.
+
+        The result is detached from the autograd graph — MaxVio is a monitoring scalar
+        and must never contribute gradients to any parameter.
+
+        Args:
+            routing_freqs: Per-head routing frequencies of shape (L,). Sums to 1.
+            num_heads: Total number of MoSRAH heads L.
+
+        Returns:
+            Detached scalar MaxVio tensor.
+        """
+        return (num_heads * (routing_freqs - 1.0 / num_heads).max()).detach()
