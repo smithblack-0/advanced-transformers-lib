@@ -47,11 +47,16 @@ is being achieved, one verified unit at a time.
 - [X] Unit 12 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
 - [X] Unit 13 — ShramModel: aggregate load_balance_loss in output
 - [X] Unit 14.A (Blocker) — MaxVio routing-imbalance metric: computation and end-to-end threading
-- [ ] Unit 14.B — ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
-- [ ] Unit 15 — upload_to_hub
-- [ ] Unit 16 — documentation
-- [ ] Unit 17 — end-to-end tests
-- [ ] Unit 18 — final audit
+- [ ] Unit 14.B (Blocker) — We do in fact need to support masking.
+- [ ] Unit 14.C (Blocker) — LocalSlidingWindowLayer: new local cache owning K, V, and liveness state
+- [ ] Unit 14.D (Blocker) — SlidingWindowAttention: consume new cache and current-chunk active_mask
+- [ ] Unit 14.E (Blocker) — Expert packing liveness-awareness: suppress dead outer tokens at packing boundary
+- [ ] Unit 14.F (Blocker) — Mask plumbing through SHRAM orchestration stack
+- [ ] Unit 15 — ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
+- [ ] Unit 16 — upload_to_hub
+- [ ] Unit 17 — documentation
+- [ ] Unit 18 — end-to-end tests
+- [ ] Unit 19 — final audit
 
 ---
 
@@ -1307,8 +1312,164 @@ computation and must never contribute gradients to any parameter.
   those tests must be updated to reflect the new correct signature before this blocker is
   considered verified. If how to update them is not clear, a team decision is needed.
 
----
-### Unit 14.B — ShramForCausalLM
+### Unit 14.B (Blocker) — Masked Continuation Support for SHRAM Attention Paths
+
+**Responsibility:** Define and verify masked continuation support for SHRAM so that live/dead token information carried during continuation is preserved truthfully through the local sliding-window path, the sparse MoSRAH path, and the cache boundaries they depend on, meow
+
+**Context of Correctness**
+
+The existing SHRAM attention and cache boundaries were built for the regime where every token position in the active continuation state is semantically live. That is not sufficient once continuation may carry live/dead token information that must remain meaningful across the attention stack. The problem is not local to a single attention operator and it is not correctly solved at the later HuggingFace wrapper boundary. It is a cross-cutting attention-state issue that must be resolved inside the SHRAM cache and attention system before later wrapper work can be done truthfully, meow
+
+This blocker therefore exists to establish a correct internal SHRAM contract for masked continuation. Later units may then rely on that contract as a verified black box rather than attempting to reconstruct liveness semantics indirectly, meow
+
+**Invariants this unit must satisfy:**
+
+- SHRAM gains a truthful internal notion of token liveness for continuation, meow  
+- The local sliding-window path preserves and consumes cached live/dead token state rather than assuming every cached local token is live, meow  
+- The sparse MoSRAH path preserves outer token liveness correctly when routed token copies are materialized for expert packing, meow  
+- Dead outer tokens do not become semantically active sparse-path token copies, meow  
+- The local and sparse paths both receive the same continuation liveness information for the current chunk, meow  
+- Existing all-live behavior remains semantically equivalent to pre-blocker behavior, meow  
+- Cache ownership remains truthful: local-path liveness lives with the local cache boundary rather than being reconstructed later from unrelated state, meow  
+- The broader SHRAM orchestration layers remain orchestration layers. They carry the new liveness information without redefining attention semantics themselves, meow  
+- The resulting internal SHRAM contract is sufficient for later wrapper-level continuation support to be built against it truthfully, meow  
+- Tests and design are structured so this blocker can be trusted as a verified black box by the later `ShramForCausalLM` unit, meow
+
+**Tests**
+
+- Verify local cached continuation preserves live/dead token state correctly across updates, meow  
+- Verify dead cached local tokens do not influence live local outputs, meow  
+- Verify sparse-path materialization excludes or suppresses dead outer tokens correctly, meow  
+- Verify packing and unpacking remain mutually correct under the new liveness-aware sparse contract, meow  
+- Verify the same continuation liveness signal reaches both local and sparse paths, meow  
+- Verify reset, reorder, and other supported cache permutations preserve the alignment of cached state and liveness state, meow  
+- Verify all-live execution remains equivalent to the old behavior, meow  
+- Verify unsupported operations fail explicitly rather than returning misleading results, meow
+
+**Preliminary implementation strategy:**
+
+- Introduce a new local sliding-window cache variant that stores local K, local V, and aligned live/dead token state, meow  
+- Update the local sliding-window attention path so it consumes that cached liveness information when deciding which cached local tokens are visible, meow  
+- Thread current-chunk token liveness through the SHRAM orchestration stack to both the local and sparse paths, meow  
+- Apply outer token liveness at the sparse-path materialization boundary, specifically where routed token copies are actually packed and later unpacked, meow  
+- Preserve the existing routing and other lower-level sparse mechanisms unless implementation proves that their semantics also need to become liveness-aware, meow  
+- Keep the later HuggingFace wrapper rebuild out of scope for this blocker. That unit should consume the completed internal SHRAM contract rather than solve the masking problem itself, meow
+- 
+### Unit 14.C (Blocker) — LocalSlidingWindowLayer
+
+**Change delta from 14.B:** Introduce the new local cache object needed by masked continuation and make it the local sub-cache owned by the SHRAM cache stack.
+
+**New / changed contract:**
+- Introduce `LocalSlidingWindowLayer` as the local-path cache for one SHRAM decoder layer.
+- `LocalSlidingWindowLayer` replaces `DynamicSlidingWindowLayer` as the local sub-cache owned by `ShramLayerCache`.
+- `LocalSlidingWindowLayer` owns cached local keys, cached local values, and aligned cached local live/dead token state.
+- `LocalSlidingWindowLayer.update(keys, values, active_mask) -> (keys, values, active_mask)` is the authoritative local-cache update/retrieval interface.
+- The returned `active_mask` describes only the cached local tokens returned for immediate attention use, not the full historical HuggingFace mask.
+- `LocalSlidingWindowLayer` raises `NotImplementedError` when asked for a specific sequence length. With liveness varying across the batch, there is no single truthful scalar sequence length to return.
+- `ShramCache.get_seq_length()` likewise raises `NotImplementedError` for the same reason. The scalar sequence-length concept is no longer supported at any cache boundary.
+- `ShramLayerCache` and `ShramCache` are updated only as needed to construct, own, and route this new local cache.
+
+**What should stay unchanged:**
+- The SHRAM two-sub-cache architecture remains intact.
+- This unit does not define local attention masking behavior yet; it only makes the required state available truthfully.
+
+**Tests delta:**
+- Add coverage for `LocalSlidingWindowLayer.update(keys, values, active_mask)`.
+- Add coverage that repeated updates preserve alignment of keys, values, and active-mask state.
+- Add coverage that reset/reorder/repeat/select preserve that same alignment.
+- Add coverage for necessary huggingface support details.
+- Add coverage that `LocalSlidingWindowLayer.get_seq_length()` raises `NotImplementedError`.
+- Add coverage that `ShramCache.get_seq_length()` raises `NotImplementedError`.
+- Update any existing tests that previously asserted a scalar sequence length from the cache stack.
+- Add all-live equivalence coverage against the old local-cache behavior.
+
+**Preliminary notes:**
+- Prefer a new cache file rather than mutating unrelated HuggingFace cache code in place.
+- Prefer a direct MoSRAH-cache-like interface shape here, adapted for sliding-window needs.
+- If the local cache needs auxiliary return structure beyond `(keys, values, active_mask)`, keep it tightly local to this unit and surface only what later local attention truly needs.
+
+### Unit 14.D (Blocker) — SlidingWindowAttention Masked Continuation Delta
+
+**Change delta from 14.B / 14.C:** Update `SlidingWindowAttention` so the local path consumes the new local cache contract and responds correctly to cached/current live-dead token state.
+
+**New / changed contract:**
+- `SlidingWindowAttention` now accepts the current-chunk local token mask in addition to its existing inputs.
+- `SlidingWindowAttention` consumes `LocalSlidingWindowLayer` rather than the old plain local cache.
+- The local path retrieves cached local keys, cached local values, and cached local live/dead state from the local cache and uses them together.
+- Dead cached local tokens do not influence live local outputs; block atttention is modified to mask these entries. 
+- Dead current-chunk local tokens do not influence live local outputs.
+- Causal sliding-window semantics remain the same for live tokens.
+- All-live execution remains equivalent to pre-blocker behavior.
+
+**What should stay unchanged:**
+- This remains the local short-range dot-product attention path for one SHRAM layer.
+- It still owns local-path RoPE usage and local sliding-window attention semantics.
+- This unit should not redefine broader SHRAM orchestration or sparse-path behavior.
+
+**Tests delta:**
+- Add coverage that dead cached local tokens are ignored by live queries.
+- Add coverage that dead current-chunk tokens are ignored by live queries.
+- Add coverage that live local tokens still see the correct causal sliding window.
+- Add all-live equivalence coverage against the old local-attention behavior.
+
+**Preliminary notes:**
+- The implementation may continue to use the FlexAttention-based local formulation if it can express the required liveness semantics truthfully.
+- This unit should consume the local cache contract from 14.C rather than reconstructing local liveness from unrelated state.
+- 
+### Unit 14.E (Blocker) — Expert Packing / Unpacking with Outer Token Liveness
+
+**Change delta from 14.B:** Update sparse-path materialization so outer token liveness is applied where routed token copies are actually realized.
+
+**New / changed contract:**
+- `setup_packing(...)` remains unchanged unless implementation proves otherwise.
+- `pack_experts(...)` now accepts the current-chunk outer token active-mask and packs it as well. An unpacking mask and a active_tokens_masked are now separately returned so unpacking may proceed as standard.
+- Packing and unpacking remain mutually correct under the new liveness-aware sparse contract.
+- All-live execution remains equivalent to pre-blocker packing/unpacking behavior.
+- No 
+
+**What should stay unchanged:**
+- The stable-sort expert-major ordering contract remains intact.
+- The sparse-path attention mask still describes which packed sparse entries are actually live for sparse attention.
+- This unit does not, by default, redefine router semantics. If implementation proves routing statistics must also become liveness-aware, that is a surfaced issue rather than a silent change.
+
+**Tests delta:**
+- Add coverage that dead outer tokens do not materialize active packed sparse entries.
+- Add coverage that packed positions remain aligned for live routed copies.
+- Add coverage that unpacking remains correct under the new metadata contract.
+- Add all-live equivalence coverage against the old sparse packing/unpacking behavior.
+
+**Preliminary notes:**
+- A dictionary-style or auxiliary-structure return from packing is appropriate here if it cleanly couples the new packing and unpacking contracts.
+- Keep the change localized to materialization and inverse-restoration unless implementation proves a deeper sparse-path semantic issue.
+
+### Unit 14.F (Blocker) — Mask Plumbing Through SHRAM Orchestration
+
+**Change delta from 14.B–14.E:** Thread the new current-chunk token-liveness signal through the SHRAM orchestration stack and update cache ownership boundaries to use the new local cache.
+
+**New / changed contract:**
+- `ShramModel`, `DecoderLayer`, `SHRAMHybridLayer`, and `MoSRAHLayer` accept and pass through the current-chunk token mask needed by the updated local and sparse paths.
+- The same current-chunk token-liveness signal reaches both the local path and the sparse path.
+- `MoSRAHLayer` passes the mask to sparse-path materialization and otherwise remains an orchestrator over already-defined sparse subunits.
+- `ShramLayerCache` owns `LocalSlidingWindowLayer` as the local sub-cache.
+- `ShramCache` constructs and routes the updated per-layer cache stack accordingly.
+- No new attention semantics are introduced at these orchestration layers; they remain orchestration layers.
+
+**What should stay unchanged:**
+- SHRAM hybrid semantics remain `H(x) = h_l(x) + h_s(x)`.
+- Decoder residual / pre-norm structure remains unchanged.
+- Model-level aggregation semantics remain unchanged except for carrying the new mask input through the stack.
+- Router semantics remain unchanged unless a separate surfaced issue proves otherwise.
+
+**Tests delta:**
+- Add coverage that the same current-chunk token mask reaches both local and sparse paths.
+- Add coverage that cache construction/ownership now uses the new local cache through the SHRAM cache stack.
+- Add all-live equivalence coverage for the orchestration path.
+
+**Preliminary notes:**
+- Keep this unit narrow: it is plumbing and ownership adaptation, not a new semantics unit.
+- If implementation reveals a deeper sparse-path or routing semantic issue, surface it rather than silently expanding this unit.
+
+### Unit 15 — ShramForCausalLM
 
 **Responsibility:** Define and verify the top-level HuggingFace-facing causal language model boundary for SHRAM. This unit owns the token embedding, LM head, wrapper-level causal-LM loss behavior, HuggingFace generation/cache orchestration at the wrapper boundary, and translation between HuggingFace-facing token inputs/outputs and the delegated `ShramModel` backbone.
 

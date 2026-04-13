@@ -55,6 +55,7 @@ class DecoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
+        mask: torch.Tensor,
         cache: ShramLayerCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply one decoder block to the input.
@@ -62,6 +63,7 @@ class DecoderLayer(nn.Module):
         Args:
             x: Input of shape (batch, seq_len, hidden_size).
             position_ids: Authoritative positions of shape (batch, seq_len).
+            mask: An attention mask of shape (batch, possibly_other_sequence_length).
             cache: Optional per-layer SHRAM cache passed through to the hybrid
                 attention layer unchanged.
 
