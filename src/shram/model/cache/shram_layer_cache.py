@@ -7,44 +7,47 @@ the HuggingFace per-layer cache role, and exposes each sub-cache directly so its
 path can interact with it without indirection.
 
 ShramLayerCache does not define a composite update() interface. The two paths have materially
-different update semantics — the sliding-window side uses standard key/value concatenation
+different update semantics — the local side uses chunk-local key/value/mask concatenation
 while the MoSRAH side uses expert-choice scatter with an active mask — and merging these
 behind a single update() would hide those differences behind a misleading abstraction. Instead,
 each attention path calls update() on the sub-cache it owns. ShramLayerCache acts as the
 ownership, coordination, and reset/reorder boundary for one decoder layer.
 
-The scalar sequence length concept is exposed at this boundary and sourced from the
-sliding-window cache, which tracks the full cumulative token count. The MoSRAH cache is
-ragged across (batch, head) slots and has no meaningful scalar summary.
+No scalar sequence length is exposed at this boundary. Ragged masked continuation means
+different batch items may carry different numbers of live tokens, making a single truthful
+scalar unavailable. get_seq_length() raises NotImplementedError.
 """
 
 import torch
-from transformers.cache_utils import CacheLayerMixin, DynamicSlidingWindowLayer
+from transformers.cache_utils import CacheLayerMixin
 
 from .mosrah_cache import MoSRAHCache
+from .sliding_window_cache import LocalSlidingWindowLayerCache
 
 
 class ShramLayerCache(CacheLayerMixin):
     """Cache subsystem for one SHRAM decoder layer.
 
     Owns and coordinates two sub-caches:
-      - sliding_window_cache: DynamicSlidingWindowLayer for the local sliding-window path.
+      - sliding_window_cache: LocalSlidingWindowLayerCache for the local sliding-window path.
       - mosrah_cache: MoSRAHCache for the MoSRAH sparse attention path.
 
     Satisfies the HuggingFace per-layer cache role (CacheLayerMixin). The two sub-caches are
     exposed directly for their downstream attention paths — no composite update() interface is
     provided, because the two paths have materially different update semantics.
 
-    The scalar sequence length is sourced from the sliding-window cache, which tracks the full
-    cumulative token count across all forward passes. The MoSRAH cache is ragged across
-    (batch, head) slots and cannot contribute a truthful scalar summary.
+    No scalar sequence length is exposed at this boundary. Ragged masked continuation means
+    different batch items may carry different numbers of live tokens, making a single truthful
+    scalar unavailable. get_seq_length() raises NotImplementedError.
 
     Args:
-        sliding_window: Number of tokens retained by the sliding-window cache.
+        sliding_window: Number of tokens retained by the local sliding-window cache.
+        num_local_heads: Number of local attention heads.
+        local_head_dim: Per-head embedding width for the local path.
         num_mosrah_heads: Total number of MoSRAH expert heads (L).
         mosrah_head_dim: Bottlenecked head embedding width (u) for the MoSRAH path.
         batch_size: Number of sequences in the batch.
-        device: Device on which to allocate MoSRAH cache tensors.
+        device: Device on which to allocate cache tensors.
         initial_buffer_size: Initial per-(batch, head) capacity for MoSRAHCache. Doubled
             when any slot overflows. Defaults to 64 to avoid repeated reallocation during
             prompt processing.
@@ -56,6 +59,8 @@ class ShramLayerCache(CacheLayerMixin):
     def __init__(
         self,
         sliding_window: int,
+        num_local_heads: int,
+        local_head_dim: int,
         num_mosrah_heads: int,
         mosrah_head_dim: int,
         batch_size: int,
@@ -63,7 +68,13 @@ class ShramLayerCache(CacheLayerMixin):
         initial_buffer_size: int = 64,
     ) -> None:
         super().__init__()
-        self.sliding_window_cache = DynamicSlidingWindowLayer(sliding_window=sliding_window)
+        self.sliding_window_cache = LocalSlidingWindowLayerCache(
+            sliding_window=sliding_window,
+            num_heads=num_local_heads,
+            head_dim=local_head_dim,
+            batch_size=batch_size,
+            device=device,
+        )
         self.mosrah_cache = MoSRAHCache(
             num_mosrah_heads=num_mosrah_heads,
             head_dim=mosrah_head_dim,
@@ -80,10 +91,8 @@ class ShramLayerCache(CacheLayerMixin):
     def is_initialized(self) -> bool:
         """True iff both sub-caches have allocated their storage.
 
-        Derived from the sub-caches rather than tracked as a flag, so it is always
-        consistent with actual sub-cache state. The effective gate is the sliding-window
-        cache: MoSRAHCache pre-allocates at construction and is always ready, while
-        DynamicSlidingWindowLayer allocates lazily on the first update() call.
+        Both LocalSlidingWindowLayerCache and MoSRAHCache pre-allocate at construction,
+        so this is True immediately after ShramLayerCache.__init__ returns.
         """
         return self.sliding_window_cache.is_initialized and self.mosrah_cache.is_initialized
 
@@ -99,15 +108,16 @@ class ShramLayerCache(CacheLayerMixin):
     # CacheLayerMixin — composite-meaningful methods
     # ---------------------------------------------------------------------------
 
-    def get_seq_length(self) -> int:
-        """Return the cumulative token count from the sliding-window path.
+    def get_seq_length(self) -> int:  # type: ignore[override]
+        """Not supported — no single scalar sequence length is available at this boundary.
 
-        The sliding-window cache tracks the total number of tokens seen across all forward
-        passes, which is the meaningful scalar sequence length at this layer boundary. The
-        MoSRAH cache is ragged across (batch, head) slots and cannot contribute a truthful
-        scalar summary.
+        Ragged masked continuation means different batch items may carry different numbers
+        of live tokens, making a truthful scalar unavailable.
         """
-        return self.sliding_window_cache.get_seq_length()
+        raise NotImplementedError(
+            "ShramLayerCache has no single scalar sequence length. "
+            "Ragged masked continuation makes a truthful scalar unavailable."
+        )
 
     def reset(self) -> None:
         """Clear both sub-caches.

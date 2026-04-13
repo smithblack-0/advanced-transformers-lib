@@ -2,7 +2,7 @@
 
 The HuggingFace Cache protocol expects a single top-level Cache object that owns one
 CacheLayerMixin per decoder layer. The actual SHRAM caching responsibilities live one level
-lower in ShramLayerCache — each of which owns a DynamicSlidingWindowLayer and a MoSRAHCache.
+lower in ShramLayerCache — each of which owns a LocalSlidingWindowLayerCache and a MoSRAHCache.
 ShramCache bridges those two levels: it constructs one ShramLayerCache per decoder layer,
 presents them through the Cache interface, and transparently forwards model-wide operations
 across all of them.
@@ -13,9 +13,9 @@ nor the model-level boundary here can meaningfully unify them. Callers must reac
 relevant sub-cache directly. ShramCache's role is ownership, construction, and model-wide
 coordination of the layer caches — not routing attention inputs.
 
-The scalar sequence length concept is exposed here and sourced from the sliding-window side of
-the first layer cache. All layers process the same forward pass sequence, so any layer index
-gives the same answer; layer 0 is the canonical choice.
+No scalar sequence length is exposed at this boundary. Ragged masked continuation means
+different batch items may carry different numbers of live tokens, making a single truthful
+scalar unavailable. get_seq_length() raises NotImplementedError.
 """
 
 import torch
@@ -38,11 +38,13 @@ class ShramCache(Cache):
     Args:
         num_hidden_layers: Number of SHRAM decoder layers. Determines how many
             ShramLayerCache objects are constructed.
-        sliding_window: Token window size passed to each layer's DynamicSlidingWindowLayer.
+        sliding_window: Token window size passed to each layer's LocalSlidingWindowLayerCache.
+        num_local_heads: Number of local attention heads per layer.
+        local_head_dim: Per-head embedding width for the local path.
         num_mosrah_heads: Total number of MoSRAH expert heads (L) per layer.
         mosrah_head_dim: Bottlenecked head embedding width (u) for the MoSRAH path.
         batch_size: Number of sequences in the batch.
-        device: Device on which to allocate MoSRAH cache tensors.
+        device: Device on which to allocate cache tensors.
         initial_buffer_size: Initial per-(batch, head) capacity for each MoSRAHCache.
             Doubled when any slot overflows. Defaults to 64 to avoid repeated reallocation
             during prompt processing.
@@ -52,6 +54,8 @@ class ShramCache(Cache):
         self,
         num_hidden_layers: int,
         sliding_window: int,
+        num_local_heads: int,
+        local_head_dim: int,
         num_mosrah_heads: int,
         mosrah_head_dim: int,
         batch_size: int,
@@ -61,6 +65,8 @@ class ShramCache(Cache):
         layers = [
             ShramLayerCache(
                 sliding_window=sliding_window,
+                num_local_heads=num_local_heads,
+                local_head_dim=local_head_dim,
                 num_mosrah_heads=num_mosrah_heads,
                 mosrah_head_dim=mosrah_head_dim,
                 batch_size=batch_size,
@@ -72,13 +78,8 @@ class ShramCache(Cache):
         super().__init__(layers=layers)
 
     # ---------------------------------------------------------------------------
-    # Cache — composite-meaningful methods (inherited; documented here for clarity)
+    # Cache — composite-meaningful methods
     # ---------------------------------------------------------------------------
-    #
-    # get_seq_length(layer_idx=0): Inherited. Delegates to layers[layer_idx].get_seq_length(),
-    #   which returns the sliding-window path's cumulative token count — the truthful scalar
-    #   sequence length for the model. All layers see the same forward-pass sequence, so any
-    #   layer_idx gives the same answer; 0 is the default.
     #
     # reset(): Inherited. Iterates all layer caches and calls reset() on each.
     #
@@ -87,6 +88,17 @@ class ShramCache(Cache):
     # is_initialized: Inherited property. True iff all layer caches are initialized.
     #   Since ShramLayerCache.is_initialized is True from construction, this is True
     #   immediately after ShramCache.__init__ returns.
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:  # type: ignore[override]
+        """Not supported — no single scalar sequence length is available at this boundary.
+
+        Ragged masked continuation means different batch items may carry different numbers
+        of live tokens, making a truthful scalar unavailable at any cache boundary.
+        """
+        raise NotImplementedError(
+            "ShramCache has no single scalar sequence length. "
+            "Ragged masked continuation makes a truthful scalar unavailable."
+        )
 
     # ---------------------------------------------------------------------------
     # Cache — unsupported methods

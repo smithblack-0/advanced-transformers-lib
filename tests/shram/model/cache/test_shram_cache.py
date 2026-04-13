@@ -1,4 +1,4 @@
-"""Tests for ShramCache — Unit 6.C.
+"""Tests for ShramCache — Unit 6.C / Unit 14.D.
 
 Invariants verified in this file:
 
@@ -8,15 +8,12 @@ HF Cache protocol and construction:
 - All owned layer caches are ShramLayerCache instances
 - is_initialized is True immediately after construction
 - update() raises NotImplementedError — no composite update interface
+- get_seq_length() raises NotImplementedError — no scalar sequence length available
 - crop() raises NotImplementedError
-- batch_repeat_interleave() raises NotImplementedError
-- batch_select_indices() raises NotImplementedError
 - max_batch_size raises NotImplementedError
 - max_cache_len raises NotImplementedError
 
 Composite behaviors:
-- get_seq_length() returns 0 before any sliding-window updates
-- get_seq_length(layer_idx) reflects cumulative token count for that layer's sliding-window cache
 - reset() clears all layer caches through the ShramCache boundary
 - reorder_cache() permutes all layer caches consistently through the ShramCache boundary
 - len(cache) == num_hidden_layers
@@ -49,6 +46,8 @@ def make_cache(num_layers: int = NUM_LAYERS, batch: int = BATCH) -> ShramCache:
     return ShramCache(
         num_hidden_layers=num_layers,
         sliding_window=SLIDING_WINDOW,
+        num_local_heads=LOCAL_HEADS,
+        local_head_dim=LOCAL_HEAD_DIM,
         num_mosrah_heads=NUM_MOSRAH_HEADS,
         mosrah_head_dim=MOSRAH_HEAD_DIM,
         batch_size=batch,
@@ -58,10 +57,11 @@ def make_cache(num_layers: int = NUM_LAYERS, batch: int = BATCH) -> ShramCache:
 
 
 def sw_update(layer_cache: ShramLayerCache, batch: int, num_tokens: int) -> None:
-    """Drive a layer's sliding_window_cache.update() with random data."""
+    """Drive a layer's sliding_window_cache.update() with all-active random data."""
     k = torch.randn(batch, LOCAL_HEADS, num_tokens, LOCAL_HEAD_DIM)
     v = torch.randn(batch, LOCAL_HEADS, num_tokens, LOCAL_HEAD_DIM)
-    layer_cache.sliding_window_cache.update(k, v)
+    mask = torch.ones(batch, num_tokens, dtype=torch.bool)
+    layer_cache.sliding_window_cache.update(k, v, mask)
 
 
 def mosrah_update(layer_cache: ShramLayerCache, batch: int, num_tokens: int) -> None:
@@ -146,54 +146,21 @@ def test_all_layers_are_shram_layer_cache():
     assert all(isinstance(layer, ShramLayerCache) for layer in cache.layers)
 
 
-def test_is_initialized_false_at_construction():
-    """is_initialized is False at construction — sliding_window sub-caches have not yet allocated storage."""
+def test_is_initialized_true_at_construction():
+    """is_initialized is True at construction — both sub-caches pre-allocate storage."""
     cache = make_cache()
-    assert cache.is_initialized is False
-
-
-def test_is_initialized_true_after_all_layers_updated():
-    """is_initialized becomes True once every layer's sliding_window_cache has allocated storage."""
-    cache = make_cache()
-    for layer in cache.layers:
-        sw_update(layer, BATCH, 1)
     assert cache.is_initialized is True
 
 
 # ---------------------------------------------------------------------------
-# get_seq_length — delegates through layer to sliding-window path
+# get_seq_length — not supported
 # ---------------------------------------------------------------------------
 
-def test_get_seq_length_zero_at_construction():
-    """get_seq_length() returns 0 before any updates."""
+def test_get_seq_length_raises():
+    """get_seq_length() raises NotImplementedError — no scalar sequence length available."""
     cache = make_cache()
-    assert cache.get_seq_length() == 0
-
-
-def test_get_seq_length_reflects_sliding_window_updates():
-    """get_seq_length(layer_idx) reflects the cumulative token count for that layer."""
-    cache = make_cache()
-    sw_update(cache.layers[0], BATCH, 5)
-    assert cache.get_seq_length(layer_idx=0) == 5
-    sw_update(cache.layers[0], BATCH, 3)
-    assert cache.get_seq_length(layer_idx=0) == 8
-
-
-def test_get_seq_length_unaffected_by_mosrah_updates():
-    """get_seq_length() does not change when only mosrah_cache is updated."""
-    cache = make_cache()
-    mosrah_update(cache.layers[0], BATCH, 4)
-    assert cache.get_seq_length(layer_idx=0) == 0
-
-
-def test_get_seq_length_per_layer_independent():
-    """get_seq_length() reports the correct value for each layer independently."""
-    cache = make_cache(num_layers=3)
-    sw_update(cache.layers[0], BATCH, 2)
-    sw_update(cache.layers[2], BATCH, 7)
-    assert cache.get_seq_length(layer_idx=0) == 2
-    assert cache.get_seq_length(layer_idx=1) == 0
-    assert cache.get_seq_length(layer_idx=2) == 7
+    with pytest.raises(NotImplementedError):
+        cache.get_seq_length()
 
 
 # ---------------------------------------------------------------------------
@@ -201,13 +168,13 @@ def test_get_seq_length_per_layer_independent():
 # ---------------------------------------------------------------------------
 
 def test_reset_clears_all_sliding_window_caches():
-    """reset() clears the sliding-window cache in every layer."""
+    """reset() clears the sliding-window cache active mask in every layer."""
     cache = make_cache()
     for layer in cache.layers:
         sw_update(layer, BATCH, 3)
     cache.reset()
-    for i in range(NUM_LAYERS):
-        assert cache.get_seq_length(layer_idx=i) == 0
+    for layer in cache.layers:
+        assert not layer.sliding_window_cache.active_mask.any()
 
 
 def test_reset_clears_all_mosrah_caches():
@@ -224,7 +191,8 @@ def test_reset_on_fresh_cache_is_idempotent():
     """reset() on a fresh cache does not raise and leaves all layers in clean state."""
     cache = make_cache()
     cache.reset()
-    assert cache.get_seq_length() == 0
+    for layer in cache.layers:
+        assert not layer.sliding_window_cache.active_mask.any()
     for layer in cache.layers:
         assert layer.mosrah_cache.get_heads_lengths().sum() == 0
 
