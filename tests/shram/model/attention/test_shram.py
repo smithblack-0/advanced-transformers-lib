@@ -46,8 +46,8 @@ def make_config(**overrides) -> ShramConfig:
 def make_inputs(
     requires_grad: bool = False,
     start_position: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Construct a small model-space input and authoritative position tensor."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construct a small model-space input, authoritative position tensor, and all-live active mask."""
     hidden_states = torch.tensor(
         [[
             [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
@@ -64,7 +64,8 @@ def make_inputs(
         start_position + hidden_states.shape[1],
         dtype=torch.long,
     ).unsqueeze(0)
-    return hidden_states, position_ids
+    active_mask = torch.ones(1, hidden_states.shape[1], dtype=torch.bool)
+    return hidden_states, position_ids, active_mask
 
 
 def make_continued_decoding_inputs(
@@ -103,6 +104,8 @@ def make_layer_cache(
     """Construct a real per-layer SHRAM cache."""
     return ShramLayerCache(
         sliding_window=config.window_size,
+        num_local_heads=config.num_sliding_window_heads,
+        local_head_dim=config.head_dim,
         num_mosrah_heads=config.num_mosrah_heads,
         mosrah_head_dim=config.head_dim,
         batch_size=batch_size,
@@ -143,23 +146,26 @@ def first_parameter(module: torch.nn.Module) -> torch.nn.Parameter:
 class TestHybridComposition:
     def test_hybrid_output_equals_the_sum_of_the_real_local_and_sparse_paths(self):
         """The hybrid layer should compute H(x) = h_l(x) + h_s(x)."""
-        hidden_states, position_ids = make_inputs()
+        hidden_states, position_ids, active_mask = make_inputs()
         layer = make_layer(make_config(), seed=0)
 
         local_output = layer.local_attention(
             x=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         sparse_output, sparse_load_balance_loss, _ = layer.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
         hybrid_output, hybrid_load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
@@ -178,7 +184,7 @@ class TestHybridComposition:
 
     def test_zeroing_local_path_leaves_only_the_real_sparse_path_contribution(self):
         """If the local path is zeroed, the hybrid output should equal the sparse output."""
-        hidden_states, position_ids = make_inputs()
+        hidden_states, position_ids, active_mask = make_inputs()
         layer = make_layer(make_config(), seed=0)
 
         zero_module_parameters(layer.local_attention)
@@ -186,11 +192,13 @@ class TestHybridComposition:
         sparse_output, sparse_load_balance_loss, _ = layer.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         hybrid_output, hybrid_load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
@@ -209,7 +217,7 @@ class TestHybridComposition:
 
     def test_zeroing_sparse_path_leaves_only_the_real_local_path_contribution(self):
         """If the sparse path is zeroed, the hybrid output should equal the local output."""
-        hidden_states, position_ids = make_inputs()
+        hidden_states, position_ids, active_mask = make_inputs()
         layer = make_layer(make_config(), seed=0)
 
         zero_module_parameters(layer.sparse_attention)
@@ -217,16 +225,19 @@ class TestHybridComposition:
         local_output = layer.local_attention(
             x=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         hybrid_output, hybrid_load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         sparse_output, sparse_load_balance_loss, _ = layer.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
@@ -267,12 +278,13 @@ class TestRealExecution:
         rope_mode,
     ):
         """The real assembled hybrid layer should return (B, N, d) plus scalar loss."""
-        hidden_states, position_ids = make_inputs(start_position=0)
+        hidden_states, position_ids, active_mask = make_inputs(start_position=0)
         layer = make_layer(make_config(rope_mode=rope_mode), seed=0)
 
         hybrid_output, load_balance_loss, max_vio = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
@@ -286,20 +298,21 @@ class TestRealExecution:
 
     def test_uncached_nonzero_starting_positions_fail_explicitly(self):
         """Uncached hybrid execution must not accept nonzero starting positions."""
-        hidden_states, position_ids = make_inputs(start_position=10)
+        hidden_states, position_ids, active_mask = make_inputs(start_position=10)
         layer = make_layer(make_config(), seed=0)
 
         with pytest.raises(ValueError, match="nonzero starting positions"):
             layer(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
+                active_mask=active_mask,
                 cache=None,
             )
 
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
     def test_cached_execution_runs_sanely_with_the_real_per_layer_cache(self, rope_mode):
         """The real assembled hybrid layer should exercise both owned sub-caches."""
-        hidden_states, position_ids = make_inputs(start_position=0)
+        hidden_states, position_ids, active_mask = make_inputs(start_position=0)
         config = make_config(rope_mode=rope_mode)
         layer = make_layer(config, seed=0)
         layer_cache = make_layer_cache(
@@ -309,17 +322,21 @@ class TestRealExecution:
 
         prefix_hidden_states = hidden_states[:, :2]
         prefix_position_ids = position_ids[:, :2]
+        prefix_active_mask = active_mask[:, :2]
         current_hidden_states = hidden_states[:, 2:]
         current_position_ids = position_ids[:, 2:]
+        current_active_mask = active_mask[:, 2:]
 
         prefix_output, prefix_load_balance_loss, _ = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
+            active_mask=prefix_active_mask,
             cache=layer_cache,
         )
         current_output, current_load_balance_loss, _ = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
+            active_mask=current_active_mask,
             cache=layer_cache,
         )
 
@@ -330,10 +347,8 @@ class TestRealExecution:
         assert torch.isfinite(prefix_output).all()
         assert torch.isfinite(current_output).all()
 
-        # The local sliding-window cache owns the scalar sequence length, while
-        # the MoSRAH cache owns ragged per-head occupancy. Both should reflect
+        # The MoSRAH cache owns ragged per-head occupancy and should reflect
         # real use after cached hybrid execution.
-        assert layer_cache.get_seq_length() >= prefix_hidden_states.shape[1]
         assert torch.any(layer_cache.mosrah_cache.get_heads_lengths() > 0)
 
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
@@ -342,19 +357,22 @@ class TestRealExecution:
             rope_mode,
     ):
         """Cached hybrid execution should match the corresponding suffix of a full uncached run."""
-        hidden_states, position_ids = make_inputs(start_position=0)
+        hidden_states, position_ids, active_mask = make_inputs(start_position=0)
         config = make_config(rope_mode=rope_mode)
         layer = make_layer(config, seed=0)
 
         prefix_hidden_states = hidden_states[:, :2]
         prefix_position_ids = position_ids[:, :2]
+        prefix_active_mask = active_mask[:, :2]
         current_hidden_states = hidden_states[:, 2:]
         current_position_ids = position_ids[:, 2:]
+        current_active_mask = active_mask[:, 2:]
 
         # Legal uncached oracle: the entire sequence starts at zero.
         full_output, _, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
@@ -366,11 +384,13 @@ class TestRealExecution:
         _, _, _ = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
+            active_mask=prefix_active_mask,
             cache=layer_cache,
         )
         current_cached_output, current_cached_load_balance_loss, _ = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
+            active_mask=current_active_mask,
             cache=layer_cache,
         )
 
@@ -396,7 +416,7 @@ class TestRealExecution:
 class TestConfigurationResponse:
     def test_changing_total_mosrah_head_capacity_changes_the_real_hybrid_output(self):
         """Changing sparsity / total sparse routed capacity should change hybrid behavior."""
-        hidden_states, position_ids = make_inputs(start_position=0)
+        hidden_states, position_ids, active_mask = make_inputs(start_position=0)
 
         layer_a = make_layer(
             make_config(num_mosrah_heads=3, num_selected_heads=2),
@@ -410,11 +430,13 @@ class TestConfigurationResponse:
         output_a, _, _ = layer_a(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         output_b, _, _ = layer_b(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
@@ -454,8 +476,12 @@ class TestConfigurationResponse:
 
             prefix_hidden_states = hidden_states[:, :prefix_length]
             prefix_position_ids = position_ids[:, :prefix_length]
+            prefix_active_mask = torch.ones(1, prefix_length, dtype=torch.bool)
             current_hidden_states = hidden_states[:, prefix_length:]
             current_position_ids = position_ids[:, prefix_length:]
+            current_active_mask = torch.ones(
+                1, total_length - prefix_length, dtype=torch.bool
+            )
 
             main_sequence_cache = make_layer_cache(
                 main_sequence_config,
@@ -471,22 +497,26 @@ class TestConfigurationResponse:
             _, _, _ = main_sequence_layer(
                 hidden_states=prefix_hidden_states,
                 position_ids=prefix_position_ids,
+                active_mask=prefix_active_mask,
                 cache=main_sequence_cache,
             )
             _, _, _ = semantic_sequence_layer(
                 hidden_states=prefix_hidden_states,
                 position_ids=prefix_position_ids,
+                active_mask=prefix_active_mask,
                 cache=semantic_sequence_cache,
             )
 
             main_sequence_output, _, _ = main_sequence_layer(
                 hidden_states=current_hidden_states,
                 position_ids=current_position_ids,
+                active_mask=current_active_mask,
                 cache=main_sequence_cache,
             )
             semantic_sequence_output, _, _ = semantic_sequence_layer(
                 hidden_states=current_hidden_states,
                 position_ids=current_position_ids,
+                active_mask=current_active_mask,
                 cache=semantic_sequence_cache,
             )
 
@@ -506,7 +536,7 @@ class TestConfigurationResponse:
         )
     def test_changing_yarn_scale_changes_the_real_hybrid_output(self):
         """Changing sparse-path YaRN extrapolation scale should matter."""
-        hidden_states, position_ids = make_inputs(start_position=0)
+        hidden_states, position_ids, active_mask = make_inputs(start_position=0)
 
         standard_scale_layer = make_layer(
             make_config(
@@ -526,11 +556,13 @@ class TestConfigurationResponse:
         standard_scale_output, _, _ = standard_scale_layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         yarn_scaled_output, _, _ = yarn_scaled_layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
@@ -547,7 +579,7 @@ class TestConfigurationResponse:
 class TestGradientBehavior:
     def test_hybrid_output_backward_reaches_both_real_model_space_paths(self):
         """Gradients from the hybrid output should reach both real subpaths."""
-        hidden_states, position_ids = make_inputs(requires_grad=True, start_position=0)
+        hidden_states, position_ids, active_mask = make_inputs(requires_grad=True, start_position=0)
         layer = make_layer(make_config(), seed=0)
 
         local_param = first_parameter(layer.local_attention)
@@ -557,6 +589,7 @@ class TestGradientBehavior:
         hybrid_output, load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         del load_balance_loss
@@ -579,7 +612,7 @@ class TestGradientBehavior:
 
     def test_load_balance_loss_backward_reaches_the_sparse_balancing_path_and_causes_movement(self):
         """The returned load-balance loss should survive the hybrid layer and update expert_bias."""
-        hidden_states, position_ids = make_inputs(requires_grad=True, start_position=0)
+        hidden_states, position_ids, active_mask = make_inputs(requires_grad=True, start_position=0)
         layer = make_layer(make_config(), seed=0)
 
         local_param = first_parameter(layer.local_attention)
@@ -592,6 +625,7 @@ class TestGradientBehavior:
         hybrid_output, load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         del hybrid_output

@@ -49,6 +49,7 @@ class MoSRAHLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
+        active_mask: torch.Tensor,
         cache: MoSRAHCache | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the full MoSRAH sparse path.
@@ -56,6 +57,11 @@ class MoSRAHLayer(nn.Module):
         Args:
             hidden_states: Model-space hidden states x of shape (B, N, d).
             position_ids: Authoritative per-token positions of shape (B, N).
+            active_mask: Current-chunk active mask of shape (B, N), where True
+                means the token is semantically live. Forwarded to the router
+                so dead tokens are excluded from routing statistics, and to
+                pack_experts so dead outer tokens do not become semantically
+                active packed entries.
             cache: Optional layer-local MoSRAH cache. Pass None for uncached
                 execution and the layer-local cache instance for cached execution.
 
@@ -70,23 +76,28 @@ class MoSRAHLayer(nn.Module):
         # The first transition moves from model-space token-choice input into
         # the packed expert-choice sparse-attention state. Routing decides both
         # which experts each token uses and which unbiased probabilities must be
-        # reserved for the final reduction. Packing then realizes that routing
-        # decision in the expert-major frame BEA consumes, while carrying the
-        # authoritative upstream positions through the same rearrangement so
-        # packed hidden states and packed positions remain aligned.
+        # reserved for the final reduction. The active mask is forwarded to the
+        # router so dead tokens are excluded from routing statistics, and to
+        # pack_experts so outer liveness is faithfully carried into the packed
+        # frame. Packing returns both the unpacking mask (slot occupancy, always
+        # B*N*K True entries) and the packed active mask (live slots only);
+        # active_mask is rebound to the packed form after this point.
         # -------------------------------------------------------------------
-        selected_heads, routing_probs, load_balance_loss, max_vio = self.router(hidden_states)
+        selected_heads, routing_probs, load_balance_loss, max_vio = self.router(
+            hidden_states, active_mask
+        )
 
         flattened_selected_heads, permutation, inverse_permutation = setup_packing(
             selected_heads
         )
-        packed_hidden_states, packed_positions, active_mask = pack_experts(
+        packed_hidden_states, packed_positions, unpacking_mask, active_mask = pack_experts(
             hidden_states=hidden_states,
             position_ids=position_ids,
             selected_heads=selected_heads,
             num_experts=self.num_experts,
             flattened_selected_heads=flattened_selected_heads,
             permutation=permutation,
+            outer_active_mask=active_mask,
         )
 
         # -------------------------------------------------------------------
@@ -119,7 +130,7 @@ class MoSRAHLayer(nn.Module):
         token_choice_outputs = unpack_experts(
             expert_outputs=packed_outputs,
             selected_heads=selected_heads,
-            active_mask=active_mask,
+            unpacking_mask=unpacking_mask,
             inverse_permutation=inverse_permutation,
         )
         final_output = (

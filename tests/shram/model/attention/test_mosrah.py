@@ -41,8 +41,8 @@ def make_config(rope_mode: str = "main_sequence") -> ShramConfig:
 
 def make_inputs(
     requires_grad: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Construct a small model-space input and authoritative position tensor."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construct a small model-space input, authoritative position tensor, and all-live active mask."""
     hidden_states = torch.tensor(
         [[
             [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
@@ -54,7 +54,8 @@ def make_inputs(
         requires_grad=requires_grad,
     )
     position_ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
-    return hidden_states, position_ids
+    active_mask = torch.ones(1, 4, dtype=torch.bool)
+    return hidden_states, position_ids, active_mask
 
 
 def make_cache(config: ShramConfig, batch_size: int) -> MoSRAHCache:
@@ -83,11 +84,12 @@ class TestRealExecution:
         torch.manual_seed(0)
         config = make_config(rope_mode=rope_mode)
         layer = MoSRAHLayer(config)
-        hidden_states, position_ids = make_inputs()
+        hidden_states, position_ids, active_mask = make_inputs()
 
         sparse_output, load_balance_loss, max_vio = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
@@ -106,17 +108,20 @@ class TestRealExecution:
         config = make_config(rope_mode=rope_mode)
         layer = MoSRAHLayer(config)
 
-        hidden_states, position_ids = make_inputs()
+        hidden_states, position_ids, active_mask = make_inputs()
         prefix_hidden_states = hidden_states[:, :2]
         prefix_position_ids = position_ids[:, :2]
+        prefix_active_mask = active_mask[:, :2]
         current_hidden_states = hidden_states[:, 2:]
         current_position_ids = position_ids[:, 2:]
+        current_active_mask = active_mask[:, 2:]
 
         cache = make_cache(config, batch_size=hidden_states.shape[0])
 
         prefix_output, prefix_load_balance_loss, _ = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
+            active_mask=prefix_active_mask,
             cache=cache,
         )
         lengths_after_prefix = cache.get_heads_lengths().clone()
@@ -124,6 +129,7 @@ class TestRealExecution:
         current_output, current_load_balance_loss, _ = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
+            active_mask=current_active_mask,
             cache=cache,
         )
         lengths_after_current = cache.get_heads_lengths().clone()
@@ -131,6 +137,7 @@ class TestRealExecution:
         uncached_current_output, uncached_current_load_balance_loss, _ = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
+            active_mask=current_active_mask,
             cache=None,
         )
 
@@ -161,15 +168,18 @@ class TestRealExecution:
         config = make_config(rope_mode=rope_mode)
         layer = MoSRAHLayer(config)
 
-        hidden_states, position_ids = make_inputs()
+        hidden_states, position_ids, active_mask = make_inputs()
         prefix_hidden_states = hidden_states[:, :2]
         prefix_position_ids = position_ids[:, :2]
+        prefix_active_mask = active_mask[:, :2]
         current_hidden_states = hidden_states[:, 2:]
         current_position_ids = position_ids[:, 2:]
+        current_active_mask = active_mask[:, 2:]
 
         full_output, full_load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
 
@@ -178,11 +188,13 @@ class TestRealExecution:
         _, prefix_load_balance_loss, _ = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
+            active_mask=prefix_active_mask,
             cache=cache,
         )
         current_output, current_load_balance_loss, _ = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
+            active_mask=current_active_mask,
             cache=cache,
         )
 
@@ -216,11 +228,12 @@ class TestGradientFlow:
         torch.manual_seed(0)
         config = make_config("main_sequence")
         layer = MoSRAHLayer(config)
-        hidden_states, position_ids = make_inputs(requires_grad=True)
+        hidden_states, position_ids, active_mask = make_inputs(requires_grad=True)
 
         sparse_output, load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         del load_balance_loss
@@ -249,11 +262,12 @@ class TestGradientFlow:
         torch.manual_seed(0)
         config = make_config("main_sequence")
         layer = MoSRAHLayer(config)
-        hidden_states, position_ids = make_inputs(requires_grad=True)
+        hidden_states, position_ids, active_mask = make_inputs(requires_grad=True)
 
         sparse_output, load_balance_loss, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=None,
         )
         del sparse_output

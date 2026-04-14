@@ -39,6 +39,7 @@ class SHRAMHybridLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
+        active_mask: torch.Tensor,
         cache: ShramLayerCache | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply the SHRAM hybrid attention layer.
@@ -46,6 +47,9 @@ class SHRAMHybridLayer(nn.Module):
         Args:
             hidden_states: Input hidden states of shape (B, N, d).
             position_ids: Authoritative token positions of shape (B, N).
+            active_mask: Current-chunk active mask of shape (B, N), where True
+                means the token is semantically live. Forwarded unchanged to
+                both the local path and the sparse path.
             cache: Optional per-layer SHRAM cache. When provided, the owned
                 sliding-window and MoSRAH sub-caches are dispatched directly to
                 their corresponding attention paths.
@@ -91,11 +95,13 @@ class SHRAMHybridLayer(nn.Module):
         local_output = self.local_attention(
             x=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=sliding_window_cache,
         )
         sparse_output, load_balance_loss, max_vio = self.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=mosrah_cache,
         )
 

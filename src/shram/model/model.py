@@ -66,6 +66,7 @@ class ShramModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
+        active_mask: torch.Tensor,
         cache: ShramCache | None = None,
         output_hidden_states: bool = False,
     ) -> dict:
@@ -76,6 +77,9 @@ class ShramModel(nn.Module):
             position_ids: Absolute positions of shape (batch, seq_len). Required.
                 Must be provided explicitly by the caller — this module does not
                 infer positions from cache state.
+            active_mask: Current-chunk active mask of shape (batch, seq_len),
+                where True means the token is semantically live. Forwarded
+                unchanged to every decoder layer.
             cache: Optional top-level ShramCache. When provided, each DecoderLayer
                 receives its own layer-local cache via ``cache.layers[layer_idx]``.
                 The top-level cache object is updated in place and returned unchanged.
@@ -108,6 +112,7 @@ class ShramModel(nn.Module):
             hidden_states, layer_load_balance_loss, layer_max_vio = layer(
                 hidden_states,
                 position_ids,
+                active_mask,
                 cache=layer_cache,
             )
             total_load_balance_loss = total_load_balance_loss + layer_load_balance_loss

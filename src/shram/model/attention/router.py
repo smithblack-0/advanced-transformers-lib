@@ -69,12 +69,15 @@ class MoSRAHRouter(nn.Module):
         self.expert_bias = nn.Parameter(torch.zeros(config.num_mosrah_heads))
 
     def forward(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, active_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route input tokens to K expert heads each and compute routing probabilities.
 
         Args:
             x: Input hidden states of shape (batch, seq_len, hidden_size).
+            active_mask: Current-chunk active mask of shape (batch, seq_len), where
+                True means the token is semantically live. Dead tokens do not
+                contribute to routing frequencies, load_balance_loss, or max_vio.
 
         Returns:
             selected_heads: Head indices I of shape (batch, seq_len, num_selected_heads).
@@ -114,12 +117,16 @@ class MoSRAHRouter(nn.Module):
         gathered = routing_scores.gather(dim=-1, index=selected_heads)   # V, (B, N, K)
         routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)    # P, (B, N, K)
 
-        # Routing frequency f_l: fraction of (batch, token, head_slot) triples that
-        # assigned to each head. Scatter selected_heads into a boolean assignment mask M
-        # of shape (B, N, L), then sum over batch and sequence dimensions.
+        # Routing frequency f_l: fraction of active (batch, token, head_slot) triples
+        # assigned to each head. Dead tokens are excluded by zeroing their rows in the
+        # assignment mask before reduction. Normalization uses the active assignment
+        # count so frequencies remain properly scaled regardless of how many tokens
+        # are live in this chunk.
         assignment_mask = torch.zeros(B, N, L, device=x.device, dtype=x.dtype)
         assignment_mask.scatter_(-1, selected_heads, 1.0)
-        routing_freqs = assignment_mask.sum(dim=(0, 1)) / (B * N * K)   # f, (L,)
+        active_assignments = assignment_mask * active_mask.unsqueeze(-1)
+        num_active_assignments = active_mask.sum() * K
+        routing_freqs = active_assignments.sum(dim=(0, 1)) / num_active_assignments  # f, (L,)
 
         # Load balance loss via custom autograd. expert_bias is an input so PyTorch
         # registers it as a graph node; the custom backward writes the DeepSeek-style

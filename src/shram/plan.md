@@ -47,11 +47,14 @@ is being achieved, one verified unit at a time.
 - [X] Unit 12 — DecoderLayer: replace attention sublayer, propagate load_balance_loss
 - [X] Unit 13 — ShramModel: aggregate load_balance_loss in output
 - [X] Unit 14.A (Blocker) — MaxVio routing-imbalance metric: computation and end-to-end threading
-- [ ] Unit 14.B (Blocker) — We do in fact need to support masking.
+- [X] Unit 14.B (Blocker) — We do in fact need to support masking.
 - [X] Unit 14.C (Blocker) — LocalSlidingWindowLayerCache: local cache with update/retrieval contract for masked continuation
 - [X] Unit 14.D (Blocker) — Local cache wiring: replace DynamicSlidingWindowLayer in ShramLayerCache/ShramCache, retire scalar seq-length
-- [ ] Unit 14.E (Blocker) — SlidingWindowAttention: consume new local cache contract, construct effective mask from returned state
-- [ ] Unit 14.F (Blocker) — Mask plumbing through SHRAM orchestration stack; expert packing liveness at materialization boundary
+- [X] Unit 14.E (Blocker) — SlidingWindowAttention: consume new local cache contract, construct effective mask from returned state
+- [X] Unit 14.F (Blocker) — Expert packing and unpacking masked continuation delta: pack outer_active_mask as a third tensor through expert-major transformation; return unpacking_mask and active_mask as distinct outputs
+- [X] Unit 14.G (Blocker) — MoSRAH router masked continuation delta: exclude dead tokens from routing frequency statistics and normalization
+- [X] Unit 14.H (Blocker) — MoSRAHLayer masked continuation delta: wire updated router and pack_experts contracts into MoSRAHLayer call sites
+- [X] Unit 14.I (Blocker) — Mask plumbing through SHRAMHybridLayer, DecoderLayer, and ShramModel
 - [ ] Unit 15 — ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
 - [ ] Unit 16 — upload_to_hub
 - [ ] Unit 17 — documentation
@@ -1432,7 +1435,7 @@ Under masked continuation, the local path no longer operates in a regime where e
 
 **Context of Correctness** 
 
-LocalSlidingWindowLayerCache returns what is in essence the stored sliding window context concatenated with our new updates. It does no further processing than this. In order for the system to continue to operate correctly it is necessary to modify the local sliding window system's masking mechanism to both respond to a directly passed (no cache) mask and the mask that may be passed back by the sliding window cache. This is despite the fact packing may not be contingous; in theory, the cache can return a scenario where tokens 1, 2, 3 are live, 4, 5 are dead, and 6-10 are live again. Worse, this masking is different for different batches. The existing local path already owns local causal/window semantics and already uses a FlexAttention-style formulation. The modifications should be able to be performed by setting up the SlidingWindowAttention to accept the passed-in model.py mask format, run it throguh (or skip) the cache, then correctly construct and handle attention causally and locally regardless of what the mask ends up becoming.
+LocalSlidingWindowLayerCache returns what is in essence the stored sliding window context concatenated with our new updates. It does no further processing than this. In order for the system to continue to operate correctly it is necessary to modify the local sliding window system's masking mechanism 14to both respond to a directly passed (no cache) mask and the mask that may be passed back by the sliding window cache. This is despite the fact packing may not be contingous; in theory, the cache can return a scenario where tokens 1, 2, 3 are live, 4, 5 are dead, and 6-10 are live again. Worse, this masking is different for different batches. The existing local path already owns local causal/window semantics and already uses a FlexAttention-style formulation. The modifications should be able to be performed by setting up the SlidingWindowAttention to accept the passed-in model.py mask format, run it throguh (or skip) the cache, then correctly construct and handle attention causally and locally regardless of what the mask ends up becoming.
 
 **New / changed contract:**
 - `SlidingWindowAttention` accepts the current-chunk active mask as described in 14.B in addition to its existing inputs.
@@ -1534,40 +1537,73 @@ The sparse-path packing boundary now handles semantic suppression of dead outer 
 - Normalize routing frequencies by the number of active token/head assignments rather than by the total raw token count.
 - If the all-dead case is possible, define its router outputs explicitly rather than allowing divide-by-zero behavior.
 
-### Unit 14.H (Blocker) — Mask Plumbing Through MoSRAH and SHRAM Orchestration
+### Unit 14.H (Blocker) — MoSRAHLayer Masked Continuation Delta
 
-**Change delta from 14.B–14.G:** Thread the current-chunk active mask through the remaining SHRAM orchestration and MoSRAH boundaries so the updated local cache, local attention, router, and packing systems all receive the information they now require.
+**Change delta from 14.F and 14.G:** Wire the updated contracts from `pack_experts` (14.F) and `MoSRAHRouter` (14.G) into `MoSRAHLayer` so the layer correctly calls its sub-components with the active mask they now require.
 
 **Context of Correctness**
 
-After 14.C–14.G, the affected local and sparse subunits have mask-aware contracts, but those contracts are not yet useful until the current-chunk active mask is threaded through the surrounding SHRAM stack. The remaining work here is therefore interface plumbing: the same current-chunk mask must reach the local path, the sparse packing path, and the router, without introducing new semantics at the orchestration layers.
-
-The relevant boundaries are `ShramModel`, `DecoderLayer`, `SHRAMHybridLayer`, and `MoSRAHLayer`. `ShramLayerCache` / `ShramCache` ownership changes were handled earlier; this unit concerns call signatures and mask forwarding.
+14.F and 14.G updated `pack_experts` and `MoSRAHRouter` to accept and use `outer_active_mask`/`active_mask`, but `MoSRAHLayer` still calls both with the old signatures. Three call sites are broken: the router call is missing `active_mask`, `pack_experts` is missing `outer_active_mask` and its 3-tuple unpack is now wrong (it returns 4), and `unpack_experts` receives `active_mask` where it now expects `unpacking_mask`. This unit fixes those call sites. It is internal rewiring of `MoSRAHLayer` — not plumbing above it, and not changes to the sub-components themselves.
 
 **New / changed contract:**
-- `ShramModel`, `DecoderLayer`, and `SHRAMHybridLayer` accept and pass through the current-chunk active mask required by the updated local and sparse paths.
-- `MoSRAHLayer` accepts the current-chunk active mask in addition to its existing inputs.
-- `MoSRAHLayer` passes the current-chunk active mask to `MoSRAHRouter`.
-- `MoSRAHLayer` passes the current-chunk active mask to `pack_experts(...)`.
+- `MoSRAHLayer.forward` accepts `active_mask: torch.Tensor` of shape `(B, N)` in addition to its existing inputs.
+- `MoSRAHLayer` passes `active_mask` to `MoSRAHRouter`.
+- `MoSRAHLayer` passes `active_mask` as `outer_active_mask` to `pack_experts`.
+- `MoSRAHLayer` correctly unpacks all four return values from `pack_experts`: `packed_hidden_states`, `packed_positions`, `unpacking_mask`, `active_mask`.
+- `MoSRAHLayer` passes `unpacking_mask` (not `active_mask`) to `unpack_experts`.
+- `MoSRAHLayer` passes `active_mask` (packed semantic liveness) to BEA.
+- All-live behavior remains semantically equivalent to pre-blocker behavior.
+
+**What should stay unchanged:**
+- `MoSRAHRouter`, `pack_experts`, `unpack_experts`, and BEA internals are not modified.
+- `MoSRAHLayer` does not gain new attention semantics; it remains an orchestration layer for its sub-components.
+- This unit does not thread the active mask above `MoSRAHLayer`; that is 14.I.
+
+**Tests delta:**
+- Add coverage that dead outer tokens do not affect `load_balance_loss` or `max_vio` at the `MoSRAHLayer` boundary.
+- Add coverage that dead outer tokens produce suppressed outputs from `MoSRAHLayer` (BEA receives the correct packed active mask).
+- Add all-live equivalence coverage against pre-blocker `MoSRAHLayer` behavior.
+
+**Preliminary notes:**
+- Keep this unit strictly to the three broken call sites in `mosrah.py`.
+- The four-value unpack from `pack_experts` — `(packed_hidden_states, packed_positions, unpacking_mask, active_mask)` — is the key structural change; verify the names are not swapped.
+
+### Unit 14.I (Blocker) — Mask Plumbing Through SHRAMHybridLayer, DecoderLayer, and ShramModel
+
+**Change delta from 14.B–14.H:** Thread the current-chunk active mask through the remaining SHRAM orchestration layers so both attention paths receive it at runtime.
+
+**Context of Correctness**
+
+After 14.C–14.H, all sub-units have mask-aware contracts. The remaining work is pure interface plumbing: the same current-chunk mask must be accepted at the `ShramModel` boundary and forwarded unchanged through `DecoderLayer` and `SHRAMHybridLayer` to both the local path and the (now mask-wired) `MoSRAHLayer`. No new semantics are introduced at these orchestration layers.
+
+**New / changed contract:**
+- `ShramModel.forward` accepts `active_mask: torch.Tensor` of shape `(B, N)` as a required parameter.
+- `ShramModel` forwards `active_mask` to each `DecoderLayer`.
+- `DecoderLayer.forward` accepts and forwards `active_mask` to `SHRAMHybridLayer`.
+- `SHRAMHybridLayer.forward` accepts `active_mask` and passes it to both the local attention path and `MoSRAHLayer`.
 - The same current-chunk active mask reaches both the local path and the sparse path.
-- No new attention semantics are introduced at these orchestration layers; they remain orchestration layers.
+- No new attention semantics are introduced at these orchestration layers.
 - Existing all-live behavior remains semantically equivalent to pre-blocker behavior.
 
 **What should stay unchanged:**
 - SHRAM hybrid semantics remain `H(x) = h_l(x) + h_s(x)`.
 - Decoder residual / pre-norm structure remains unchanged.
-- Model-level aggregation semantics remain unchanged except for carrying the new mask input through the stack.
-- This unit does not redefine local attention semantics, router semantics, packing semantics, or BEA semantics.
+- `MoSRAHLayer`, `SlidingWindowAttention`, `MoSRAHRouter`, `pack_experts`, and BEA internals are not modified.
 
 **Tests delta:**
-- Add coverage that the same current-chunk active mask reaches both the local path and the sparse path.
-- Add coverage that `MoSRAHLayer` forwards the current-chunk active mask to both the router and the packing boundary.
-- Add all-live equivalence coverage for the orchestration path.
+- Add coverage that the same active mask reaches both the local path and the sparse path through `SHRAMHybridLayer`.
+- Add all-live equivalence coverage for the orchestration path end to end.
+
+**Audit requirements**
+- Inspect `SHRAMHybridLayer.forward` and verify that the same `active_mask` is passed to both `self.local_attention(...)` and `self.sparse_attention(...)` — not two independently constructed masks.
+- Inspect `DecoderLayer.forward` and verify that `active_mask` is forwarded to `self.attention(...)` without modification.
+- Inspect `ShramModel.forward` and verify that `active_mask` is passed to every `layer(...)` call in the decoder loop without modification.
 
 **Preliminary notes:**
-- Keep this unit narrow: it is interface plumbing, not a new semantics unit.
-- Prefer explicit signature updates over hidden state or implicit mask recovery.
-- If implementation reveals another boundary that must forward the current-chunk active mask, surface it rather than silently expanding scope.
+- Keep this unit narrow: call-signature updates and forwarding only.
+- Prefer explicit required parameters over optional defaults — the active mask is always required.
+- Note that `DecoderLayer` already has a `mask` parameter that is received but not forwarded; determine whether it is this active mask or a different artifact, and resolve cleanly.
+- If implementation reveals any further boundary requiring the mask, surface it rather than silently expanding scope.
 
 ### Unit 15 — ShramForCausalLM
 

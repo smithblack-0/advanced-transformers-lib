@@ -57,7 +57,7 @@ def make_input(
     batch: int = 2,
     seq: int = 4,
     seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     random_generator = torch.Generator(device="cpu")
     random_generator.manual_seed(seed)
 
@@ -68,7 +68,8 @@ def make_input(
         generator=random_generator,
     )
     position_ids = torch.arange(seq, dtype=torch.long).unsqueeze(0).expand(batch, -1)
-    return x, position_ids
+    active_mask = torch.ones(batch, seq, dtype=torch.bool)
+    return x, position_ids, active_mask
 
 
 def make_layer_cache(
@@ -78,6 +79,8 @@ def make_layer_cache(
 ) -> ShramLayerCache:
     return ShramLayerCache(
         sliding_window=config.window_size,
+        num_local_heads=config.num_sliding_window_heads,
+        local_head_dim=config.head_dim,
         num_mosrah_heads=config.num_mosrah_heads,
         mosrah_head_dim=config.head_dim,
         batch_size=batch_size,
@@ -116,11 +119,12 @@ class TestRuntimeSmoke:
         """DecoderLayer should preserve (B, N, d) and return finite scalar loss."""
         config = small_config()
         layer = make_layer(config, seed=0)
-        x, position_ids = make_input(config, batch=2, seq=4, seed=1)
+        x, position_ids, active_mask = make_input(config, batch=2, seq=4, seed=1)
 
         output, load_balance_loss, max_vio = layer(
             x,
             position_ids,
+            active_mask,
             cache=None,
         )
 
@@ -136,11 +140,12 @@ class TestRuntimeSmoke:
         """A real DecoderLayer should not be dead or bypassed with respect to x."""
         config = small_config()
         layer = make_layer(config, seed=0)
-        x, position_ids = make_input(config, batch=1, seq=4, seed=2)
+        x, position_ids, active_mask = make_input(config, batch=1, seq=4, seed=2)
 
         baseline_output, baseline_load_balance_loss, _ = layer(
             x,
             position_ids,
+            active_mask,
             cache=None,
         )
 
@@ -150,6 +155,7 @@ class TestRuntimeSmoke:
         perturbed_output, perturbed_load_balance_loss, _ = layer(
             perturbed_x,
             position_ids,
+            active_mask,
             cache=None,
         )
 
@@ -174,16 +180,18 @@ class TestRuntimeSmoke:
         input_seeds = list(range(10))
 
         for input_seed in input_seeds:
-            x, _ = make_input(config, batch=1, seq=4, seed=input_seed)
+            x, _, active_mask = make_input(config, batch=1, seq=4, seed=input_seed)
 
             output_a, _, _ = layer(
                 x,
                 position_ids_a,
+                active_mask,
                 cache=None,
             )
             output_b, _, _ = layer(
                 x,
                 position_ids_b,
+                active_mask,
                 cache=None,
             )
 
@@ -205,11 +213,13 @@ class TestRuntimeSmoke:
         config = small_config()
         layer = make_layer(config, seed=0)
 
-        x, position_ids = make_input(config, batch=1, seq=4, seed=3)
+        x, position_ids, active_mask = make_input(config, batch=1, seq=4, seed=3)
         prefix_x = x[:, :2]
         prefix_position_ids = position_ids[:, :2]
+        prefix_active_mask = active_mask[:, :2]
         current_x = x[:, 2:]
         current_position_ids = position_ids[:, 2:]
+        current_active_mask = active_mask[:, 2:]
 
         layer_cache = make_layer_cache(
             config,
@@ -220,11 +230,13 @@ class TestRuntimeSmoke:
         prefix_output, prefix_load_balance_loss, _ = layer(
             prefix_x,
             prefix_position_ids,
+            prefix_active_mask,
             cache=layer_cache,
         )
         current_output, current_load_balance_loss, _ = layer(
             current_x,
             current_position_ids,
+            current_active_mask,
             cache=layer_cache,
         )
 

@@ -55,7 +55,7 @@ class DecoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
-        mask: torch.Tensor,
+        active_mask: torch.Tensor,
         cache: ShramLayerCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply one decoder block to the input.
@@ -63,7 +63,9 @@ class DecoderLayer(nn.Module):
         Args:
             x: Input of shape (batch, seq_len, hidden_size).
             position_ids: Authoritative positions of shape (batch, seq_len).
-            mask: An attention mask of shape (batch, possibly_other_sequence_length).
+            active_mask: Current-chunk active mask of shape (batch, seq_len),
+                where True means the token is semantically live. Forwarded
+                unchanged to the hybrid attention layer.
             cache: Optional per-layer SHRAM cache passed through to the hybrid
                 attention layer unchanged.
 
@@ -77,6 +79,7 @@ class DecoderLayer(nn.Module):
         attn_out, load_balance_loss, max_vio = self.attention(
             hidden_states=self.attn_norm(x),
             position_ids=position_ids,
+            active_mask=active_mask,
             cache=cache,
         )
         hidden_states = x + attn_out

@@ -94,6 +94,8 @@ def make_cache(
     return ShramCache(
         num_hidden_layers=config.num_hidden_layers,
         sliding_window=config.window_size,
+        num_local_heads=config.num_sliding_window_heads,
+        local_head_dim=config.head_dim,
         num_mosrah_heads=config.num_mosrah_heads,
         mosrah_head_dim=config.head_dim,
         batch_size=batch_size,
@@ -113,7 +115,7 @@ class TestOutputContract:
         model = make_model(config, seed=0)
 
         inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=1)
-        out = model(inputs_embeds, position_ids(1, 4))
+        out = model(inputs_embeds, position_ids(1, 4), torch.ones(1, 4, dtype=torch.bool))
 
         assert type(out) is dict
         assert set(out.keys()) == {
@@ -130,7 +132,7 @@ class TestOutputContract:
         model = make_model(config, seed=0)
 
         inputs_embeds = random_embeds(2, 5, config.hidden_size, seed=2)
-        out = model(inputs_embeds, position_ids(2, 5))
+        out = model(inputs_embeds, position_ids(2, 5), torch.ones(2, 5, dtype=torch.bool))
 
         assert out["last_hidden_state"].shape == (2, 5, config.hidden_size)
         assert out["load_balance_loss"].ndim == 0
@@ -155,6 +157,7 @@ class TestHiddenStates:
         out = model(
             inputs_embeds,
             position_ids(1, 4),
+            torch.ones(1, 4, dtype=torch.bool),
             output_hidden_states=False,
         )
 
@@ -169,6 +172,7 @@ class TestHiddenStates:
         out = model(
             inputs_embeds,
             position_ids(1, 4),
+            torch.ones(1, 4, dtype=torch.bool),
             output_hidden_states=True,
         )
 
@@ -195,6 +199,7 @@ class TestCacheBoundary:
         out = model(
             inputs_embeds,
             position_ids(1, 4),
+            torch.ones(1, 4, dtype=torch.bool),
             cache=None,
         )
 
@@ -211,6 +216,7 @@ class TestCacheBoundary:
         out = model(
             inputs_embeds,
             position_ids(1, 4),
+            torch.ones(1, 4, dtype=torch.bool),
             cache=cache,
         )
 

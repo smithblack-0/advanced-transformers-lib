@@ -240,6 +240,11 @@ Tests are first-class artifacts of this project. They are written alongside the 
 **1. Plan first.**
 Before writing any code, produce a complete plan covering: module structure, implementation order, and known decision points requiring user input. Submit the plan for user review and do not proceed until approved.
 
+**1a. Agree before acting.**
+Review and implementation are distinct scopes. Transitioning from review or discussion into code requires explicit agreement from both parties. There is no way for correct modifications to the codebase to be made without an agreed scope — acting outside of one means all results, human or AI, are wrong by definition, regardless of whether the code appears correct in isolation. A process violation here does not produce questionable work; it produces invalid work, and that work is rolled back without review. Both parties must reach explicit consensus before any edit is made.
+
+Part of that consensus — and what the implementer should actively seek — is the scope of autonomy: a clear statement of what can be determined independently and what cannot. One valid answer is "you may figure this out yourself," but the critical output is knowing what lies outside that grant. This is isomorphic to clarifying the specification before work begins. Without a defined scope of autonomy there is no basis for correct implementation decisions, and the implementer must stop and ask rather than assume.
+
 **2. Keep the plan current.**
 Update the plan and status continuously as work proceeds. The plan must reflect actual current state at all times so that work can be resumed after a session interruption without loss.
 
