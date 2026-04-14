@@ -1611,11 +1611,8 @@ After 14.C–14.H, all sub-units have mask-aware contracts. The remaining work i
 
 **Context of Correctness**
 
-`ShramForCausalLM` is not the transformer backbone and it is not where SHRAM attention semantics are defined. Those responsibilities belong below this boundary. The correct role of this unit is instead to act as the HuggingFace-facing wrapper: it owns the token-level interface, satisfies the causal language model contract expected by training and generation flows, and translates between that external contract and the pre-embedded backbone contract implemented by `ShramModel`.
+`ShramForCausalLM` is the huggingface interface boundary. It is responsible for best satisfying and ensuring the satisfaction of huggingface expectations and standards. Huggingface expects token embedding lookup, vocabulary projection, next-token loss handling, weight tying, wrapper-level cache construction/resolution, wrapper-level positional-generation wiring, and truthful exposure of backbone-produced auxiliary or monitoring values to downstream HuggingFace-facing consumers to be on this unit. It also expects to be able to pass in positional ids if needed during generation, a whole-sequence mask, and preferably would not use the cache location feature as that is becoming obsolete. 
 
-This is therefore the correct unit for token embedding lookup, vocabulary projection, next-token loss handling, weight tying, wrapper-level cache construction/resolution, wrapper-level positional-generation wiring, and truthful exposure of backbone-produced auxiliary or monitoring values to downstream HuggingFace-facing consumers. It is also the correct unit to surface blockers required for truthful HuggingFace support, because those blockers belong to the wrapper boundary rather than to the backbone or attention internals.
-
-This unit should preserve delegation wherever possible. Transformer computation, decoder-stack behavior, SHRAM attention behavior, and backbone-level metric semantics are not redefined here; they are delegated to `ShramModel`. The wrapper's job is to supply the correct token/interface behavior above that model and to expose the resulting outputs truthfully at the HuggingFace boundary.
 
 **Invariants this unit must satisfy:**
 
@@ -1627,30 +1624,33 @@ This unit should preserve delegation wherever possible. Transformer computation,
 - `load_balance_loss` is present in the forward output as a scalar auxiliary training value. The training loop is responsible for the paper's scaling weight; this model does not apply it.
 - `max_vio` is present in the forward output as a detached scalar monitoring value. It is the layer-maximum value produced by `ShramModel` and is not modified here.
 - The wrapper preserves standard wrapper responsibilities such as weight tying, output-head exposure, and compatibility with the expected HuggingFace causal-LM wrapper interface, unless a behavior is explicitly excluded.
-- The unit owns cache resolution at the HuggingFace wrapper boundary.
+- The unit owns cache resolution at the HuggingFace wrapper boundary. It also owns mask slicing in terms of the relevant recent sequence, as described in 14.B.
 - When cached execution or generation requires internal cache construction at this boundary, the constructed cache is a `ShramCache`, not a plain `DynamicCache`.
 - A caller who supplies an explicit `ShramCache` as `past_key_values` has that cache used unchanged.
-- `use_cache=True` is supported at this wrapper boundary.
-- Under supported cached execution, the `past_key_values` flowing through this unit is always a `ShramCache`.
-- This unit preserves truthful wrapper-level positional/cache wiring needed for generation. If HuggingFace supplies generation-time cache-position information, this unit uses or forwards it correctly rather than inventing conflicting wrapper-level position state.
-- The unit satisfies the externally relevant HuggingFace causal-LM contract where support is implemented and raises explicitly where support is not truthfully implemented.
+- `use_cache=True` is supported at this wrapper boundary. Not using cache does not genrate a ShramCache
 - Unsupported HuggingFace-facing behavior must fail explicitly rather than being silently accepted with wrong semantics.
 - Tests and design for this unit are structured so the unit can be trusted as a verified black box by downstream training, generation, and hub-facing consumers.
 
 **Tests:**
 
+Training unit:
 - Verify the forward output exposes `load_balance_loss` and that it is a finite scalar.
 - Verify the forward output exposes `max_vio`, that it is a finite scalar, and that it is detached.
 - Verify the wrapper still produces logits of shape `(B, N, vocab_size)`.
 - Verify wrapper-level causal-LM loss is present when labels are provided and absent when labels are not provided.
 - Verify wrapper-level causal-LM loss still applies the correct next-token shift.
 - Verify tied-embedding behavior remains correct when configured.
+- Verify torch dynamo compiles, or discuss verifying it on the backbone level
+
+Inference unit:
+
 - Verify `generate()` may be called successfully in ordinary token generation.
 - Verify `generate()` may be called successfully in beam search.
-- Verify `generate()` may be called successfully in direct reconstructive / contrastive search if that strategy remains supported by the SHRAM cache stack.
-- Verify `generate()` called with an explicit `ShramCache` uses that cache unchanged.
-- Verify KV cache accumulates correctly across decode steps under supported generation.
+- Verify `generate()` may be called successfully in direct reconstructive / contrastive search (or discuss removing it if unsupported).
+- Verify `generate()` called with an explicit `ShramCache` uses that cache.
+- Verify `generate()` may be called with a sequence of raggedly batched input prompts, and this successfully operates. 
 - Verify unsupported HuggingFace-facing behaviors fail explicitly rather than being silently accepted.
+- Verify 
 
 **Audit**
 
@@ -1658,7 +1658,6 @@ This unit should preserve delegation wherever possible. Transformer computation,
 - Verify embeddings are created at this boundary and logits are produced at this boundary rather than inside `ShramModel`.
 - Verify wrapper-level label shifting and loss computation occur here rather than being delegated downward or expected from the caller.
 - Verify internally constructed caches at the cached-forward / generation boundary are `ShramCache` objects rather than generic HuggingFace dynamic caches.
-- Verify explicitly supplied `ShramCache` instances are passed through unchanged.
 - Verify `load_balance_loss` and `max_vio` are exposed truthfully from the backbone result rather than recomputed or semantically altered here.
 - Verify commonly used HuggingFace-facing support has been evaluated and is either implemented truthfully or explicitly excluded.
 - Verify any existing wrapper behaviors that remain unsupported, such as behaviors with no truthful SHRAM boundary meaning, raise explicitly and do not silently degrade.
@@ -1667,14 +1666,16 @@ This unit should preserve delegation wherever possible. Transformer computation,
 
 - Treat this as a wrapper-boundary update, not a backbone redesign.
 - Preserve the existing HuggingFace wrapper structure wherever it remains truthful, and extend it only where SHRAM-specific cache and output requirements demand it.
+- Make sure to audit how huggingface ideomatically wants to be implemented and use the correct version. If this means a major refactor, discuss it and insert it as a blocker (one unit, 14, has already been done in this way.)
 - `ShramModel` should continue to receive pre-embedded hidden states rather than token IDs.
 - The wrapper should continue to own embedding lookup, LM-head projection, label-shifted CE loss, and weight tying.
+- The wrapper should continue to support any needed functionality such as reinitializing or reshaping heads.
 - The likely override point for ensuring `generate()` constructs a `ShramCache` is `_prepare_cache_for_generation(generation_config, model_kwargs, generation_mode, batch_size, max_cache_length)`. If the ground situation shows a different HuggingFace hook is now responsible, that should be surfaced rather than worked around silently.
-- If GenerationMixin supplies generation-time `cache_position`, wrapper behavior should remain aligned with that contract. For decode of `M` new tokens when `N` tokens are already cached, the effective generation position state should correspond to `N, N+1, ..., N+M-1`; if no tokens are yet cached, it should begin at zero.
+- Other such generation or preparitory helper functions should be examined for any needed changes. 
 - Prefer runtime tests for real wrapper behavior and use audit for structural delegation and cache-construction facts that are better checked by direct inspection than by brittle implementation-shaped tests.
 - If HuggingFace-facing support obligations are discovered that are not yet truthfully satisfied, surface them as blockers rather than filling gaps silently.
 
-### Unit 15 — upload_to_hub.py
+### Unit 16 — upload_to_hub.py
 
 **What:** Adapt the upload script for the SHRAM model type. Update class names, model type
 string, and model card content. Register `ShramConfig` and `ShramForCausalLM` with the AutoClass
@@ -1687,7 +1688,7 @@ API and push all model files to the Hub.
 
 ---
 
-### Unit 16 — Documentation
+### Unit 17 — Documentation
 
 **What:** Write `documentation.md` covering design decisions, deviations from the paper, and
 limitations. Update `README.md` with accurate architectural details. Record every open decision
@@ -1700,7 +1701,7 @@ resolved during implementation and the rationale for each.
 
 ---
 
-### Unit 17 — End-to-End Tests
+### Unit 18 — End-to-End Tests
 
 **What:** Full-stack smoke tests: instantiate from config, run a training step, verify loss
 decreases. Include load-balance loss in the training step. Include network tests for the Hub
@@ -1714,7 +1715,7 @@ round-trip.
 
 ---
 
-### Unit 18 — Final Audit
+### Unit 19 — Final Audit
 
 **What:** Review every file in `src/shram/` against the invariants in `job.md`. Verify no
 hardcoded values, no missing documentation, no gaps between tests and intent. Apply the
