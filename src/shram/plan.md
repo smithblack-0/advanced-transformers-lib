@@ -1715,7 +1715,7 @@ This blocker exists because Unit 15 wrapper/generation compatibility cannot be c
 
 - Cache storage is not initialized from a fixed presumed batch size.
 - Batch size is removed as a cache-construction requirement where it is currently baked into SHRAM cache initialization.
-- Cache initialization instead occurs lazily from the first runtime key/value tensors presented through the HuggingFace cache pathway.
+STO- Cache initialization instead occurs lazily from the first runtime key/value tensors presented through the HuggingFace cache pathway.
 - The resulting cache shape truthfully matches the actual inference batch shape in use at that point.
 - `LocalSlidingWindowLayerCache`, `ShramLayerCache`, and `ShramCache` continue to expose correct `batch_repeat_interleave` behavior for HuggingFace generation pathways that expand batch structure.
 - Existing cache semantics other than construction timing/shape source remain unchanged unless required for compatibility with the lazy-init design.
