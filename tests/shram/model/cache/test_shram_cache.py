@@ -156,11 +156,18 @@ def test_is_initialized_true_at_construction():
 # get_seq_length — not supported
 # ---------------------------------------------------------------------------
 
-def test_get_seq_length_raises():
-    """get_seq_length() raises NotImplementedError — no scalar sequence length available."""
+def test_get_seq_length_returns_cumulative_token_count():
+    """get_seq_length() returns the cumulative processed token count from layer 0's local path."""
     cache = make_cache()
-    with pytest.raises(NotImplementedError):
-        cache.get_seq_length()
+    sw_update(cache.layers[0], BATCH, 4)
+    assert cache.get_seq_length() == 4
+
+
+def test_get_seq_length_uses_specified_layer():
+    """get_seq_length(layer_idx) delegates to the correct layer."""
+    cache = make_cache(num_layers=3)
+    sw_update(cache.layers[1], BATCH, 7)
+    assert cache.get_seq_length(layer_idx=1) == 7
 
 
 # ---------------------------------------------------------------------------

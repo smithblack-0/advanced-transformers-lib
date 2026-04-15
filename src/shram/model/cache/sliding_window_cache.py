@@ -94,6 +94,11 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
 
         self.is_initialized = True
 
+        # Cumulative count of all token positions presented through update() for
+        # this cache instance. This is the quantity HuggingFace generation reads
+        # through get_seq_length() to track how far along the sequence we are.
+        self._total_processed: int = 0
+
     def update(  # type: ignore[override]
         self,
         key_states: torch.Tensor,
@@ -143,6 +148,8 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
             composite_values=composite_values,
             composite_mask=composite_mask,
         )
+
+        self._total_processed += key_states.shape[2]
 
         return composite_keys, composite_values, composite_mask
 
@@ -207,11 +214,14 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         self.active_mask = composite_mask[:, -self.sliding_window :]
 
     def get_seq_length(self) -> int:
-        raise NotImplementedError(
-            "LocalSlidingWindowLayerCache does not expose a single scalar "
-            "sequence length. Ragged masked continuation makes a single truthful "
-            "scalar unavailable at this cache boundary."
-        )
+        """Return the cumulative number of token positions processed by this cache.
+
+        This is the total count of token positions presented across all update()
+        calls since construction or the last reset(). It is the quantity HuggingFace
+        generation reads to track sequence progress and is not the same as active-token
+        count or current window occupancy.
+        """
+        return self._total_processed
 
     def get_max_cache_shape(self) -> int:
         return self.sliding_window
@@ -229,6 +239,7 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         self.keys.zero_()
         self.values.zero_()
         self.active_mask.zero_()
+        self._total_processed = 0
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
         """Reorder the batch dimension for beam search."""

@@ -57,10 +57,36 @@ def test_get_max_cache_shape_returns_configured_window():
     assert cache.get_max_cache_shape() == 7
 
 
-def test_get_seq_length_raises_not_implemented():
+def test_get_seq_length_is_zero_at_construction():
     cache = make_cache(sliding_window=3, batch_size=1)
-    with pytest.raises(NotImplementedError):
-        cache.get_seq_length()
+    assert cache.get_seq_length() == 0
+
+
+def test_get_seq_length_counts_first_chunk():
+    cache = make_cache(sliding_window=3, batch_size=1)
+    cache.update(k([[1.0, 2.0, 3.0]]), v([[1.0, 2.0, 3.0]]), m([[True, True, True]]))
+    assert cache.get_seq_length() == 3
+
+
+def test_get_seq_length_accumulates_across_updates():
+    cache = make_cache(sliding_window=3, batch_size=1)
+    cache.update(k([[1.0, 2.0]]), v([[1.0, 2.0]]), m([[True, True]]))
+    cache.update(k([[3.0]]), v([[3.0]]), m([[True]]))
+    assert cache.get_seq_length() == 3
+
+
+def test_get_seq_length_counts_all_positions_not_just_active():
+    # Dead positions still count toward processed sequence length.
+    cache = make_cache(sliding_window=3, batch_size=1)
+    cache.update(k([[1.0, 2.0]]), v([[1.0, 2.0]]), m([[False, True]]))
+    assert cache.get_seq_length() == 2
+
+
+def test_get_seq_length_resets_to_zero_after_reset():
+    cache = make_cache(sliding_window=3, batch_size=1)
+    cache.update(k([[1.0, 2.0]]), v([[1.0, 2.0]]), m([[True, True]]))
+    cache.reset()
+    assert cache.get_seq_length() == 0
 
 
 def test_get_mask_sizes_raises_not_implemented():

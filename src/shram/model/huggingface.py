@@ -200,8 +200,12 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
         if not generation_config.use_cache:
             return
 
+        num_repeats = max(
+            generation_config.num_beams,
+            generation_config.num_return_sequences,
+        )
         model_kwargs["past_key_values"] = self._build_shram_cache(
-            batch_size=batch_size,
+            batch_size=batch_size*num_repeats,
             device=self.embed_tokens.weight.device,
         )
 

@@ -13,9 +13,9 @@ behind a single update() would hide those differences behind a misleading abstra
 each attention path calls update() on the sub-cache it owns. ShramLayerCache acts as the
 ownership, coordination, and reset/reorder boundary for one decoder layer.
 
-No scalar sequence length is exposed at this boundary. Ragged masked continuation means
-different batch items may carry different numbers of live tokens, making a single truthful
-scalar unavailable. get_seq_length() raises NotImplementedError.
+Sequence length at this boundary is reported by delegating to the local sliding-window
+sub-cache, which tracks the cumulative count of token positions processed. This is the
+quantity HuggingFace generation reads through get_seq_length().
 """
 
 import torch
@@ -36,9 +36,8 @@ class ShramLayerCache(CacheLayerMixin):
     exposed directly for their downstream attention paths — no composite update() interface is
     provided, because the two paths have materially different update semantics.
 
-    No scalar sequence length is exposed at this boundary. Ragged masked continuation means
-    different batch items may carry different numbers of live tokens, making a single truthful
-    scalar unavailable. get_seq_length() raises NotImplementedError.
+    Sequence length is reported by delegating to the local sliding-window sub-cache, which
+    tracks the cumulative count of token positions processed across all update() calls.
 
     Args:
         sliding_window: Number of tokens retained by the local sliding-window cache.
@@ -109,15 +108,13 @@ class ShramLayerCache(CacheLayerMixin):
     # ---------------------------------------------------------------------------
 
     def get_seq_length(self) -> int:  # type: ignore[override]
-        """Not supported — no single scalar sequence length is available at this boundary.
+        """Return the cumulative sequence length from the local sliding-window path.
 
-        Ragged masked continuation means different batch items may carry different numbers
-        of live tokens, making a truthful scalar unavailable.
+        The local path is authoritative for sequence progress: it sees every token
+        presented to this layer and accumulates a truthful total. Delegates to
+        sliding_window_cache.get_seq_length().
         """
-        raise NotImplementedError(
-            "ShramLayerCache has no single scalar sequence length. "
-            "Ragged masked continuation makes a truthful scalar unavailable."
-        )
+        return self.sliding_window_cache.get_seq_length()
 
     def reset(self) -> None:
         """Clear both sub-caches.

@@ -14,8 +14,8 @@ The library is a repository, not a PyPI package. Distribution is via HuggingFace
 
 ## Governing Principle
 
-Hours of LLM work rejected due to failing to follow governing principles: 6
-Total sessions completely rolled back: 4
+Hours of LLM work rejected due to failing to follow governing principles: 7
+Total sessions completely rolled back: 5
 **These rules are serious**
 
 This is a research baseline, not a software project. That distinction determines everything about how this work is done.

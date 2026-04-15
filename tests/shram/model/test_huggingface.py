@@ -410,6 +410,7 @@ def test_shram_cache_initializes_correctly_for_batch_size_two() -> None:
         num_mosrah_heads=4,
         mosrah_head_dim=16,
         device=torch.device("cpu"),
+        batch_size=2,
     )
 
     layer_cache = cache.layers[0]

@@ -13,9 +13,9 @@ nor the model-level boundary here can meaningfully unify them. Callers must reac
 relevant sub-cache directly. ShramCache's role is ownership, construction, and model-wide
 coordination of the layer caches — not routing attention inputs.
 
-No scalar sequence length is exposed at this boundary. Ragged masked continuation means
-different batch items may carry different numbers of live tokens, making a single truthful
-scalar unavailable. get_seq_length() raises NotImplementedError.
+Sequence length is reported by delegating to the local sliding-window sub-cache of the
+specified layer, which tracks the cumulative count of token positions processed. This is
+what HuggingFace generation reads through get_seq_length().
 """
 
 import torch
@@ -90,15 +90,14 @@ class ShramCache(Cache):
     #   immediately after ShramCache.__init__ returns.
 
     def get_seq_length(self, layer_idx: int = 0) -> int:  # type: ignore[override]
-        """Not supported — no single scalar sequence length is available at this boundary.
+        """Return the cumulative sequence length for the specified layer.
 
-        Ragged masked continuation means different batch items may carry different numbers
-        of live tokens, making a truthful scalar unavailable at any cache boundary.
+        Delegates to the layer cache at layer_idx, which in turn delegates to the
+        local sliding-window sub-cache. That sub-cache is authoritative for sequence
+        progress: it sees every token presented to the layer and accumulates a truthful
+        total count. Defaults to layer 0, which is sufficient for HuggingFace generation.
         """
-        raise NotImplementedError(
-            "ShramCache has no single scalar sequence length. "
-            "Ragged masked continuation makes a truthful scalar unavailable."
-        )
+        return self.layers[layer_idx].get_seq_length()
 
     # ---------------------------------------------------------------------------
     # Cache — unsupported methods

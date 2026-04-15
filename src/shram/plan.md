@@ -58,8 +58,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 15.A — Audit report on tied embeddings
 - [X] Unit 15.B — Custom output class for huggingface
 - [X] Unit 15.C (Blocker) — get sequence length cache support
-- [ ] Unit 15.D (Blocker) — Lazy cache initialization for beam search
-- [ ] Unit 15.E ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
+- [X] Unit 15.D ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
 - [ ] Unit 16 — upload_to_hub
 - [ ] Unit 17 — documentation
 - [ ] Unit 18 — end-to-end tests
@@ -1699,44 +1698,7 @@ Because built-in generation depends on this value, Unit 15.C cannot be completed
 - Source `ShramCache.get_seq_length()` by forwarding the truthful per-layer value exposed at the layer-cache boundary.
 - If no contradictory ground truth appears in the code, avoid involving MoSRAH occupancy or active-mask semantics in this scalar sequence-length concept.
 
-### Unit 15.D (Blocker) — Lazy Cache Initialization for Variable Inference Batch Shapes
-
-**Responsibility:** Rework the SHRAM cache stack so cache storage is initialized from the actual runtime tensor shapes seen during inference, rather than from a fixed presumed batch size.
-
-**Context of Correctness**
-
-Beam search is failing. The HuggingFace caching system operates on slightly different premises than originally presumed. It was originally assumed that information would always pass through the model in shapes tied to the originally presumed batch sizing; this is not always true. As a result, inference can construct caches of the wrong batch shape.
-
-Fortunately, HuggingFace already provides a lazy cache-initialization pathway: the cache can be initialized from the incoming key/value tensors when they first arrive at the correct runtime shape. Therefore the fix is not to guess batch size more cleverly, but to stop treating it as fixed cache construction data at all.
-
-This blocker exists because Unit 15 wrapper/generation compatibility cannot be completed correctly while cache construction still bakes in the wrong batch shape. The cache stack must instead initialize from actual runtime tensor shapes and continue to support HuggingFace’s batch-expansion pathways such as beam search.
-
-**Invariants this unit must satisfy:**
-
-- Cache storage is not initialized from a fixed presumed batch size.
-- Batch size is removed as a cache-construction requirement where it is currently baked into SHRAM cache initialization.
-STO- Cache initialization instead occurs lazily from the first runtime key/value tensors presented through the HuggingFace cache pathway.
-- The resulting cache shape truthfully matches the actual inference batch shape in use at that point.
-- `LocalSlidingWindowLayerCache`, `ShramLayerCache`, and `ShramCache` continue to expose correct `batch_repeat_interleave` behavior for HuggingFace generation pathways that expand batch structure.
-- Existing cache semantics other than construction timing/shape source remain unchanged unless required for compatibility with the lazy-init design.
-- The design does not rely on a fixed training/inference batch-size assumption.
-
-**Tests**
-
-- Add or update cache tests so at least one cache is first initialized from tensors with batch size 2 rather than only batch size 1.
-- Add or update tests to verify lazy cache initialization uses the runtime tensor batch shape rather than a fixed constructor batch size.
-- Add or update tests for `batch_repeat_interleave` so the cache stack still behaves correctly under HuggingFace batch-expansion pathways.
-- Add or update wrapper/generation tests as needed so the previous wrong-shape beam-search failure path is no longer hit.
-
-**Preliminary implementation strategy:**
-
-- Remove fixed batch-size cache construction where possible rather than trying to preserve it. This includes from the config itself. 
-- Prefer HuggingFace’s lazy cache-init pathway and size storage from the first real key/value tensors.
-- Rewire the SHRAM cache stack so top-level and per-layer cache construction no longer depend on a presumed batch size.
-- Preserve and verify `batch_repeat_interleave` across all relevant cache layers so later HuggingFace batch expansion remains correct.
-- If a cache layer can defer allocation cleanly until first update, prefer that over placeholder allocation with guessed shape.
-
-### Unit 15.E — ShramForCausalLM
+### Unit 15.D — ShramForCausalLM
 
 **Responsibility:** Define and verify the top-level HuggingFace-facing causal language model boundary for SHRAM. This unit owns the token embedding, LM head, wrapper-level causal-LM loss behavior, HuggingFace generation/cache orchestration at the wrapper boundary, and translation between HuggingFace-facing token inputs/outputs and the delegated `ShramModel` backbone.
 

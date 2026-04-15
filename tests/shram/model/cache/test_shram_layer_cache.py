@@ -136,11 +136,11 @@ def test_sliding_window_cache_has_correct_window():
     assert cache.sliding_window_cache.sliding_window == SLIDING_WINDOW
 
 
-def test_get_seq_length_raises():
-    """get_seq_length() raises NotImplementedError — no scalar sequence length available."""
+def test_get_seq_length_delegates_to_sliding_window_cache():
+    """get_seq_length() returns the cumulative token count from the local sliding-window path."""
     cache = make_cache()
-    with pytest.raises(NotImplementedError):
-        cache.get_seq_length()
+    sw_update(cache, BATCH, 5)
+    assert cache.get_seq_length() == 5
 
 
 def test_mosrah_cache_has_correct_buffer_shape():
