@@ -23,7 +23,7 @@ from src.shram.tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
 
-REPO_ID = "smithblack-0/shram"
+REPO_ID = "smithblack-0/SHRAM"
 MODEL_DIR = Path(__file__).parent / "model"
 _CARD_TEMPLATE = Path(__file__).parent / "model_card.md"
 
@@ -44,11 +44,16 @@ def _render_config_table(config: ShramConfig) -> str:
         ("hidden_size", config.hidden_size),
         ("intermediate_size", config.intermediate_size),
         ("num_hidden_layers", config.num_hidden_layers),
-        ("num_attention_heads", config.num_attention_heads),
-        ("num_key_value_heads", config.num_key_value_heads),
+        ("num_sliding_window_heads", config.num_sliding_window_heads),
+        ("num_mosrah_heads", config.num_mosrah_heads),
+        ("num_selected_heads", config.num_selected_heads),
         ("head_dim", config.head_dim),
-        ("max_position_embeddings", config.max_position_embeddings),
-        ("rope_theta", config.rope_theta),
+        ("window_size", config.window_size),
+        ("rope_mode", config.rope_mode),
+        ("local_rope_theta", config.local_rope_theta),
+        ("mosrah_rope_theta", config.mosrah_rope_theta),
+        ("training_sequence_length", config.training_sequence_length),
+        ("inference_sequence_length", config.inference_sequence_length),
     ]
     lines = ["| Parameter | Default |", "|-----------|---------|"]
     for name, value in rows:
@@ -109,6 +114,7 @@ def upload(repo_id: str = REPO_ID) -> None:
     upload_folder(
         repo_id=repo_id,
         folder_path=MODEL_DIR,
+        path_in_repo="architecture_core",
         repo_type="model",
         ignore_patterns=["__pycache__", "*.pyc"],
         commit_message="Update architecture and tokenizer",

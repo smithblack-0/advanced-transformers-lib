@@ -1771,14 +1771,18 @@ Inference unit:
 
 ### Unit 16 — upload_to_hub.py
 
-**What:** Adapt the upload script for the SHRAM model type. Update class names, model type
-string, and model card content. Register `ShramConfig` and `ShramForCausalLM` with the AutoClass
-API and push all model files to the Hub. Stop publishing defaults as though they are the model parameters; save that for pretrained model saving. Consider adding a save_pretrained_model_to_hub to huggingface.py for saving configured models with their configs to huggingface.py
+**Responsibility:** Publish the SHRAM architecture and tokenizer to the HuggingFace Hub so a researcher can instantiate a freshly initialized model with no local setup beyond `pip install transformers`.
+
+**Context of Correctness:** The upload script was written for the Llama 3 baseline and has not been adapted for SHRAM. It references wrong parameter names, presents default values under framing that implies a pretrained checkpoint rather than a configurable architecture, and targets the wrong repository and path. A researcher following the published usage instructions against the current Hub state would get errors or a misleading model card.
 
 **Invariants this unit must satisfy:**
-- A freshly instantiated model can be round-tripped: upload → `from_pretrained` → forward pass.
-- The model card accurately describes the SHRAM architecture.
-- No weights are uploaded. No checkpoint is assumed.
+
+- Architecture files are uploaded under the `architecture_core` path within the repository.
+- No weight files are uploaded.
+- The model card accurately identifies this as the SHRAM architecture, not Llama.
+- The model card presents constructor default values explicitly framed as overridable defaults, not as the parameters of a pretrained model.
+
+**Preliminary implementation strategy:** Three files need changes. In `upload_to_hub.py`: update `REPO_ID` to `smithblack-0/SHRAM`, add `path_in_repo="architecture_core"` to the `upload_folder` call, and replace the Llama field names in `_render_config_table` with the SHRAM field names from `ShramConfig`. In `model_card.md`: rewrite for SHRAM — correct the title, remove the `llama` tag, update the license section, and reframe the defaults table section header and surrounding copy to make clear these are overridable constructor defaults, not pretrained model parameters.
 
 ---
 
