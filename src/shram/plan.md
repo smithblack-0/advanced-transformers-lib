@@ -55,7 +55,11 @@ is being achieved, one verified unit at a time.
 - [X] Unit 14.G (Blocker) — MoSRAH router masked continuation delta: exclude dead tokens from routing frequency statistics and normalization
 - [X] Unit 14.H (Blocker) — MoSRAHLayer masked continuation delta: wire updated router and pack_experts contracts into MoSRAHLayer call sites
 - [X] Unit 14.I (Blocker) — Mask plumbing through SHRAMHybridLayer, DecoderLayer, and ShramModel
-- [ ] Unit 15 — ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
+- [X] Unit 15.A — Audit report on tied embeddings
+- [X] Unit 15.B — Custom output class for huggingface
+- [X] Unit 15.C (Blocker) — get sequence length cache support
+- [ ] Unit 15.D (Blocker) — Lazy cache initialization for beam search
+- [ ] Unit 15.E ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
 - [ ] Unit 16 — upload_to_hub
 - [ ] Unit 17 — documentation
 - [ ] Unit 18 — end-to-end tests
@@ -1605,7 +1609,134 @@ After 14.C–14.H, all sub-units have mask-aware contracts. The remaining work i
 - Note that `DecoderLayer` already has a `mask` parameter that is received but not forwarded; determine whether it is this active mask or a different artifact, and resolve cleanly.
 - If implementation reveals any further boundary requiring the mask, surface it rather than silently expanding scope.
 
-### Unit 15 — ShramForCausalLM
+### Unit 15.A
+
+SHRAM supports both tied and untied embedding configurations by config. Because HuggingFace save/load behavior needs to know whether a given model instance actually uses tied weights, this decision cannot be treated as a fixed class-wide fact.
+
+**Procedures**
+
+- Probed the HuggingFace save/load path directly.
+- Checked whether pretrained loading preserves preexisting tensor aliasing.
+- Checked where HuggingFace records and reads tied-weight declarations.
+- Checked whether constructor-time config rebuilding occurs before checkpoint loading.
+
+**Findings**
+
+- HuggingFace during pretrained-model load may overwrite parameter objects rather than merely filling existing tensor storage, and save/load bookkeeping must know about intentional ties.
+- Although pretrained loading does construct the model from config first, later load steps may replace parameters, so constructor-created aliasing is not by itself a complete serialization guarantee.
+- Therefore the only safe action is:
+  - if tied embeddings are enabled, tie the embeddings and store the tied declaration at `_tied_weights_keys`
+  - if tied embeddings are disabled, do neither
+
+### Unit 15.B — SHRAM CausalLM Output
+
+`ShramForCausalLM` must expose a HuggingFace-causal-LM-compatible wrapper output while also truthfully surfacing SHRAM-specific monitoring and auxiliary values produced by the backbone.
+
+**Invariants this unit must satisfy:**
+
+- The wrapper output preserves the standard causal-LM boundary information expected by HuggingFace-facing consumers:
+  - logits,
+  - past_key_values,
+  - hidden_states,
+  - loss when labels are provided.
+- The wrapper output also exposes:
+  - `load_balance_loss` as a scalar auxiliary training value,
+  - `max_vio` as a detached scalar monitoring value.
+- `load_balance_loss` and `max_vio` are surfaced truthfully from the backbone result and are not recomputed or semantically altered in the wrapper.
+- The output type is SHRAM-specific and exists to extend the standard causal-LM wrapper output with these additional fields.
+- The output remains compatible with normal HuggingFace-facing access patterns for causal-LM outputs.
+
+**Tests:**
+
+- Verify the output exposes the standard causal-LM wrapper fields.
+- Verify the output exposes `load_balance_loss` and `max_vio`.
+- Verify `load_balance_loss` is finite when present.
+- Verify `max_vio` is finite when present and detached.
+
+**Audit:**
+
+- Verify the output type exists only to extend the wrapper boundary truthfully and does not move backbone semantics upward into the wrapper.
+- Verify `load_balance_loss` and `max_vio` are passed through from `ShramModel` rather than recomputed.
+
+**Preliminary implementation strategy:**
+
+- Introduce a small SHRAM-specific output type that extends the standard causal-LM output shape with `load_balance_loss` and `max_vio`.
+- Keep this unit narrow: output contract only, no wrapper-behavior changes here.
+- 
+### Unit 15.C (Blocker) — Top-Level Sequence Length for HuggingFace Generation
+
+**Responsibility:** Restore truthful top-level sequence-length reporting for the SHRAM cache stack so built-in HuggingFace generation can operate against `ShramCache`.
+
+**Context of Correctness**
+
+The HuggingFace decoding system, even in greedy modes, requires the ability to tell how many tokens have previously been generated. It asks this through `get_seq_length()`, which is currently configured to throw an error.
+
+We previously chose to throw because ragged-batch cache state seemed to prevent a truthful scalar report. That was a misunderstanding of what HuggingFace is asking for here. It does not need the number of currently active tokens in the cache; it needs the total sequence length processed so far for the current sequence. The local sliding-window path now provides a simpler place to track that quantity truthfully.
+
+Because built-in generation depends on this value, Unit 15.C cannot be completed correctly until the cache stack reports it.
+
+**Invariants this unit must satisfy:**
+
+- `LocalSlidingWindowLayerCache` tracks the cumulative total number of tokens processed for the current sequence.
+- That tracked quantity is total processed sequence length, not active-token count and not current window occupancy.
+- `ShramLayerCache.get_seq_length()` reports this value truthfully for the layer.
+- `ShramCache.get_seq_length()` reports this value truthfully at the top-level HuggingFace cache boundary.
+- This sequence-length report is compatible with ordinary HuggingFace generation usage.
+- Existing cache semantics for masking, ragged expert-state handling, and local/sliding-window behavior are otherwise unchanged.
+- The design does not infer sequence length from MoSRAH ragged occupancy.
+
+**Tests**
+
+- Add or update tests for `LocalSlidingWindowLayerCache` to verify cumulative processed-token count across repeated updates.
+- Add or update tests for `ShramLayerCache` to verify `get_seq_length()` reports the local cache’s cumulative processed-token count.
+- Add or update tests for `ShramCache` to verify top-level `get_seq_length()` reports the truthful model-wide sequence length.
+- Add or update HuggingFace wrapper/generation tests as needed so the previous `get_seq_length()` failure path is no longer hit during ordinary generation.
+
+**Preliminary implementation strategy:**
+
+- Prefer tracking cumulative processed tokens directly in `LocalSlidingWindowLayerCache` rather than reconstructing sequence length indirectly from other cache state.
+- Source `ShramLayerCache.get_seq_length()` from the local/sliding-window side, where total sequence progress is naturally defined.
+- Source `ShramCache.get_seq_length()` by forwarding the truthful per-layer value exposed at the layer-cache boundary.
+- If no contradictory ground truth appears in the code, avoid involving MoSRAH occupancy or active-mask semantics in this scalar sequence-length concept.
+
+### Unit 15.D (Blocker) — Lazy Cache Initialization for Variable Inference Batch Shapes
+
+**Responsibility:** Rework the SHRAM cache stack so cache storage is initialized from the actual runtime tensor shapes seen during inference, rather than from a fixed presumed batch size.
+
+**Context of Correctness**
+
+Beam search is failing. The HuggingFace caching system operates on slightly different premises than originally presumed. It was originally assumed that information would always pass through the model in shapes tied to the originally presumed batch sizing; this is not always true. As a result, inference can construct caches of the wrong batch shape.
+
+Fortunately, HuggingFace already provides a lazy cache-initialization pathway: the cache can be initialized from the incoming key/value tensors when they first arrive at the correct runtime shape. Therefore the fix is not to guess batch size more cleverly, but to stop treating it as fixed cache construction data at all.
+
+This blocker exists because Unit 15 wrapper/generation compatibility cannot be completed correctly while cache construction still bakes in the wrong batch shape. The cache stack must instead initialize from actual runtime tensor shapes and continue to support HuggingFace’s batch-expansion pathways such as beam search.
+
+**Invariants this unit must satisfy:**
+
+- Cache storage is not initialized from a fixed presumed batch size.
+- Batch size is removed as a cache-construction requirement where it is currently baked into SHRAM cache initialization.
+- Cache initialization instead occurs lazily from the first runtime key/value tensors presented through the HuggingFace cache pathway.
+- The resulting cache shape truthfully matches the actual inference batch shape in use at that point.
+- `LocalSlidingWindowLayerCache`, `ShramLayerCache`, and `ShramCache` continue to expose correct `batch_repeat_interleave` behavior for HuggingFace generation pathways that expand batch structure.
+- Existing cache semantics other than construction timing/shape source remain unchanged unless required for compatibility with the lazy-init design.
+- The design does not rely on a fixed training/inference batch-size assumption.
+
+**Tests**
+
+- Add or update cache tests so at least one cache is first initialized from tensors with batch size 2 rather than only batch size 1.
+- Add or update tests to verify lazy cache initialization uses the runtime tensor batch shape rather than a fixed constructor batch size.
+- Add or update tests for `batch_repeat_interleave` so the cache stack still behaves correctly under HuggingFace batch-expansion pathways.
+- Add or update wrapper/generation tests as needed so the previous wrong-shape beam-search failure path is no longer hit.
+
+**Preliminary implementation strategy:**
+
+- Remove fixed batch-size cache construction where possible rather than trying to preserve it. This includes from the config itself. 
+- Prefer HuggingFace’s lazy cache-init pathway and size storage from the first real key/value tensors.
+- Rewire the SHRAM cache stack so top-level and per-layer cache construction no longer depend on a presumed batch size.
+- Preserve and verify `batch_repeat_interleave` across all relevant cache layers so later HuggingFace batch expansion remains correct.
+- If a cache layer can defer allocation cleanly until first update, prefer that over placeholder allocation with guessed shape.
+
+### Unit 15.E — ShramForCausalLM
 
 **Responsibility:** Define and verify the top-level HuggingFace-facing causal language model boundary for SHRAM. This unit owns the token embedding, LM head, wrapper-level causal-LM loss behavior, HuggingFace generation/cache orchestration at the wrapper boundary, and translation between HuggingFace-facing token inputs/outputs and the delegated `ShramModel` backbone.
 
@@ -1629,6 +1760,7 @@ After 14.C–14.H, all sub-units have mask-aware contracts. The remaining work i
 - A caller who supplies an explicit `ShramCache` as `past_key_values` has that cache used unchanged.
 - `use_cache=True` is supported at this wrapper boundary. Not using cache does not genrate a ShramCache
 - Unsupported HuggingFace-facing behavior must fail explicitly rather than being silently accepted with wrong semantics.
+- Tied embeddings are supported. They are both directly tied for immediate usage, and declared as instance variables on the huggingface instance field for saving and loading purposes.
 - Tests and design for this unit are structured so the unit can be trusted as a verified black box by downstream training, generation, and hub-facing consumers.
 
 **Tests:**
@@ -1679,7 +1811,7 @@ Inference unit:
 
 **What:** Adapt the upload script for the SHRAM model type. Update class names, model type
 string, and model card content. Register `ShramConfig` and `ShramForCausalLM` with the AutoClass
-API and push all model files to the Hub.
+API and push all model files to the Hub. Stop publishing defaults as though they are the model parameters; save that for pretrained model saving. Consider adding a save_pretrained_model_to_hub to huggingface.py for saving configured models with their configs to huggingface.py
 
 **Invariants this unit must satisfy:**
 - A freshly instantiated model can be round-tripped: upload → `from_pretrained` → forward pass.
