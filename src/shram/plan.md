@@ -59,7 +59,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 15.B — Custom output class for huggingface
 - [X] Unit 15.C (Blocker) — get sequence length cache support
 - [X] Unit 15.D ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
-- [ ] Unit 16 — upload_to_hub
+- [X] Unit 16 — upload_to_hub
 - [ ] Unit 17 — documentation
 - [ ] Unit 18 — end-to-end tests
 - [ ] Unit 19 — final audit

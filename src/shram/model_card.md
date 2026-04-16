@@ -34,10 +34,16 @@ All other components follow the Llama 3 baseline (RMSNorm, SwiGLU FFN, RoPE).
 
 ## Usage
 
+This repository contains no pretrained weights. The intended workflow is: pull the
+architecture config from the Hub, instantiate a model with fresh random weights, then
+train it yourself.
+
 ```python
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-# Pull architecture config — override any parameter at instantiation time
+# Step 1: pull the architecture config from the Hub.
+# AutoConfig.from_pretrained downloads config.json only — no weights are loaded.
+# Override any parameter via kwargs.
 config = AutoConfig.from_pretrained(
     "{repo_id}",
     trust_remote_code=True,
@@ -45,15 +51,19 @@ config = AutoConfig.from_pretrained(
     num_mosrah_heads=32,        # example override
 )
 
-# Instantiate with fresh random weights — no checkpoint required
+# Step 2: instantiate with fresh random weights.
+# from_config never loads a checkpoint — it always produces a randomly initialised model.
 model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
-# Load tokenizer
+# Step 3: load the tokenizer.
 tokenizer = AutoTokenizer.from_pretrained("{repo_id}")
+```
 
-# Save and reload after training
-model.save_pretrained("./checkpoint")
-model = AutoModelForCausalLM.from_pretrained("./checkpoint", trust_remote_code=True)
+After training your own checkpoint, save and reload it in the standard way:
+
+```python
+model.save_pretrained("./my-checkpoint")
+model = AutoModelForCausalLM.from_pretrained("./my-checkpoint", trust_remote_code=True)
 ```
 
 ## Constructor Defaults
