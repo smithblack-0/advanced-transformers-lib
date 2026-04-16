@@ -1788,15 +1788,44 @@ Inference unit:
 
 ### Unit 17 — Documentation
 
-**What:** Write `documentation.md` covering design decisions, deviations from the paper, and
-limitations. Update `README.md` with accurate architectural details. Record every open decision
-resolved during implementation and the rationale for each.
+**Responsibility:** Define and verify the documentation surface needed for a user or maintainer to understand, control, use, and continue maintaining the SHRAM portion of the repository in support of the corresponding SHRAM/SRAM-effect paper.
+
+**Context of Correctness**
+
+The SRAM effect is a hypothesized trade that lets certain classes of models trade parameters for long-sequence performance at a linear asymptotic rate; details are available in the corresponding paper. Probing this effect required the construction of a complex and unusual SHRAM subsystem inside a broader multi-model repository. Keeping that SHRAM portion of the repository usable and understandable, while preserving its connection to the paper and supporting ongoing maintenance, is therefore a critical part of correctly studying the effect.
 
 **Invariants this unit must satisfy:**
-- Every open decision resolved during implementation is recorded with its rationale.
-- Limitations are documented explicitly, including any known train/inference mismatches.
-- The model card accurately describes the SHRAM variant.
 
+- The documentation explains, at a brief operational level, what the SHRAM portion of the repository is for and how it relates to the corresponding paper.
+- The documentation makes the connection to the paper explicit and easy to find.
+- The documentation tells a user how to instantiate and use the SHRAM portion of the repository at its intended surface, rather than forcing them to infer basic usage from source code.
+- The documentation identifies the main SHRAM control surfaces relevant to operating or probing the system, without trying to restate the full theory from the paper.
+- The documentation identifies the major caveats or unusual usage constraints a user must know in order to use the SHRAM portion of the repository correctly.
+- - The documentation provides sufficient context for ongoing maintenance of the SHRAM portion of the repository.
+- The documentation explains the relevant software-artifact surface: where the important SHRAM entrypoints are, how this part of the repository is structured at a high level, and how new versions are uploaded or exposed.
+- The documentation defers deeper theory, proofs, and detailed architectural justification to the paper rather than attempting to duplicate them.
+- The documentation is sufficient for a technically competent reader to understand how to operate and maintain the SHRAM portion of the repository in support of the paper.
+
+** Audit**
+
+- Verify a reader can identify what the SHRAM portion of the repository is for and how it relates to the paper from the documentation alone.
+- Verify the paper is linked or otherwise made easy to find from the SHRAM documentation surface.
+- Verify a reader can find the main SHRAM usage entrypoints without reading implementation files first.
+- Verify a reader can find the major SHRAM control knobs or operational surfaces relevant to running or probing the system.
+- Verify major SHRAM caveats and unusual usage constraints are documented.
+- Verify the upload/versioning path for SHRAM is documented or linked from the relevant documentation surface.
+- Verify the documentation makes clear how SHRAM sits alongside the repository’s other model implementations.
+- Verify the documentation provides enough context that future maintenance of the SHRAM section does not require reconstructing project intent only from code or old plan history.
+- Verify the documentation does not try to reproduce the paper’s deeper theory where a short explanation plus a pointer is more correct.
+
+**Preliminary implementation strategy**
+
+- Use the top-level repository documentation as the main user-facing operating surface, with SHRAM-specific documentation attached to the SHRAM portion of the repo.
+- Explain briefly what the SRAM effect / SHRAM system is trying to probe, then point outward to the paper for theory and deeper architectural justification.
+- Document the practical SHRAM surface: structure, usage entrypoints, control knobs, caveats, maintenance-relevant context, and upload/version workflow.
+- Document SHRAM as one model family within a broader repository rather than as a standalone project.
+- Prefer short operational explanations plus links over reproducing long theoretical sections from the paper.
+- If possible, make the paper directly accessible from the SHRAM documentation surface so the repository and paper remain visibly connected.
 ---
 
 ### Unit 18 — End-to-End Tests
