@@ -24,9 +24,9 @@ def make_config(rope_mode: str = "main_sequence") -> ShramConfig:
     """Construct a small SHRAM config for MoSRAH path tests."""
     return ShramConfig(
         vocab_size=128,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
+        embedding_width=8,
+        mlp_width=16,
+        num_decoder_layers=1,
         num_sliding_window_heads=2,
         num_mosrah_heads=3,
         num_selected_heads=2,

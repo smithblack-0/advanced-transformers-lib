@@ -20,7 +20,8 @@ overridable at instantiation time via kwargs.
 
 > **Important:** `trust_remote_code=True` is required. It downloads the architecture
 > source files from the Hub and imports them into your Python process. Review the
-> source at [{repo_id}](https://huggingface.co/{repo_id}) before use.
+> source at [{repo_id}](https://huggingface.co/{repo_id}) before use. Those interested can also
+> clone the git repository at https://github.com/smithblack-0/advanced-transformers-lib
 
 ## Architecture
 

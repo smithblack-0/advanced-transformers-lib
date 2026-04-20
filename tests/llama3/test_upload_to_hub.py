@@ -1,12 +1,18 @@
-"""Tests for upload_to_hub.py.
+"""Tests for upload_to_hub.py and stage_for_hub.py.
 
-Hub interaction (create_repo, upload_folder) cannot be unit tested and is
-verified manually per the strategy in plan.md. These tests cover the
-independently verifiable functions: config table rendering and card rendering.
+Hub interaction (upload_folder) cannot be unit tested and is verified manually.
+These tests cover the independently verifiable functions: config table rendering,
+card rendering, the None guard, and the staging interface.
 """
 
+import tempfile
+from pathlib import Path
+
 from src.llama3.model.configuration import Llama3Config
-from src.llama3.upload_to_hub import _render_card, _render_config_table
+from src.llama3.stage_for_hub import stage
+from src.llama3.upload_to_hub import _render_card, _render_config_table, upload
+
+MODEL_DIR = Path(__file__).parent.parent.parent / "src" / "llama3" / "model"
 
 
 def small_config(**kwargs) -> Llama3Config:
@@ -20,6 +26,42 @@ def small_config(**kwargs) -> Llama3Config:
     )
     defaults.update(kwargs)
     return Llama3Config(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# None guard
+# ---------------------------------------------------------------------------
+
+class TestNoneGuard:
+    def test_upload_none_repo_id_exits_cleanly(self):
+        """upload(repo_id=None) must return without error and without attempting any upload."""
+        upload(repo_id=None)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# stage
+# ---------------------------------------------------------------------------
+
+class TestStage:
+    def test_callable_with_source_and_dest(self):
+        """stage must accept (source_dir, dest_dir) and complete without error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stage(MODEL_DIR, Path(tmp))
+
+    def test_python_files_present(self):
+        """Root-level Python files must appear in the staging directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stage(MODEL_DIR, Path(tmp))
+            assert (Path(tmp) / "huggingface.py").exists()
+            assert (Path(tmp) / "configuration.py").exists()
+
+    def test_no_pycache_in_staging(self):
+        """__pycache__ files must not appear in the staging directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stage(MODEL_DIR, Path(tmp))
+            staged = list(Path(tmp).iterdir())
+            assert not any(p.suffix == ".pyc" for p in staged)
+            assert not any(p.name == "__pycache__" for p in staged)
 
 
 # ---------------------------------------------------------------------------

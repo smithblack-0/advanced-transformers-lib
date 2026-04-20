@@ -60,9 +60,17 @@ is being achieved, one verified unit at a time.
 - [X] Unit 15.C (Blocker) — get sequence length cache support
 - [X] Unit 15.D ShramForCausalLM: expose load_balance_loss and max_vio; KV cache resolution
 - [X] Unit 16 — upload_to_hub
-- [ ] Unit 17 — documentation
-- [ ] Unit 18 — end-to-end tests
-- [ ] Unit 19 — final audit
+- [X] Unit 17 — documentation
+- [X] Unit 18.A (Blocker) — Combined loss refactor: ce_weight + load_balance_weight forward args
+- [X] Unit 18.B (Blocker) — End-to-End Subfolder Blocker: branch-based upload replacing subfolder approach
+- [X] Unit 18.C (Blocker) — End-to-End Subfolder Blocker: basic approach. Work this time dammit.
+- [X] Unit 18.D (Blocker) — Huggingface, bafflingly, does not support folders. Fix it without loosing the important organization of the project.
+- [X] Unit 18.E — end-to-end tests
+- [ ] Unit 19.A — Devops Concerns
+  - [ ] Unit 19.A.1 — Standardize upload infrastructure across all model folders
+  - [ ] Unit 19.A.2 — Local dev environment files per model
+  - [ ] Unit 19.A.3 — GitHub Actions workflows
+- [ ] Unit 19.B — final audit
 
 ---
 
@@ -1828,21 +1836,244 @@ The SRAM effect is a hypothesized trade that lets certain classes of models trad
 - If possible, make the paper directly accessible from the SHRAM documentation surface so the repository and paper remain visibly connected.
 ---
 
-### Unit 18 — End-to-End Tests
+### Unit 18.A (Blocker) — Combined loss refactor: ce_weight + load_balance_weight forward args
+
+**What:** Refactor `ShramForCausalLM.forward()` so that `loss` follows the HuggingFace MoE
+convention: the combined weighted total of CE loss and load balance loss. Expose the individual
+components as `ce_loss` and `load_balance_loss` on the output for logging.
+
+**Why this is a blocker:** HuggingFace's `Trainer` and any standard training loop calls
+`.backward()` on `out.loss` only. With the current design, the router's `expert_bias` and
+load-balance-relevant parameters never receive gradients in standard training. This violates
+the convention established by Mixtral and other HuggingFace MoE models.
+
+**Invariants this unit must satisfy:**
+- `forward()` accepts `ce_weight: float = 1.0` and `load_balance_weight: float = 0.01` as
+  explicit keyword arguments. Defaults match the paper's recommendations.
+- When labels are provided, `out.loss = ce_weight * ce_loss + load_balance_weight * load_balance_loss`.
+- When labels are not provided, `out.loss` is `None`.
+- `out.ce_loss` contains the raw unweighted cross-entropy loss (or `None` if no labels).
+- `out.load_balance_loss` continues to contain the raw unweighted load balance loss.
+- `out.max_vio` is unchanged.
+- `expert_bias` and all other load-balance-graph parameters receive gradients when
+  `out.loss.backward()` is called with labels provided.
+- `ShramCausalLMOutput` gains a `ce_loss` field. All existing fields remain.
+- HuggingFace's `Trainer` works correctly with default weights (no custom kwargs required).
+
+**Research note:** Weights are forward arguments, not config fields. Researchers who want
+non-default weighting must use a custom training loop or `Trainer` subclass — this is
+acceptable and consistent with how auxiliary loss weighting is handled in the literature.
+
+---
+
+### Unit 18.B - End-to-End Subfolder Blocker
+
+**Responsibity**: Perform a minor amount of refactoring to allow the storage of multiple revisions rather than multiple files
+
+**Context of Correctness**
+
+Huggingface initially appeared to support loading from subfolders located at a remote repository. This was not in fact true. While it is the case you can load any folder locally simply by naming the directory, the "subfolder" field of the huggingface load kwargs is not correctly accounted for by the load module subcode.
+
+Instead, the most viable way to keep multiple models in the same repository is to form multiple branches and use the revision tag to load them. It is possible for instance to just upload the folder to the root directly, in different branches, to maintain separation
+
+**Invariants**
+
+- Code and test among files **upload_to_hub.py*, **test_upload_to_hub.py** is cleaned up to no longer expect the existance of an architecture_core folder.
+- The upload system now selects a branch feature instead of a subfolder feathre
+- The upload system now makes a new branch when needed before uploading the folder as well
+- The folder is uploaded directly into the repository root. 
+- For consistency, the current revision will be called "primary". Loading is executed by passing in a revision indicator.
+- Downstream tests are modified as needed to express these invariants. 
+
+
+**Preliminary implementation strategy**
+
+- Before upload, check whether the target branch exists; create it if it does not.
+- Upload the architecture folder directly to the repository root of that branch.
+- Load by passing both `revision` and `code_revision`.
+
+Example usage:
+
+```python
+config = AutoConfig.from_pretrained(
+    "smithblack-0/SHRAM",
+    revision="primary",
+    code_revision="primary",
+    trust_remote_code=True,
+)
+
+model = AutoModelForCausalLM.from_config(
+    config,
+    trust_remote_code=True,
+)
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "smithblack-0/SHRAM",
+    revision="primary",
+)
+```
+
+### Unit 18.C - Huggingface Subfolder Blocker (v2)
+
+**Responsibity**: Perform a minor amount of refactoring to ensure we only store the architecture itself in the main system.
+
+**Context of Correctness**
+
+It turns out while AutoModelForCausalLM.from_config permits the injection of a code revision, it in no way responds to it. This makes the system currently in use pointless. The only option is to fall back to a raw repository. We update to main directly.
+**Invariants**
+
+- Code and test among files **upload_to_hub.py*, **test_upload_to_hub.py** is cleaned up to no longer expect the existance of a revision.
+- The upload system now just uploads directly in a standard manner
+- The folder is uploaded directly into the repository root. 
+- Downstream tests are modified as needed to express these invariants. 
+- Documentation.md is modified to reflect the correct strategy. 
+- e2e tests is modified to reflect the strategy. These do not have to be ru
+
+**Preliminary implementation strategy**
+
+- This should be straightforward 
+
+Example usage:
+
+```python
+config = AutoConfig.from_pretrained(
+    "smithblack-0/SHRAM",
+    trust_remote_code=True,
+)
+
+model = AutoModelForCausalLM.from_config(
+    config,
+    trust_remote_code=True,
+)
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "smithblack-0/SHRAM",
+)
+```
+
+### Unit 18.D — Huggingface Upload System Rewrite
+
+**Responsibility**: Rewrite the upload system to make a temporary staging folder of flattened files to handle limitations of the huggingface system
+
+**Context of Correctness**
+
+Custom Huggingface automodel uploads are unable to contain any folders. Deep in the internal's of huggingfaces 'dynamic_module_utils.py' package the line "    modules_needed = check_imports(resolved_module_file)" is used immediately to represent the modules needed, when those modules may be a multiple-leveled relative import such as "cache.shram_cache.py". This is never resolved to "cache/shram_cache.py" before file fetching or uploading begins, making huggingface foundationally unable to handle folders.  This is a significant issue. 
+
+There are several lines of possible fixes:
+
+* Flattening the repository is possible. However, We loose all organization and become unmaintainable to an outsider 
+* Switching to a package approach is possible. However, this late into development it is not a good idea, and the other coresident models are not build for this approach anyhow
+
+The only solution of any level of correctness is thus a well-written staging approach that makes a staging folder that is flattened, and refactors imports as needed to make this work.
+
+**Invariants**
+
+* The upload script is modified to execute a flattening 'staging' approach wherein paths such as "cache/shram_cache.py" become "__cache__shram_cache.py". This produces a sorted flat folder for huggingface to work from. 
+* libcst is used during this process to refactor source code to use single-level relative imports rather than multi-level folder imports, to avoid breaking code imports. 
+* The system is well-written and modular following best practices using helper functions
+
+**Tests**
+
+* The ability to import from the staged files must be tested at some point; it is not viable to upload something that may not successfully import
+
+**Preliminary implementation strategy**
+
+* It is likely going to be easiest to meet all criteria to have a separate refactoring system that takes a location to make a folder at, and then invoke that in the main script. This allows testing of imports independently of the primary logic.
+
+
+### Unit 18.E — End-to-End Tests
 
 **What:** Full-stack smoke tests: instantiate from config, run a training step, verify loss
 decreases. Include load-balance loss in the training step. Include network tests for the Hub
 round-trip.
 
 **Invariants this unit must satisfy:**
-- The model can be instantiated from a config, run a forward pass, compute loss, and backpropagate
-  without error.
+- The model can be instantiated from a config, run a forward pass, compute loss, and backpropagate without error.
 - The load-balance loss is accessible from the forward output and participates in the backward pass.
 - Network tests verify the Hub round-trip.
 
 ---
 
-### Unit 19 — Final Audit
+### Unit 19.A — DevOps concerns.
+
+**Responsibility**: Setup the proper devops concerns for automated updating and testing
+
+**Context of Correctness**:
+
+While it is in theory possible to continue to use the repository to manually update systems, it is likely far more correct to create a proper github-supported workflow that may run tests as needed, has protected branches, and will automatically upload passing models to the hub.
+
+**Invariants**
+
+* The github system now has branch protection; we work using a checked out branch instead
+* The github system is configured to automatically search for model folders and run the associated actions and pull request merges
+* On pull request all tests have to pass for merge to be allowed.
+* Pull requests may have a 'Release' tag attached to them in github. When done, tests are run then each relevant upload_to_hub script runs too.
+* The upload_to_hub system is redesigned to use github secrets. These secrets are unique to each script.
+* A setup_dev_environment.py file that runs a requirements file should be located in the folder for that model. When run, it would set up any needed requirements.
+* A record_requirements.py file that will write a requirements file into the main shram folder for usage by setup_dev_enviroment.
+
+---
+
+### Unit 19.A.1 — Standardize upload infrastructure across all model folders
+
+**Responsibility:** Bring all three model upload systems (llama3, mosa, shram) to a common standard so the orchestrator can treat every model identically and the repository is forkable.
+
+**Context of Correctness:** This is a single-system repository. Professional quality means a contributor who forks it and adds a new model finds a clear, consistent pattern. SHRAM has a staging system and secrets-ready design; llama3 and mosa use an older pattern. That inconsistency is a quality and maintainability defect. Standardizing here is what makes 19.A.3 (the orchestrator) possible — the orchestrator can only call each model's upload script uniformly if the scripts present a uniform interface.
+
+**Invariants:**
+- Every model folder contains a `stage_for_hub.py` with a `stage(source_dir, dest_dir)` function having the same signature as SHRAM's
+- Every `upload_to_hub.py` reads its HuggingFace token from an environment variable unique to that model (e.g. `SHRAM_HF_TOKEN`, `LLAMA3_HF_TOKEN`, `MOSA_HF_TOKEN`) rather than prompting interactively
+- Every `upload_to_hub.py` with `REPO_ID = None` exits cleanly with an informative message without attempting any upload or raising an exception
+- Every `upload_to_hub.py` stages through `stage_for_hub.py` into a temporary directory before uploading, never uploading the source tree directly
+
+**Tests:**
+- Each `upload_to_hub.py` invoked with `REPO_ID = None` exits without error
+- Each `stage_for_hub.py` is importable and exposes a `stage(source_dir, dest_dir)` callable
+
+**Preliminary implementation:** Port SHRAM's `stage_for_hub.py` and updated `upload_to_hub.py` pattern to llama3 and mosa. Where a model's source tree is already flat, `stage_for_hub.py` may be a thin wrapper that copies files without renaming — the interface is what matters, not the complexity of the implementation.
+
+---
+
+### Unit 19.A.2 — Per-model pyproject.toml and dev environment setup
+
+**Responsibility:** Each model folder declares its own dependencies and provides a one-command local install so contributors and CI can reproduce a working environment for that model independently.
+
+**Context of Correctness:** Different models may have different dependencies — conflating them into a single repo-wide file is a maintainability defect and prevents per-model isolation. The correct unit of dependency declaration is the model folder. A `pyproject.toml` per model is the standard Python mechanism for this, requires no external tooling, and is hand-maintainable — CI will surface missing entries when imports fail, so there is no need for a generation script.
+
+**Invariants:**
+- `src/llama3/pyproject.toml`, `src/mosa/pyproject.toml`, and `src/shram/pyproject.toml` exist and each declares that model's runtime dependencies under `[project.dependencies]`
+- `src/llama3/setup_dev_environment.py`, `src/mosa/setup_dev_environment.py`, and `src/shram/setup_dev_environment.py` exist, are runnable from the repository root without arguments, and install that model's dependencies via `pip install -e`
+- After running `setup_dev_environment.py` for shram, `from shram.model.huggingface import ShramForCausalLM` is importable; same pattern holds for llama3 and mosa under their respective package names
+- Each model's `documentation.md` documents both the HuggingFace path and the local install option
+
+**Tests:**
+- `setup_dev_environment.py` is present and importable in each model folder
+- `setup_dev_environment.py` exposes a `setup()` callable
+- After install, each model's top-level model class is importable under its short package name
+
+**Preliminary implementation:** `pyproject.toml` uses `[project]` for metadata and dependencies, `[tool.setuptools.packages.find]` with `where` pointing at the src layout to locate the package. `setup_dev_environment.py` resolves the model folder path relative to `__file__` and calls `subprocess.run([sys.executable, "-m", "pip", "install", "-e", str(model_dir)], check=True)`. The installed short package names are `shram`, `llama3`, and `mosa` respectively.
+
+---
+
+### Unit 19.A.3 — GitHub Actions workflows
+
+**Responsibility:** Automate testing on every PR and Hub upload on Release-labelled merges via a modular workflow structure.
+
+**Context of Correctness:** Manual upload and manual test runs do not scale and are not enforced. Branch protection is only meaningful if there is a CI system backing it. The workflow structure must be modular — one orchestrator, one reusable workflow file per model — so adding a new model means adding one file and one orchestrator registration, nothing else.
+
+**Invariants:**
+- `.github/workflows/orchestrator.yml` exists, triggers on PR and on Release-labelled merge to master, and calls each model's workflow file
+- `.github/workflows/llama3.yml`, `shram.yml`, and `mosa.yml` exist as reusable workflows; each owns its own test path, secret name, and upload invocation
+- On every PR: all model tests must pass or the PR cannot be merged
+- On Release-labelled merge: tests run first; upload runs per model only if tests pass; a model with `REPO_ID = None` is skipped without failing the workflow
+- Each model workflow installs dependencies via `pip install -e src/<model>/` before running tests
+- Each model workflow reads its HuggingFace token from a GitHub secret scoped to that model
+
+**Tests:** Not locally unit-testable. Verified by opening a test PR and observing workflow execution on GitHub.
+
+**Preliminary implementation:** Orchestrator uses GitHub Actions `workflow_call` to invoke each model's reusable workflow. Each model workflow has two jobs: `test` (runs `pip install -e src/<model>/` then pytest for that model's test folder) and `upload` (conditional on Release label, `needs: test`). Branch protection rules are configured manually in the GitHub repository settings — this is not automatable from the codebase itself and must be documented as a setup step.
+
+### Unit 19.B — Final Audit
 
 **What:** Review every file in `src/shram/` against the invariants in `job.md`. Verify no
 hardcoded values, no missing documentation, no gaps between tests and intent. Apply the

@@ -14,11 +14,14 @@ What is never uploaded: weights. No weight files exist in src/llama3/model/,
 making accidental upload structurally impossible.
 """
 
+import os
+import tempfile
 from pathlib import Path
 
 from huggingface_hub import upload_folder
 
 from src.llama3.model.configuration import Llama3Config
+from src.llama3.stage_for_hub import stage
 from src.llama3.tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
@@ -78,42 +81,54 @@ def _render_card(config: Llama3Config, repo_id: str) -> str:
 def upload(repo_id: str = REPO_ID) -> None:
     """Prepare and publish the architecture and tokenizer to the Hub.
 
-    Prompts for a HuggingFace write-access token scoped to this repository,
-    then runs four steps:
+    Reads the HuggingFace write token from the LLAMA3_HF_TOKEN environment
+    variable, then runs five steps:
     1. Refresh tokenizer files in model/ via prepare_tokenizer()
     2. Write config.json to model/ from Llama3Config defaults
     3. Render and write README.md (architecture card) to model/
-    4. Upload model/ contents to the Hub repository root atomically
+    4. Stage model files into a temporary flat directory
+    5. Upload the staging directory to the Hub repository root
 
+    If REPO_ID is None, exits immediately with an informative message.
     The repository must already exist on HuggingFace Hub before running.
     See src/llama3/documentation.md for setup instructions.
 
     Args:
-        repo_id: Target Hub repository in 'namespace/name' format.
+        repo_id: Target Hub repository in 'namespace/name' format, or None to skip.
     """
-    token = input("HuggingFace write token: ").strip()
+    if repo_id is None:
+        print("REPO_ID is not set. Skipping upload.")
+        return
 
-    print("Step 1/4 -- Refreshing tokenizer...")
+    token = os.environ.get("LLAMA3_HF_TOKEN")
+    if token is None:
+        raise EnvironmentError("LLAMA3_HF_TOKEN environment variable is not set.")
+
+    print("Step 1/5 -- Refreshing tokenizer...")
     prepare_tokenizer()
 
     config = Llama3Config()
 
-    print("Step 2/4 -- Writing config.json...")
+    print("Step 2/5 -- Writing config.json...")
     config.save_pretrained(MODEL_DIR)
 
-    print("Step 3/4 -- Rendering architecture card...")
+    print("Step 3/5 -- Rendering architecture card...")
     card = _render_card(config, repo_id)
     (MODEL_DIR / "README.md").write_text(card, encoding="utf-8")
 
-    print(f"Step 4/4 -- Uploading {MODEL_DIR} to {repo_id}...")
-    upload_folder(
-        repo_id=repo_id,
-        folder_path=MODEL_DIR,
-        repo_type="model",
-        ignore_patterns=["__pycache__", "*.pyc"],
-        commit_message="Update architecture and tokenizer",
-        token=token,
-    )
+    print("Step 4/5 -- Staging model files...")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        staging_dir = Path(tmp_dir)
+        stage(MODEL_DIR, staging_dir)
+
+        print(f"Step 5/5 -- Uploading to {repo_id}...")
+        upload_folder(
+            repo_id=repo_id,
+            folder_path=staging_dir,
+            repo_type="model",
+            commit_message="Update architecture and tokenizer",
+            token=token,
+        )
 
     print("\nDone. Verify from a fresh environment:")
     print(f"  AutoConfig.from_pretrained('{repo_id}', trust_remote_code=True)")

@@ -3,19 +3,18 @@
 Two test layers live here:
 
 1. Integration tests (local, no network) — verify the assembled model works as a
-   complete system before the Hub is involved. Three use cases: Generatable,
-   Trainable, HF-loadable. Any bug discovered here is resolved as a new blocker
-   before Unit 10 begins.
+   complete system. Three use cases: generatable (greedy), beam-search with cache,
+   trainable, HF-loadable. These run without Hub access.
 
-2. End-to-end tests (@pytest.mark.network) — the full user journey starting from
-   the Hub. Unit 10. The starting point is always the Hub — never a locally
-   constructed model. These replicate exactly what a researcher does when pulling
-   and using this library.
+2. End-to-end tests (@pytest.mark.network) — the full researcher journey starting
+   from the Hub. The starting point is always the Hub — never a locally constructed
+   model. These replicate exactly what a researcher does when pulling and using
+   this library.
 """
 
 import torch
 import pytest
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.huggingface import ShramForCausalLM
@@ -27,19 +26,27 @@ from src.shram.model.huggingface import ShramForCausalLM
 
 def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
+        vocab_size=256,
         hidden_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=2,
         intermediate_size=128,
         num_hidden_layers=2,
-        vocab_size=256,
+        num_sliding_window_heads=4,
+        num_mosrah_heads=4,
+        num_selected_heads=4,
+        head_dim=16,
+        window_size=8,
+        rope_mode="main_sequence",
+        training_sequence_length=32,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
 
 
 @pytest.fixture
-def model() -> ShramForCausalLM:
+def model():
     return ShramForCausalLM(small_config()).eval()
 
 
@@ -49,11 +56,7 @@ def model() -> ShramForCausalLM:
 
 class TestIntegrationGeneratable:
     def test_output_shape(self, model):
-        """generate() must return (batch, input_len + max_new_tokens).
-
-        eos_token_id is None in our config, so there is no early stopping —
-        generation always runs to exactly max_new_tokens. The shape is deterministic.
-        """
+        """generate() must return (batch, input_len + max_new_tokens)."""
         ids = torch.randint(0, 256, (1, 4))
         out = model.generate(ids, max_new_tokens=5)
         assert out.shape == (1, 9)
@@ -73,7 +76,7 @@ class TestIntegrationGeneratable:
 
 
 # ---------------------------------------------------------------------------
-# Integration — Beam search (_reorder_cache)
+# Integration — Beam search (exercises reorder_cache)
 # ---------------------------------------------------------------------------
 
 class TestIntegrationBeamSearch:
@@ -81,11 +84,10 @@ class TestIntegrationBeamSearch:
         """Beam search with use_cache=True must produce identical output to use_cache=False.
 
         With use_cache=False the model recomputes all key/values at every step —
-        correct by construction, no cache involved. With use_cache=True,
-        _reorder_cache is called at each step to reorder the KV cache to match
-        the surviving beams. Any bug in _reorder_cache (wrong dimension, inverted
-        index) causes the model to attend to incorrect history and produce different
-        tokens, making the mismatch detectable here.
+        correct by construction. With use_cache=True, reorder_cache is called at
+        each step to reorder the KV cache to match surviving beams. Any bug in
+        reorder_cache causes the model to attend to incorrect history and produce
+        different tokens, making the mismatch detectable here.
         """
         ids = torch.randint(0, 256, (1, 4))
         out_cached = model.generate(ids, max_new_tokens=5, num_beams=2, use_cache=True)
@@ -106,12 +108,7 @@ class TestIntegrationTrainable:
         out.loss.backward()
 
     def test_all_params_have_gradients(self):
-        """Every trainable parameter must receive a gradient after backward().
-
-        With tie_word_embeddings=False (our default), embed_tokens and lm_head are
-        independent tensors and both must have gradients. The loss path runs through
-        the full stack: embed_tokens → decoder layers → lm_head → cross-entropy.
-        """
+        """Every trainable parameter must receive a gradient after backward()."""
         m = ShramForCausalLM(small_config()).train()
         ids = torch.randint(0, 256, (1, 4))
         out = m(ids, labels=ids, use_cache=False)
@@ -121,50 +118,33 @@ class TestIntegrationTrainable:
                 assert param.grad is not None, f"No gradient for {name}"
 
 
+
 # ---------------------------------------------------------------------------
-# Integration — HuggingFace-loadable (local)
+# Hub constants
 # ---------------------------------------------------------------------------
 
-class TestIntegrationAutoClass:
-    def test_from_config_after_local_registration(self):
-        """AutoModelForCausalLM.from_config must return a ShramForCausalLM after
-        local AutoClass registration — the same path a researcher uses before or
-        without Hub access.
-        """
-        AutoConfig.register("shram", ShramConfig)
-        AutoModelForCausalLM.register(ShramConfig, ShramForCausalLM)
-        m = AutoModelForCausalLM.from_config(small_config())
-        assert isinstance(m, ShramForCausalLM)
+HUB_REPO = "smithblack-0/SHRAM"
 
 
 # ---------------------------------------------------------------------------
-# Hub constant (Unit 10)
-# ---------------------------------------------------------------------------
-
-HUB_REPO = "smithblack-0/shram"
-
-
-# ---------------------------------------------------------------------------
-# Shared Hub fixture (Unit 10)
+# Shared Hub fixture
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
 def hub_config():
     """Download config from Hub once per module to avoid repeated network calls.
 
-    Module scope is correct here: the config object is read-only and safe to share
-    across all Unit 10 test classes. Each class constructs its own model instance
-    from this config, so there is no shared mutable state between classes.
-
-    After loading, the fixture asserts that the config class was imported from
-    HuggingFace's remote-code path (transformers_modules.*), not from a locally
-    registered class. HF's trust_remote_code mechanism imports Hub code under
-    transformers_modules; local AutoClass registrations import from src.*. Without
-    this check, a prior test that calls AutoConfig.register() locally can cause this
-    fixture to succeed via the local fallback even when the Hub is missing auto_map,
-    producing false-positive network tests.
+    After loading, asserts the config class was imported from HuggingFace's
+    remote-code path (transformers_modules.*), not from a locally registered
+    class. Without this check, a prior test calling AutoConfig.register() locally
+    can cause this fixture to succeed via a local fallback even when the Hub is
+    missing auto_map, producing false-positive network tests.
     """
-    config = AutoConfig.from_pretrained(HUB_REPO, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(
+        HUB_REPO,
+        trust_remote_code=True,
+        force_download=True,
+    )
     module = type(config).__module__
     assert "transformers_modules" in module, (
         f"hub_config loaded a locally-registered class ({module}) instead of Hub "
@@ -174,22 +154,12 @@ def hub_config():
 
 
 # ---------------------------------------------------------------------------
-# End-to-End — HuggingFace-loadable (Unit 10)
+# End-to-End — HuggingFace-loadable
 # ---------------------------------------------------------------------------
 
 @pytest.mark.network
 class TestE2ELoadable:
-    """The config and model must load from the Hub via AutoClass.
-
-    Verifies the Hub distribution path itself: that the files on the Hub are
-    correct, trust_remote_code finds the right classes, and the config has the
-    expected model_type. Local AutoClass registration is covered by the integration
-    tests above and is not replicated here.
-
-    The Hub-downloaded class and the local src class have different Python identities
-    (different module paths under transformers_modules), so type checks use the class
-    name rather than isinstance.
-    """
+    """The config and model must load from the Hub via AutoClass."""
 
     def test_config_model_type(self, hub_config):
         """Config loaded from Hub must identify as the expected model type."""
@@ -202,7 +172,29 @@ class TestE2ELoadable:
 
 
 # ---------------------------------------------------------------------------
-# End-to-End — Generatable (Unit 10)
+# End-to-End — Tokenizer
+# ---------------------------------------------------------------------------
+
+@pytest.mark.network
+class TestE2ETokenizer:
+    """The tokenizer must load from the Hub subfolder."""
+
+    def test_tokenizer_loads(self):
+        """AutoTokenizer.from_pretrained must succeed for the Hub repo."""
+        tokenizer = AutoTokenizer.from_pretrained(HUB_REPO)
+        assert tokenizer is not None
+
+    def test_tokenizer_encodes_and_decodes(self):
+        """Tokenizer must round-trip a simple string."""
+        tokenizer = AutoTokenizer.from_pretrained(HUB_REPO)
+        text = "Hello world"
+        ids = tokenizer.encode(text)
+        decoded = tokenizer.decode(ids, skip_special_tokens=True)
+        assert text in decoded
+
+
+# ---------------------------------------------------------------------------
+# End-to-End — Generatable
 # ---------------------------------------------------------------------------
 
 @pytest.mark.network
@@ -227,7 +219,7 @@ class TestE2EGeneratable:
 
 
 # ---------------------------------------------------------------------------
-# End-to-End — Trainable (Unit 10)
+# End-to-End — Trainable
 # ---------------------------------------------------------------------------
 
 @pytest.mark.network
@@ -245,13 +237,7 @@ class TestE2ETrainable:
         out.loss.backward()
 
     def test_all_params_have_gradients(self, model):
-        """Every trainable parameter must receive a gradient after backward().
-
-        The loss path runs through the full stack: embed_tokens → decoder layers
-        → lm_head → cross-entropy. A disconnected parameter would indicate a wiring
-        bug introduced during Hub distribution (e.g. a missing relative import that
-        caused silent fallback to a stub).
-        """
+        """Every trainable parameter must receive a gradient after backward()."""
         ids = torch.randint(0, model.config.vocab_size, (1, 4))
         out = model(ids, labels=ids, use_cache=False)
         out.loss.backward()

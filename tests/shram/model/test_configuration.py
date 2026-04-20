@@ -104,8 +104,13 @@ class TestParameterStorage:
         config = small_config(training_sequence_length=4096)
         assert config.training_sequence_length == 4096
 
-    def test_inference_sequence_length_stored(self):
-        config = small_config(inference_sequence_length=16384)
+    def test_inference_sequence_length_defaults_to_training_length(self):
+        config = small_config(training_sequence_length=4096)
+        assert config.inference_sequence_length == 4096
+
+    def test_inference_sequence_length_stored_after_set_inference_context(self):
+        config = small_config()
+        config.set_inference_context(16384)
         assert config.inference_sequence_length == 16384
 
     def test_alpha_stored(self):
@@ -162,10 +167,11 @@ class TestStructuralValidation:
         with pytest.raises(ValueError, match="training_sequence_length"):
             small_config(training_sequence_length=0)
 
-    def test_zero_inference_sequence_length_raises(self):
-        """inference_sequence_length must be positive."""
+    def test_zero_inference_sequence_length_raises_via_set_inference_context(self):
+        """set_inference_context() must reject non-positive values."""
+        config = small_config()
         with pytest.raises(ValueError, match="inference_sequence_length"):
-            small_config(inference_sequence_length=0)
+            config.set_inference_context(0)
 
 
 # ---------------------------------------------------------------------------
@@ -211,25 +217,71 @@ class TestScaleProperty:
     When scale == 1.0, YaRN reduces to standard RoPE. This is the default state.
     """
 
-    def test_scale_one_when_lengths_equal(self):
-        """scale must be 1.0 when inference equals training length."""
-        config = small_config(training_sequence_length=8192, inference_sequence_length=8192)
+    def test_scale_one_by_default(self):
+        """scale must be 1.0 at construction — inference defaults to training length."""
+        config = small_config(training_sequence_length=8192)
         assert config.scale == 1.0
 
     def test_scale_computed_correctly(self):
-        """scale must equal inference / training."""
-        config = small_config(training_sequence_length=4096, inference_sequence_length=16384)
+        """scale must equal inference / training after set_inference_context."""
+        config = small_config(training_sequence_length=4096)
+        config.set_inference_context(16384)
         assert config.scale == 4.0
 
     def test_scale_fractional(self):
         """scale may be non-integer."""
-        config = small_config(training_sequence_length=8192, inference_sequence_length=12288)
+        config = small_config(training_sequence_length=8192)
+        config.set_inference_context(12288)
         assert abs(config.scale - 1.5) < 1e-9
 
     def test_scale_is_not_stored(self):
         """scale must be a computed property, not a stored field."""
         config = small_config(training_sequence_length=4096, inference_sequence_length=16384)
         assert "scale" not in config.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# set_inference_context
+# ---------------------------------------------------------------------------
+
+class TestSetInferenceContext:
+    def test_updates_inference_sequence_length(self):
+        """set_inference_context() sets inference_sequence_length to the given value."""
+        config = small_config(training_sequence_length=4096)
+        config.set_inference_context(16384)
+        assert config.inference_sequence_length == 16384
+
+    def test_updates_scale(self):
+        """set_inference_context() causes scale to reflect the new inference length."""
+        config = small_config(training_sequence_length=4096)
+        config.set_inference_context(16384)
+        assert config.scale == 4.0
+
+    def test_setting_to_training_length_gives_scale_one(self):
+        """set_inference_context() with training length restores scale=1.0."""
+        config = small_config(training_sequence_length=4096)
+        config.set_inference_context(8192)
+        config.set_inference_context(4096)
+        assert config.scale == 1.0
+
+    def test_zero_raises(self):
+        """set_inference_context() rejects zero."""
+        config = small_config()
+        with pytest.raises(ValueError, match="inference_sequence_length"):
+            config.set_inference_context(0)
+
+    def test_negative_raises(self):
+        """set_inference_context() rejects negative values."""
+        config = small_config()
+        with pytest.raises(ValueError, match="inference_sequence_length"):
+            config.set_inference_context(-1)
+
+    def test_roundtrip_preserves_inference_context(self):
+        """inference_sequence_length set via set_inference_context survives serialisation."""
+        config = small_config(training_sequence_length=4096)
+        config.set_inference_context(16384)
+        restored = ShramConfig.from_dict(config.to_dict())
+        assert restored.inference_sequence_length == 16384
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +295,6 @@ class TestSerialisation:
             local_rope_theta=500000.0,
             mosrah_rope_theta=200000.0,
             training_sequence_length=4096,
-            inference_sequence_length=16384,
             alpha=2.0,
             beta=16.0,
             attention_dropout=0.1,
@@ -254,6 +305,7 @@ class TestSerialisation:
             rope_mode="semantic_sequence",
             head_dim=16,
         )
+        original.set_inference_context(16384)
         restored = ShramConfig.from_dict(original.to_dict())
 
         assert restored.vocab_size == original.vocab_size

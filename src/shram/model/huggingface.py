@@ -51,6 +51,7 @@ class ShramCausalLMOutput(CausalLMOutputWithPast):
     only the SHRAM-specific wrapper outputs.
     """
 
+    ce_loss: torch.FloatTensor | None = None
     load_balance_loss: torch.FloatTensor | None = None
     max_vio: torch.FloatTensor | None = None
 
@@ -119,7 +120,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             num_local_heads=self.config.num_sliding_window_heads,
             local_head_dim=self.config.head_dim,
             num_mosrah_heads=self.config.num_mosrah_heads,
-            mosrah_head_dim=self.config.hidden_size // self.config.num_selected_heads,
+            mosrah_head_dim=self.config.head_dim,
             batch_size=batch_size,
             device=device,
         )
@@ -201,8 +202,8 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             return
 
         num_repeats = max(
-            generation_config.num_beams,
-            generation_config.num_return_sequences,
+            generation_config.num_beams or 1,
+            generation_config.num_return_sequences or 1,
         )
         model_kwargs["past_key_values"] = self._build_shram_cache(
             batch_size=batch_size*num_repeats,
@@ -374,6 +375,8 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
         output_hidden_states: bool | None = None,
         labels: torch.Tensor | None = None,
         return_dict: bool | None = None,
+        ce_weight: float = 1.0,
+        load_balance_weight: float = 0.01,
         **kwargs: Any,
     ) -> ShramCausalLMOutput:
         """Run the SHRAM causal language model wrapper.
@@ -395,15 +398,21 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
                 Defaults to ``config.output_hidden_states``.
             labels: Optional target token IDs of shape ``(batch, seq_len)``.
             return_dict: Must be ``True`` or ``None``.
+            ce_weight: Weight applied to the cross-entropy loss when combining with
+                the load-balance loss. Default 1.0.
+            load_balance_weight: Weight applied to the load-balance auxiliary loss.
+                Default 0.01, matching the paper's recommendation.
             **kwargs: Unsupported HuggingFace kwargs fail explicitly.
 
         Returns:
             ``ShramCausalLMOutput`` with:
             - ``logits`` of shape ``(batch, seq_len, vocab_size)``,
-            - ``loss`` when labels are provided,
+            - ``loss`` = ``ce_weight * ce_loss + load_balance_weight * load_balance_loss``
+              when labels are provided (``None`` otherwise),
+            - ``ce_loss`` — raw unweighted cross-entropy loss for logging,
             - ``past_key_values`` as the active ``ShramCache`` or ``None``,
             - ``hidden_states`` when requested,
-            - ``load_balance_loss`` from the backbone,
+            - ``load_balance_loss`` — raw unweighted load-balance loss from the backbone,
             - detached ``max_vio`` from the backbone.
         """
         use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -487,17 +496,20 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
 
         logits: torch.FloatTensor = self.lm_head(backbone_outputs["last_hidden_state"])
 
+        ce_loss: torch.FloatTensor | None = None
         loss: torch.FloatTensor | None = None
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = nn.functional.cross_entropy(
+            ce_loss = nn.functional.cross_entropy(
                 shift_logits.view(-1, self.config.vocab_size),
                 shift_labels.view(-1),
             )
+            loss = ce_weight * ce_loss + load_balance_weight * backbone_outputs["load_balance_loss"]
 
         return ShramCausalLMOutput(
             loss=loss,
+            ce_loss=ce_loss,
             logits=logits,
             past_key_values=backbone_outputs["past_key_values"],
             hidden_states=backbone_outputs["hidden_states"],

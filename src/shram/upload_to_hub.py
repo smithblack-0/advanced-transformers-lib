@@ -8,17 +8,21 @@ The script prompts for a HuggingFace write-access token at runtime. The token
 is passed directly to the API and never stored anywhere.
 
 What is uploaded: every file in src/shram/model/ -- Python source, config.json,
-tokenizer files, and README.md (architecture card). This folder is the exact Hub root.
+tokenizer files, and README.md (architecture card). Files are placed at the root
+of the Hub repository's default branch.
 
 What is never uploaded: weights. No weight files exist in src/shram/model/,
 making accidental upload structurally impossible.
 """
 
+import os
+import tempfile
 from pathlib import Path
 
 from huggingface_hub import upload_folder
 
 from src.shram.model.configuration import ShramConfig
+from src.shram.stage_for_hub import stage
 from src.shram.tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
@@ -27,11 +31,27 @@ REPO_ID = "smithblack-0/SHRAM"
 MODEL_DIR = Path(__file__).parent / "model"
 _CARD_TEMPLATE = Path(__file__).parent / "model_card.md"
 
+# Keys produced by HuggingFace's PretrainedConfig base that do not belong in
+# the researcher-facing config parameter table.
+_HF_INTERNAL_KEYS = frozenset({
+    "transformers_version", "model_type", "auto_map",
+    "is_encoder_decoder", "is_decoder", "add_cross_attention",
+    "cross_attention_hidden_size", "tie_encoder_to_decoder",
+    "pruned_heads", "chunk_size_feed_forward",
+    "output_attentions", "return_dict",
+    "architectures", "task_specific_params", "tokenizer_class",
+    "prefix", "finetuning_task", "problem_type",
+    "id2label", "label2id", "torch_dtype",
+})
+
 # -----------------------------------------------------------------------------
 
 
 def _render_config_table(config: ShramConfig) -> str:
     """Render a markdown table of default configuration parameters.
+
+    Derives rows dynamically from the config's serialised state, excluding
+    HuggingFace-internal bookkeeping keys that are not meaningful to researchers.
 
     Args:
         config: ShramConfig providing the values to tabulate.
@@ -39,22 +59,11 @@ def _render_config_table(config: ShramConfig) -> str:
     Returns:
         Markdown table string ready for insertion into the architecture card.
     """
-    rows = [
-        ("vocab_size", config.vocab_size),
-        ("hidden_size", config.hidden_size),
-        ("intermediate_size", config.intermediate_size),
-        ("num_hidden_layers", config.num_hidden_layers),
-        ("num_sliding_window_heads", config.num_sliding_window_heads),
-        ("num_mosrah_heads", config.num_mosrah_heads),
-        ("num_selected_heads", config.num_selected_heads),
-        ("head_dim", config.head_dim),
-        ("window_size", config.window_size),
-        ("rope_mode", config.rope_mode),
-        ("local_rope_theta", config.local_rope_theta),
-        ("mosrah_rope_theta", config.mosrah_rope_theta),
-        ("training_sequence_length", config.training_sequence_length),
-        ("inference_sequence_length", config.inference_sequence_length),
-    ]
+    rows = sorted(
+        (k, v)
+        for k, v in config.to_dict().items()
+        if k not in _HF_INTERNAL_KEYS and not k.startswith("_")
+    )
     lines = ["| Parameter | Default |", "|-----------|---------|"]
     for name, value in rows:
         lines.append(f"| `{name}` | {value} |")
@@ -83,20 +92,33 @@ def _render_card(config: ShramConfig, repo_id: str) -> str:
 def upload(repo_id: str = REPO_ID) -> None:
     """Prepare and publish the architecture and tokenizer to the Hub.
 
-    Prompts for a HuggingFace write-access token scoped to this repository,
-    then runs four steps:
+    Reads the HuggingFace write token from the SHRAM_HF_TOKEN environment
+    variable, then runs five steps:
     1. Refresh tokenizer files in model/ via prepare_tokenizer()
     2. Write config.json to model/ from ShramConfig defaults
     3. Render and write README.md (architecture card) to model/
-    4. Upload model/ contents to the Hub repository root atomically
+    4. Stage model files into a temporary flat directory
+    5. Upload the staging directory to the Hub repository root
 
+    If REPO_ID is None, exits immediately with an informative message.
     The repository must already exist on HuggingFace Hub before running.
     See src/shram/documentation.md for setup instructions.
 
+    Load from Hub after uploading:
+        config = AutoConfig.from_pretrained(repo_id, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(repo_id)
+
     Args:
-        repo_id: Target Hub repository in 'namespace/name' format.
+        repo_id: Target Hub repository in 'namespace/name' format, or None to skip.
     """
-    token = input("HuggingFace write token: ").strip()
+    if repo_id is None:
+        print("REPO_ID is not set. Skipping upload.")
+        return
+
+    token = os.environ.get("SHRAM_HF_TOKEN")
+    if token is None:
+        raise EnvironmentError("SHRAM_HF_TOKEN environment variable is not set.")
 
     print("Step 1/4 -- Refreshing tokenizer...")
     prepare_tokenizer()
@@ -110,21 +132,24 @@ def upload(repo_id: str = REPO_ID) -> None:
     card = _render_card(config, repo_id)
     (MODEL_DIR / "README.md").write_text(card, encoding="utf-8")
 
-    print(f"Step 4/4 -- Uploading {MODEL_DIR} to {repo_id}...")
-    upload_folder(
-        repo_id=repo_id,
-        folder_path=MODEL_DIR,
-        path_in_repo="architecture_core",
-        repo_type="model",
-        ignore_patterns=["__pycache__", "*.pyc"],
-        commit_message="Update architecture and tokenizer",
-        token=token,
-    )
+    print("Step 4/5 -- Staging model files...")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        staging_dir = Path(tmp_dir)
+        stage(MODEL_DIR, staging_dir)
 
-    print("\nDone. Verify from a fresh environment:")
-    print(f"  AutoConfig.from_pretrained('{repo_id}', trust_remote_code=True)")
-    print(f"  AutoModelForCausalLM.from_config(config)")
-    print(f"  AutoTokenizer.from_pretrained('{repo_id}')")
+        print(f"Step 5/5 -- Uploading to {repo_id}...")
+        upload_folder(
+            repo_id=repo_id,
+            folder_path=staging_dir,
+            repo_type="model",
+            commit_message="Update architecture and tokenizer",
+            token=token,
+        )
+
+    print("\nDone. Load from a fresh environment:")
+    print(f"  config = AutoConfig.from_pretrained('{repo_id}', trust_remote_code=True)")
+    print(f"  model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)")
+    print(f"  tokenizer = AutoTokenizer.from_pretrained('{repo_id}')")
 
 
 if __name__ == "__main__":

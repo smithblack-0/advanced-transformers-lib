@@ -146,7 +146,7 @@ class TestLoss:
         assert out.loss.item() > 0
 
     def test_loss_ignores_minus_100(self, model: ShramForCausalLM) -> None:
-        """Only unmasked shifted label positions may contribute to the loss."""
+        """Only unmasked shifted label positions may contribute to the CE loss."""
         torch.manual_seed(7)
         ids = torch.randint(0, model.config.vocab_size, (1, 8))
         labels = ids.clone()
@@ -155,11 +155,45 @@ class TestLoss:
         with torch.no_grad():
             out = model(ids, labels=labels, use_cache=False)
 
-        expected_loss = torch.nn.functional.cross_entropy(
+        expected_ce = torch.nn.functional.cross_entropy(
             out.logits[:, 6, :],
             ids[:, 7],
         )
-        torch.testing.assert_close(out.loss, expected_loss)
+        torch.testing.assert_close(out.ce_loss, expected_ce)
+
+    def test_ce_loss_none_without_labels(self, model: ShramForCausalLM) -> None:
+        """ce_loss must be None when no labels are provided."""
+        ids = torch.randint(0, model.config.vocab_size, (1, 4))
+        out = model(ids, use_cache=False)
+        assert out.ce_loss is None
+
+    def test_loss_combines_ce_and_load_balance(self, model: ShramForCausalLM) -> None:
+        """loss must equal ce_weight * ce_loss + load_balance_weight * load_balance_loss."""
+        ids = torch.randint(0, model.config.vocab_size, (1, 4))
+        ce_weight, lb_weight = 1.0, 0.01
+        with torch.no_grad():
+            out = model(ids, labels=ids, use_cache=False,
+                        ce_weight=ce_weight, load_balance_weight=lb_weight)
+        expected = ce_weight * out.ce_loss + lb_weight * out.load_balance_loss
+        torch.testing.assert_close(out.loss, expected)
+
+    def test_custom_weights_scale_loss(self, model: ShramForCausalLM) -> None:
+        """Custom weights must be applied correctly to both loss components."""
+        ids = torch.randint(0, model.config.vocab_size, (1, 4))
+        with torch.no_grad():
+            out = model(ids, labels=ids, use_cache=False,
+                        ce_weight=2.0, load_balance_weight=0.5)
+        expected = 2.0 * out.ce_loss + 0.5 * out.load_balance_loss
+        torch.testing.assert_close(out.loss, expected)
+
+    def test_expert_bias_receives_gradient(self) -> None:
+        """expert_bias must receive a gradient when out.loss.backward() is called."""
+        m = ShramForCausalLM(small_config()).train()
+        ids = torch.randint(0, m.config.vocab_size, (1, 4))
+        out = m(ids, labels=ids, use_cache=False)
+        out.loss.backward()
+        bias = m.model.layers[0].attention.sparse_attention.router.expert_bias
+        assert bias.grad is not None
 
 
 # ---------------------------------------------------------------------------

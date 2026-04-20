@@ -74,20 +74,28 @@ contains no weights. All values are overridable via kwargs.
 
 | Parameter | Default |
 |-----------|---------|
-| `vocab_size` | 50277 |
-| `hidden_size` | 512 |
-| `intermediate_size` | 1366 |
-| `num_hidden_layers` | 12 |
-| `num_sliding_window_heads` | 16 |
-| `num_mosrah_heads` | 16 |
-| `num_selected_heads` | 16 |
+| `alpha` | 1.0 |
+| `attention_dropout` | 0.0 |
+| `beta` | 32.0 |
+| `dtype` | None |
 | `head_dim` | 16 |
-| `window_size` | 128 |
-| `rope_mode` | main_sequence |
+| `hidden_size` | 512 |
+| `inference_sequence_length` | 1024 |
+| `intermediate_size` | 1366 |
 | `local_rope_theta` | 10000.0 |
 | `mosrah_rope_theta` | 10000.0 |
-| `training_sequence_length` | 8192 |
-| `inference_sequence_length` | 8192 |
+| `num_hidden_layers` | 12 |
+| `num_mosrah_heads` | 16 |
+| `num_selected_heads` | 16 |
+| `num_sliding_window_heads` | 16 |
+| `output_hidden_states` | False |
+| `rms_norm_eps` | 1e-05 |
+| `rope_mode` | main_sequence |
+| `tie_word_embeddings` | False |
+| `training_sequence_length` | 1024 |
+| `use_cache` | True |
+| `vocab_size` | 50277 |
+| `window_size` | 128 |
 
 ## License
 
