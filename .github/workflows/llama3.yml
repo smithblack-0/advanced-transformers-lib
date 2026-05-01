@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install -e src/llama3/
+        run: pip install -e src/llama3/[dev]
       - name: Run tests
         run: pytest tests/llama3/
 

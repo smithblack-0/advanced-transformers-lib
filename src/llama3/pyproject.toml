@@ -12,6 +12,9 @@ dependencies = [
     "huggingface_hub",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [tool.setuptools.packages.find]
 where = [".."]
 include = ["llama3*"]
