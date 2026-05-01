@@ -1,0 +1,40 @@
+name: shram
+
+on:
+  workflow_call:
+    inputs:
+      run_upload:
+        type: boolean
+        required: true
+    secrets:
+      SHRAM_HF_TOKEN:
+        required: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e src/shram/
+      - name: Run tests
+        run: pytest tests/shram/
+
+  upload:
+    needs: test
+    if: inputs.run_upload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e src/shram/
+      - name: Upload to Hub
+        env:
+          SHRAM_HF_TOKEN: ${{ secrets.SHRAM_HF_TOKEN }}
+        run: python src/shram/upload_to_hub.py

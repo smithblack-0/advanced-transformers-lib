@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  release:
+    types: [published]
+
+jobs:
+  llama3:
+    uses: ./.github/workflows/llama3.yml
+    with:
+      run_upload: ${{ github.event_name == 'release' }}
+    secrets:
+      LLAMA3_HF_TOKEN: ${{ secrets.LLAMA3_HF_TOKEN }}
+
+  shram:
+    uses: ./.github/workflows/shram.yml
+    with:
+      run_upload: ${{ github.event_name == 'release' }}
+    secrets:
+      SHRAM_HF_TOKEN: ${{ secrets.SHRAM_HF_TOKEN }}
+
