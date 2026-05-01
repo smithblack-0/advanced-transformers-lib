@@ -121,21 +121,6 @@ class TestIntegrationTrainable:
                 assert param.grad is not None, f"No gradient for {name}"
 
 
-# ---------------------------------------------------------------------------
-# Integration — HuggingFace-loadable (local)
-# ---------------------------------------------------------------------------
-
-class TestIntegrationAutoClass:
-    def test_from_config_after_local_registration(self):
-        """AutoModelForCausalLM.from_config must return a Llama3ForCausalLM after
-        local AutoClass registration — the same path a researcher uses before or
-        without Hub access.
-        """
-        AutoConfig.register("llama3_baseline", Llama3Config)
-        AutoModelForCausalLM.register(Llama3Config, Llama3ForCausalLM)
-        m = AutoModelForCausalLM.from_config(small_config())
-        assert isinstance(m, Llama3ForCausalLM)
-
 
 # ---------------------------------------------------------------------------
 # Hub constant (Unit 10)

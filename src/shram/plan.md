@@ -70,7 +70,8 @@ is being achieved, one verified unit at a time.
   - [ ] Unit 19.A.1 — Standardize upload infrastructure across all model folders
   - [ ] Unit 19.A.2 — Local dev environment files per model
   - [ ] Unit 19.A.3 — GitHub Actions workflows
-- [ ] Unit 19.B — final audit
+- [X] Unit 19.B — ShramConfig: explicit inference_sequence_length parameter
+- [ ] Unit 19.C — Final audit
 
 ---
 
