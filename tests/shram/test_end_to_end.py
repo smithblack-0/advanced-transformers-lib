@@ -19,6 +19,10 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.huggingface import ShramForCausalLM
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="FlexAttention does not support backward on CPU",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
