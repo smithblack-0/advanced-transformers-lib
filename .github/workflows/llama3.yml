@@ -37,4 +37,4 @@ jobs:
       - name: Upload to Hub
         env:
           LLAMA3_HF_TOKEN: ${{ secrets.LLAMA3_HF_TOKEN }}
-        run: python src/llama3/upload_to_hub.py
+        run: python -m llama3.upload_to_hub

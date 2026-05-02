@@ -21,9 +21,9 @@ from pathlib import Path
 
 from huggingface_hub import upload_folder
 
-from src.shram.model.configuration import ShramConfig
-from src.shram.stage_for_hub import stage
-from src.shram.tokenizer import prepare_tokenizer
+from .model.configuration import ShramConfig
+from .stage_for_hub import stage
+from .tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
 

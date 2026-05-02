@@ -37,4 +37,4 @@ jobs:
       - name: Upload to Hub
         env:
           SHRAM_HF_TOKEN: ${{ secrets.SHRAM_HF_TOKEN }}
-        run: python src/shram/upload_to_hub.py
+        run: python -m shram.upload_to_hub

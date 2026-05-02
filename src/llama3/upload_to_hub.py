@@ -20,9 +20,9 @@ from pathlib import Path
 
 from huggingface_hub import upload_folder
 
-from src.llama3.model.configuration import Llama3Config
-from src.llama3.stage_for_hub import stage
-from src.llama3.tokenizer import prepare_tokenizer
+from .model.configuration import Llama3Config
+from .stage_for_hub import stage
+from .tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
 
