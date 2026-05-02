@@ -57,20 +57,6 @@ model = AutoModelForCausalLM.from_pretrained("./checkpoint", trust_remote_code=T
 | `max_position_embeddings` | 8192 |
 | `rope_theta` | 500000.0 |
 
-## Weight Initialisation
-
-PyTorch's constructor defaults are used: `kaiming_uniform_` for `Linear` layers,
-`normal(0, 1)` for `Embedding`. HuggingFace's default `_init_weights` pass
-(which would reinitialise everything with `normal(0, 0.02)`) is suppressed. If
-you are comparing initialisations across frameworks or baselines, account for this.
-
-## Limitations
-
-- **Padding:** right-padding only. Passing `attention_mask` raises `ValueError`.
-  Use `-100` labels on pad positions.
-- **Tokenizer:** GPT-NeoX (`EleutherAI/gpt-neox-20b`) is used in place of the
-  Llama 3 tokenizer, which is gated. Substitute if exact tokenisation is required.
-
 ## License
 
 MIT. Clean-room synthesis: the human author has not read the Llama source code.
