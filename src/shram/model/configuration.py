@@ -67,8 +67,8 @@ class ShramConfig(PretrainedConfig):
         training_sequence_length: Context length ``C_train`` the model was or will be
             trained at. Used to compute the YaRN scale factor for BEA.
         inference_sequence_length: Context length ``C_target`` the model must support
-            at inference. When equal to ``training_sequence_length``, scale ``s=1``
-            and YaRN reduces to standard RoPE.
+            at inference. Optional; defaults to ``training_sequence_length`` so that
+            ``scale=1`` and YaRN reduces to standard RoPE unless explicitly extended.
         alpha: YaRN ramp lower boundary α (paper §A.2). Frequency dimensions with
             ``r(d) < alpha`` are fully interpolated by scale s. Paper value: 1.0.
         beta: YaRN ramp upper boundary β (paper §A.2). Frequency dimensions with
@@ -102,6 +102,7 @@ class ShramConfig(PretrainedConfig):
         local_rope_theta: float = 10000.0,
         mosrah_rope_theta: float = 10000.0,
         training_sequence_length: int = 1024,
+        inference_sequence_length: int | None = None,
         alpha: float = 1.0,
         beta: float = 32.0,
         attention_dropout: float = 0.0,
@@ -128,15 +129,12 @@ class ShramConfig(PretrainedConfig):
                 f"got {training_sequence_length}."
             )
 
-        # inference_sequence_length is not a constructor parameter. It defaults to
-        # training_sequence_length (scale=1.0, standard RoPE). If a saved config
-        # carries the field through kwargs (after set_inference_context() was called
-        # before saving), restore it here with validation.
-        saved_inference_length = kwargs.pop("inference_sequence_length", training_sequence_length)
-        if saved_inference_length <= 0:
+        if inference_sequence_length is None:
+            inference_sequence_length = training_sequence_length
+        if inference_sequence_length <= 0:
             raise ValueError(
                 f"inference_sequence_length must be positive, "
-                f"got {saved_inference_length}."
+                f"got {inference_sequence_length}."
             )
 
         self.vocab_size = vocab_size
@@ -153,7 +151,7 @@ class ShramConfig(PretrainedConfig):
         self.local_rope_theta = local_rope_theta
         self.mosrah_rope_theta = mosrah_rope_theta
         self.training_sequence_length = training_sequence_length
-        self.inference_sequence_length = saved_inference_length
+        self.inference_sequence_length = inference_sequence_length
         self.alpha = alpha
         self.beta = beta
         self.attention_dropout = attention_dropout
@@ -178,22 +176,3 @@ class ShramConfig(PretrainedConfig):
         """
         return self.inference_sequence_length / self.training_sequence_length
 
-    def set_inference_context(self, inference_sequence_length: int) -> None:
-        """Set the inference context length for YaRN context extension.
-
-        This is the only supported way to set inference_sequence_length. At construction
-        the inference context defaults to training_sequence_length (scale=1.0, standard
-        RoPE). Call this method to configure a longer inference context, which causes
-        YaRN to interpolate frequencies and extend the effective context window.
-
-        Args:
-            inference_sequence_length: Target inference context length. Must be positive.
-                Values equal to training_sequence_length produce scale=1.0 (standard RoPE).
-                Values greater than training_sequence_length enable YaRN extrapolation.
-        """
-        if inference_sequence_length <= 0:
-            raise ValueError(
-                f"inference_sequence_length must be positive, "
-                f"got {inference_sequence_length}."
-            )
-        self.inference_sequence_length = inference_sequence_length

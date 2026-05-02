@@ -21,6 +21,10 @@ from src.shram.model.configuration import ShramConfig
 from src.shram.model.attention.sliding_window_attention import SlidingWindowAttention
 from src.shram.model.cache.sliding_window_cache import LocalSlidingWindowLayerCache
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="FlexAttention does not support backward on CPU",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers

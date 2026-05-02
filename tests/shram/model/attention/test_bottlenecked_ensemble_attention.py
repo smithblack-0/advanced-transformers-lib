@@ -19,6 +19,10 @@ from src.shram.model.attention.bottlenecked_ensemble_attention import Bottleneck
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.cache.mosrah_cache import MoSRAHCache
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="FlexAttention does not support backward on CPU",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers

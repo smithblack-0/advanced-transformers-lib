@@ -102,7 +102,9 @@ def upload(repo_id: str = REPO_ID) -> None:
 
     token = os.environ.get("LLAMA3_HF_TOKEN")
     if token is None:
-        raise EnvironmentError("LLAMA3_HF_TOKEN environment variable is not set.")
+        token = input("LLAMA3_HF_TOKEN not set. Enter HuggingFace write token: ").strip()
+    if not token:
+        raise EnvironmentError("No token provided. Upload aborted.")
 
     print("Step 1/5 -- Refreshing tokenizer...")
     prepare_tokenizer()

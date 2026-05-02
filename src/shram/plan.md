@@ -70,7 +70,8 @@ is being achieved, one verified unit at a time.
   - [ ] Unit 19.A.1 — Standardize upload infrastructure across all model folders
   - [ ] Unit 19.A.2 — Local dev environment files per model
   - [ ] Unit 19.A.3 — GitHub Actions workflows
-- [ ] Unit 19.B — final audit
+- [X] Unit 19.B — ShramConfig: explicit inference_sequence_length parameter
+- [ ] Unit 19.C — Final audit
 
 ---
 
@@ -2073,7 +2074,26 @@ While it is in theory possible to continue to use the repository to manually upd
 
 **Preliminary implementation:** Orchestrator uses GitHub Actions `workflow_call` to invoke each model's reusable workflow. Each model workflow has two jobs: `test` (runs `pip install -e src/<model>/` then pytest for that model's test folder) and `upload` (conditional on Release label, `needs: test`). Branch protection rules are configured manually in the GitHub repository settings — this is not automatable from the codebase itself and must be documented as a setup step.
 
-### Unit 19.B — Final Audit
+### Unit 19.B — ShramConfig: explicit `inference_sequence_length` parameter
+
+**Responsibility:** Replace the implicit/helper-based `inference_sequence_length` mechanism with an explicit optional constructor parameter.
+
+**Context of Correctness:** LLM test harness runners initialize models via config-override at construction time. A parameter that can only be set post-construction via a helper method is invisible to that paradigm and cannot be overridden. The kwargs catch-all that currently makes this "work" accidentally is a silent footgun — it accepts arbitrary typo'd kwargs without error.
+
+**Invariants:**
+- `inference_sequence_length` is an explicit optional constructor parameter with default `None`; when `None`, it is set to `training_sequence_length` at construction time
+- `set_inference_context()` does not exist on `ShramConfig`
+- No kwargs catch-all for `inference_sequence_length` exists; it is declared explicitly in the signature
+- Non-positive values passed at construction raise `ValueError`
+- `scale` property continues to return `inference_sequence_length / training_sequence_length`
+- An explicitly passed `inference_sequence_length` survives a `to_dict` / `from_dict` roundtrip
+- Tests verify: default equals training length, explicit value stored, non-positive raises `ValueError`, roundtrip preservation, `set_inference_context` does not exist as an attribute
+
+**Preliminary implementation:** Remove `set_inference_context()` from `configuration.py`. Change the kwargs pop to an explicit named parameter defaulting to `None`. Validation moves to construction time. `test_configuration.py` tests for `set_inference_context` are replaced with constructor-based equivalents.
+
+---
+
+### Unit 19.C — Final Audit
 
 **What:** Review every file in `src/shram/` against the invariants in `job.md`. Verify no
 hardcoded values, no missing documentation, no gaps between tests and intent. Apply the
