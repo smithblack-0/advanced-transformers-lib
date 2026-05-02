@@ -90,6 +90,18 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
         else:
             self._tied_weights_keys = {}
 
+    def num_mosrah_parameters(self) -> int:
+        """Return the total number of trainable parameters belonging to MoSRAH layers.
+
+        Aggregates across all decoder layers. Excludes sliding-window path parameters,
+        FFN parameters, norms, and embeddings. Use this for experimental plotting of
+        MoSRAH parameter count versus performance.
+
+        Returns:
+            Total count of trainable MoSRAH parameters.
+        """
+        return self.model.num_mosrah_parameters()
+
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the token embedding matrix."""
         return self.embed_tokens

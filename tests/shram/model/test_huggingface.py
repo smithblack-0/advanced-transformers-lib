@@ -439,6 +439,27 @@ class TestSaveLoadAndAutoClass:
         model = AutoModelForCausalLM.from_config(config)
         assert isinstance(model, ShramForCausalLM)
 
+class TestNumMosrahParameters:
+    def test_scaling_with_layers(self):
+        """2× num_hidden_layers must produce exactly 2× the MoSRAH parameter count."""
+        config_base = small_config(num_hidden_layers=2)
+        config_double = small_config(num_hidden_layers=4)
+        model_base = ShramForCausalLM(config_base)
+        model_double = ShramForCausalLM(config_double)
+        assert model_double.num_mosrah_parameters() == 2 * model_base.num_mosrah_parameters()
+
+    def test_partition(self):
+        """MoSRAH parameter count must be strictly less than total model parameter count."""
+        model = ShramForCausalLM(small_config())
+        total = sum(p.numel() for p in model.parameters())
+        assert model.num_mosrah_parameters() < total
+
+    def test_stability(self):
+        """Two calls on the same model must return the same value."""
+        model = ShramForCausalLM(small_config())
+        assert model.num_mosrah_parameters() == model.num_mosrah_parameters()
+
+
 def test_shram_cache_initializes_correctly_for_batch_size_two() -> None:
     cache = ShramCache(
         num_hidden_layers=2,

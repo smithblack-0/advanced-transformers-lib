@@ -45,6 +45,10 @@ class MoSRAHLayer(nn.Module):
         self.positions = SparseMoSRAHPositions(config)
         self.bea = BottleneckedEnsembleAttention(config)
 
+    def num_mosrah_parameters(self) -> int:
+        """Return the total number of trainable parameters in this MoSRAH layer."""
+        return sum(p.numel() for p in self.parameters())
+
     def forward(
         self,
         hidden_states: torch.Tensor,

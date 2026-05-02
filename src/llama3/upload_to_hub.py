@@ -4,8 +4,8 @@ Run as a module from the repository root:
 
     python -m src.llama3.upload_to_hub
 
-The script prompts for a HuggingFace write-access token at runtime. The token
-is passed directly to the API and never stored anywhere.
+The script reads a HuggingFace write-access token from the LLAMA3_HF_TOKEN
+environment variable. The token is passed directly to the API and never stored anywhere.
 
 What is uploaded: every file in src/llama3/model/ -- Python source, config.json,
 tokenizer files, and README.md (architecture card). This folder is the exact Hub root.
@@ -102,9 +102,7 @@ def upload(repo_id: str = REPO_ID) -> None:
 
     token = os.environ.get("LLAMA3_HF_TOKEN")
     if token is None:
-        token = input("LLAMA3_HF_TOKEN not set. Enter HuggingFace write token: ").strip()
-    if not token:
-        raise EnvironmentError("No token provided. Upload aborted.")
+        raise EnvironmentError("LLAMA3_HF_TOKEN environment variable is not set.")
 
     print("Step 1/5 -- Refreshing tokenizer...")
     prepare_tokenizer()

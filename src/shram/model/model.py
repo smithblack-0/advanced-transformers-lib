@@ -62,6 +62,10 @@ class ShramModel(nn.Module):
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def num_mosrah_parameters(self) -> int:
+        """Return the total number of trainable MoSRAH parameters across all decoder layers."""
+        return sum(layer.num_mosrah_parameters() for layer in self.layers)
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
