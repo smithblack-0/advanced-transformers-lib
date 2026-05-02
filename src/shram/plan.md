@@ -71,7 +71,8 @@ is being achieved, one verified unit at a time.
   - [ ] Unit 19.A.2 — Local dev environment files per model
   - [ ] Unit 19.A.3 — GitHub Actions workflows
 - [X] Unit 19.B — ShramConfig: explicit inference_sequence_length parameter
-- [ ] Unit 19.C — Final audit
+- [ ] Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
+- [ ] Unit 19.D — Final audit
 
 ---
 
@@ -2093,7 +2094,39 @@ While it is in theory possible to continue to use the repository to manually upd
 
 ---
 
-### Unit 19.C — Final Audit
+### Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
+
+**Responsibility:** Provide a public method on `ShramForCausalLM` that returns the total number of
+trainable parameters belonging to MoSRAH layers (routing, BEA projections, expert bias) across all
+decoder layers, for use in experimental plotting.
+
+**Why this unit, why here:** The experiment consuming this model needs the MoSRAH parameter count
+to construct plots comparing parameter count against performance. This is a read-only introspection
+capability with no architectural side effects. It is a blocker before the final audit because the
+audit certifies the public interface is complete.
+
+**Invariants this unit must satisfy:**
+- The returned count equals the sum of `p.numel()` for all parameters belonging to MoSRAH
+  submodules across all decoder layers — not the full model, not the sliding-window path, not FFN
+  or norms.
+- The method is accessible from the `ShramForCausalLM` public interface.
+- The count is stable: two calls on the same model return the same value regardless of forward
+  pass state.
+
+**Tests:**
+- **Scaling**: a model with 2× `num_hidden_layers` returns exactly 2× the MoSRAH parameter count.
+  Verifies the aggregation logic without hardcoding any concrete number.
+- **Partition**: MoSRAH count is strictly less than the total model parameter count — it is a
+  proper subset.
+- **Stability**: two calls on the same model return the same value.
+
+**Preliminary strategy:** passthrough — `MoSRAHLayer` exposes its own count, `DecoderLayer`
+aggregates, `ShramModel` sums across layers, `ShramForCausalLM` delegates. Method name to be
+confirmed with user before implementation.
+
+---
+
+### Unit 19.D — Final Audit
 
 **What:** Review every file in `src/shram/` against the invariants in `job.md`. Verify no
 hardcoded values, no missing documentation, no gaps between tests and intent. Apply the
