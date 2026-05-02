@@ -55,7 +55,7 @@ class TestIntegrationGeneratable:
         generation always runs to exactly max_new_tokens. The shape is deterministic.
         """
         ids = torch.randint(0, 256, (1, 4))
-        out = model.generate(ids, max_new_tokens=5)
+        out = model.generate(ids, max_new_tokens=5, use_cache=True)
         assert out.shape == (1, 9)
 
     def test_valid_token_ids(self, model):
