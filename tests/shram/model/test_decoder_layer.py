@@ -6,18 +6,12 @@ Unit 12 coverage strategy:
 - no re-proof of Unit 11 attention semantics or brittle symbolic rewrites
 """
 
-import pytest
 import torch
 
 from src.shram.model.attention.shram import SHRAMHybridLayer
 from src.shram.model.cache.shram_layer_cache import ShramLayerCache
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.decoder_layer import DecoderLayer
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="FlexAttention does not support backward on CPU",
-)
 
 # ---------------------------------------------------------------------------
 # Helpers

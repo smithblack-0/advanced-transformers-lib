@@ -66,10 +66,10 @@ is being achieved, one verified unit at a time.
 - [X] Unit 18.C (Blocker) — End-to-End Subfolder Blocker: basic approach. Work this time dammit.
 - [X] Unit 18.D (Blocker) — Huggingface, bafflingly, does not support folders. Fix it without loosing the important organization of the project.
 - [X] Unit 18.E — end-to-end tests
-- [ ] Unit 19.A — Devops Concerns
-  - [ ] Unit 19.A.1 — Standardize upload infrastructure across all model folders
-  - [ ] Unit 19.A.2 — Local dev environment files per model
-  - [ ] Unit 19.A.3 — GitHub Actions workflows
+- [X] Unit 19.A — Devops Concerns
+  - [X] Unit 19.A.1 — Standardize upload infrastructure across all model folders
+  - [X] Unit 19.A.2 — Local dev environment files per model
+  - [X] Unit 19.A.3 — GitHub Actions workflows
 - [X] Unit 19.B — ShramConfig: explicit inference_sequence_length parameter
 - [ ] Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
 - [ ] Unit 19.D — Final audit

@@ -1,6 +1,6 @@
 # tests/shram/model/cache/test_sliding_window_cache.py
 
-"""Tests for LocalSlidingWindowLayerCache — Unit 14.C."""
+"""Tests for LocalSlidingWindowLayerCache —"""
 
 import pytest
 import torch

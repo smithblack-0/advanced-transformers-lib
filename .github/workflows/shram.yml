@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install -e src/shram/[dev]
+        run: pip install -r src/shram/requirements-dev.txt && pip install -e src/shram/[dev]
       - name: Run tests
         run: pytest tests/shram/
 

@@ -51,6 +51,10 @@ class DecoderLayer(nn.Module):
         self.attention = SHRAMHybridLayer(config)
         self.mlp = SwiGLUMLP(config)
 
+    def num_mosrah_parameters(self) -> int:
+        """Return the total number of trainable MoSRAH parameters in this decoder layer."""
+        return self.attention.num_mosrah_parameters()
+
     def forward(
         self,
         x: torch.Tensor,

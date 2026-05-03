@@ -8,17 +8,11 @@ Unit 13 coverage strategy:
 - no brittle internal seam instrumentation
 """
 
-import pytest
 import torch
 
 from src.shram.model.cache.shram_cache import ShramCache
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.model import ShramModel
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="FlexAttention does not support backward on CPU",
-)
 
 # ---------------------------------------------------------------------------
 # Helpers

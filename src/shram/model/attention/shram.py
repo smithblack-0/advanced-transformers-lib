@@ -35,6 +35,10 @@ class SHRAMHybridLayer(nn.Module):
         self.local_attention = SlidingWindowAttention(config)
         self.sparse_attention = MoSRAHLayer(config)
 
+    def num_mosrah_parameters(self) -> int:
+        """Return the total number of trainable parameters in the MoSRAH sparse path."""
+        return self.sparse_attention.num_mosrah_parameters()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
