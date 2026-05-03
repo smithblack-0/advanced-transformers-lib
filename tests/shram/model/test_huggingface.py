@@ -18,11 +18,6 @@ from src.shram.model.cache.shram_cache import ShramCache
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.huggingface import ShramCausalLMOutput, ShramForCausalLM
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="FlexAttention does not support backward on CPU",
-)
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

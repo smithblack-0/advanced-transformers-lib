@@ -25,11 +25,18 @@ MODEL_DIR = Path(__file__).parent
 
 
 def setup() -> None:
-    """Install shram's dependencies via pip install -e.
+    """Install shram's dependencies via pip install -e and requirements-dev.txt.
 
-    Resolves the model directory relative to this file so the script is
-    runnable from any working directory.
+    Installs the dev requirements first (which pins torch to the CPU-only build
+    via PyTorch's wheel index), then installs the package in editable mode.
+    Resolves paths relative to this file so the script is runnable from any
+    working directory.
     """
+    requirements = MODEL_DIR / "requirements-dev.txt"
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
+        check=True,
+    )
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "-e", str(MODEL_DIR)],
         check=True,

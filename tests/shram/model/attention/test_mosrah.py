@@ -15,11 +15,6 @@ from src.shram.model.attention.mosrah import MoSRAHLayer
 from src.shram.model.cache.mosrah_cache import MoSRAHCache
 from src.shram.model.configuration import ShramConfig
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="FlexAttention does not support backward on CPU",
-)
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
