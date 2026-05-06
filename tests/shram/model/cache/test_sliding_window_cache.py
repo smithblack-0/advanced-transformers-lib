@@ -1,6 +1,49 @@
-# tests/shram/model/cache/test_sliding_window_cache.py
+"""Tests for LocalSlidingWindowLayerCache — Unit 14.C / 15.C.
 
-"""Tests for LocalSlidingWindowLayerCache —"""
+LocalSlidingWindowLayerCache is the local-path sub-cache for one SHRAM decoder
+layer. Its responsibility is narrow: accept the current chunk's local key, value,
+and active-mask tensors; return the current-step local frame (retained buffer
+concatenated with the current chunk); and separately retain the trimmed next-step
+sliding-window state. It does not enforce local causal visibility — that belongs
+to SlidingWindowAttention.
+
+get_seq_length() was revised in Unit 15.C to return the cumulative count of all
+token positions presented across update() calls, rather than raising
+NotImplementedError as originally specified in Unit 14.C. This is the quantity
+HuggingFace generation reads to track sequence progress.
+
+Invariants verified in this file:
+
+HF CacheLayerMixin protocol and construction:
+- LocalSlidingWindowLayerCache subclasses CacheLayerMixin
+- is_initialized is True at construction
+- get_max_cache_shape() returns the configured sliding_window size
+- get_seq_length() returns 0 at construction
+- get_seq_length() counts all positions in the first update chunk
+- get_seq_length() accumulates correctly across multiple updates
+- get_seq_length() counts all positions regardless of active/dead status
+- get_seq_length() resets to zero after reset()
+- get_mask_sizes() raises NotImplementedError
+
+update() contract:
+- First update returns retained buffer (zeros) concatenated with current chunk,
+  with aligned mask; retained buffer positions are marked dead
+- Repeated updates show only the last sliding_window raw positions are retained,
+  verified observationally via the next update's returned frame
+- Ragged batch masks are supported: different masks per batch item are preserved
+- Dead positions may remain present in the returned frame but are marked dead
+- All-live case behaves like simple positional concat followed by positional trim
+
+reset / reorder / repeat / select:
+- reset() restores fresh-cache behavior observationally
+- reorder_cache() permutes the batch dimension, preserving key/value/mask alignment
+- batch_repeat_interleave() expands the batch dimension, preserving alignment
+- batch_select_indices() selects a subset of batch entries, preserving alignment
+
+All multi-step tests use observational verification: correctness of retention is
+checked by what the next update() call returns, not by direct inspection of
+internal buffer state.
+"""
 
 import pytest
 import torch
