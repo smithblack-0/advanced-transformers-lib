@@ -71,8 +71,11 @@ is being achieved, one verified unit at a time.
   - [X] Unit 19.A.2 — Local dev environment files per model
   - [X] Unit 19.A.3 — GitHub Actions workflows
 - [X] Unit 19.B — ShramConfig: explicit inference_sequence_length parameter
-- [ ] Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
-- [ ] Unit 19.D — Final audit
+- [X] Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
+- [ ] Unit 19.E (Blocker) — E2E torch-dynamo compile coverage gap
+- [ ] Unit 19.F (Blocker) — SlidingWindowAttention torch.compile failure
+- [ ] Unit 19.G (Plan Blocker) — Inference-path torch.compile: static vs dynamic cache decision
+- [ ] Unit 19.H — Final audit
 
 ---
 
@@ -2126,7 +2129,94 @@ confirmed with user before implementation.
 
 ---
 
-### Unit 19.D — Final Audit
+### Unit 19.E (Blocker) — E2E torch-dynamo compile coverage gap
+
+**Responsibility:** Add torch dynamo compile verification to the end-to-end test suite so that the existing compile failure is surfaced as a test failure rather than being silently missed.
+
+**Context of Correctness:**
+
+Upon attempt to use this system in the real world, it was identified torch dynamo is not operational. However, no test is raising. This situation should not be possible, as the end to end test series should be testing torch dynamo as well. An oversight means it is not. We must ensure the tests correctly fail before debugging is possible.
+
+**Invariants this unit must satisfy:**
+
+- The end-to-end test suite contains a test that calls `torch.compile` on the model and executes a forward pass through the compiled result.
+- That test fails on the current implementation.
+- No currently passing tests are broken by this addition.
+
+**Tests:**
+
+- Call `torch.compile(model)` and execute a forward pass. Verify this test fails on the current codebase — failure here is the definition of done for this unit.
+
+**Preliminary implementation strategy:**
+
+- Locate the existing end-to-end test file and add the compile test alongside the existing smoke tests, reusing the same config and input setup already established there.
+- Do not mark this unit complete if the test passes — that contradicts the known failure and must be investigated before proceeding.
+
+---
+
+### Unit 19.F (Blocker) — SlidingWindowAttention torch.compile failure
+
+**Responsibility:** Fix `_make_block_mask` in `SlidingWindowAttention` to eliminate the data-dependent control flow that prevents torch dynamo from compiling the flex attention block mask.
+
+**Context of Correctness:**
+
+The sliding window attention system takes certain liberties which are incompatible with torch dynamo. In specific, it mixes control flow with data flow in a manner that is incompatible with flex attention's desire to build flex attention windows. In the sliding window attention formulation a cumsum is used to know the positions of semantic tokens given the elements of the attention mask. This, however, means that when dynamo builds a block attention mask it is attempting to compile control flow on a data-dependent quantity.
+
+**Invariants this unit must satisfy:**
+
+- `SlidingWindowAttention` compiles successfully under `torch.compile`.
+- The compiled model produces identical attention outputs to the uncompiled model for all valid inputs.
+- Active mask structures that are not supported by the revised implementation raise explicitly rather than silently producing incorrect results.
+- All existing `SlidingWindowAttention` tests continue to pass.
+
+**Tests:**
+
+- Verify `torch.compile` on a model containing `SlidingWindowAttention` followed by a forward pass completes without error.
+- Verify compiled and uncompiled forward passes produce numerically identical outputs on the same inputs.
+- Verify unsupported mask structures raise rather than producing wrong results silently.
+
+**Preliminary implementation strategy:**
+
+- **Research required before implementation:** Verify exactly what structures `active_mask` can hold in practice across all call sites (training, cached inference, masked continuation). This determines which structures must be supported and which may raise.
+- If `active_mask` is always left-justified (all `True` values precede all `False` values): assert left-justification at the `_make_block_mask` boundary and raise on violation; replace the `cumsum`-based semantic position computation with `torch.arange`, which is data-independent and dynamo-safe.
+- Verify the `arange`-based positions produce identical masking behavior to the `cumsum` approach for all valid inputs before marking this unit complete.
+- If the research reveals mask structures other than left-justified are valid, surface them explicitly before proceeding — do not resolve the gap autonomously.
+
+---
+
+### Unit 19.G (Plan Blocker) — Inference-path torch.compile: static vs dynamic cache decision
+
+**THIS IS NOT AN ACTIONABLE UNIT. It must be resolved into a full plan unit before any work proceeds.**
+
+**The unresolved decision:**
+
+Whether to rebuild the cache system around `StaticCache` to enable compiled inference, or accept the dynamic cache and forgo it. This matters because sticking with the dynamic cache means the model simply cannot be compiled in inference mode — `torch.compile` requires static shapes. Running inference uncompiled with flex_attention may be significantly slower, potentially making RULER benchmarking prohibitively expensive. Whether that cost is acceptable depends on estimates that have not yet been made.
+
+**Why it matters:**
+
+Uncompiled inference with flex_attention may be significantly slower — flex_attention is designed to be used compiled, and running it uncompiled during evaluation could make RULER benchmarking prohibitively expensive. The magnitude of this cost is currently unknown and must be estimated before the decision can be made.
+
+**Action items required to make the decision:**
+
+- Research how heavily RULER relies on inference generation — frequency and length of generation calls determines how much the compile speedup matters.
+- Estimate how much slower uncompiled flex_attention inference is versus compiled — quantify the cost of staying dynamic.
+- Investigate how large a job a `StaticCache` rebuild would be for SHRAM given the ragged MoSRAH structure.
+
+**Relevant context:**
+
+- The current cache system is dynamic and ragged by design — MoSRAH token counts vary per head and per batch item. Rebuilding around `StaticCache` is a significant undertaking.
+- `flex_attention` already handles masked/inactive positions natively, which is favorable if a padded static approach is pursued.
+- HuggingFace's `CompileConfig` is the known integration hook for making `generate()` compilation-aware once static caches exist — not a blocker in itself.
+- `test_compile_cached_forward` in `test_end_to_end.py` is skipped pending resolution.
+
+**Possible paths:**
+
+- Accept dynamic cache; compiled inference is not supported; document the limitation and close the skipped test.
+- Rebuild around `StaticCache`; enables compiled inference at significant implementation cost.
+
+---
+
+### Unit 19.H — Final Audit
 
 **What:** Review every file in `src/shram/` against the invariants in `job.md`. Verify no
 hardcoded values, no missing documentation, no gaps between tests and intent. Apply the

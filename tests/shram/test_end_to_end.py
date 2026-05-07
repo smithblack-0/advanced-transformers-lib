@@ -12,6 +12,8 @@ Two test layers live here:
    this library.
 """
 
+import shutil
+
 import torch
 import pytest
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -116,6 +118,46 @@ class TestIntegrationTrainable:
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for {name}"
 
+
+
+# ---------------------------------------------------------------------------
+# Integration — Compilable
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def msvc_env():
+    """Skip compile tests if the MSVC environment has not been activated.
+
+    torch.compile requires cl.exe to be on PATH, which is set up by running
+    vcvars64.bat before invoking Python. If it is not present, the user must
+    activate the MSVC environment first (e.g. via Developer Command Prompt or
+    by running vcvars64.bat before launching pytest).
+    """
+    if shutil.which("cl") is None:
+        pytest.skip(
+            "MSVC environment not activated: cl.exe not found on PATH. "
+            "Run vcvars64.bat or launch pytest from a Developer Command Prompt."
+        )
+
+
+class TestIntegrationCompilable:
+    def test_compile_uncached_forward(self, msvc_env):
+        """torch.compile must succeed on the uncached (training) forward path."""
+        m = ShramForCausalLM(small_config()).eval()
+        compiled = torch.compile(m)
+        ids = torch.randint(0, 256, (1, 4))
+        compiled(ids, use_cache=False)
+
+    @pytest.mark.skip(
+        reason="Inference-path compilation requires static caches and CompileConfig "
+               "support — see Plan Blocker 19.G for resolution."
+    )
+    def test_compile_cached_forward(self, msvc_env):
+        """torch.compile must succeed on the cached (inference) forward path."""
+        m = ShramForCausalLM(small_config()).eval()
+        compiled = torch.compile(m)
+        ids = torch.randint(0, 256, (1, 4))
+        compiled.generate(ids, max_new_tokens=3)
 
 
 # ---------------------------------------------------------------------------
