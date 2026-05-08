@@ -209,9 +209,9 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         This is a raw positional trim to the last `sliding_window` positions, not
         a semantic live-token trim.
         """
-        self.keys = composite_keys[:, :, -self.sliding_window :, :]
-        self.values = composite_values[:, :, -self.sliding_window :, :]
-        self.active_mask = composite_mask[:, -self.sliding_window :]
+        self.keys[:] = composite_keys[:, :, -self.sliding_window :, :]
+        self.values[:] = composite_values[:, :, -self.sliding_window :, :]
+        self.active_mask[:] = composite_mask[:, -self.sliding_window :]
 
     def get_seq_length(self) -> int:
         """Return the cumulative number of token positions processed by this cache.

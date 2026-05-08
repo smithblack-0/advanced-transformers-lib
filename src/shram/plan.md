@@ -72,7 +72,7 @@ is being achieved, one verified unit at a time.
   - [X] Unit 19.A.3 — GitHub Actions workflows
 - [X] Unit 19.B — ShramConfig: explicit inference_sequence_length parameter
 - [X] Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
-- [ ] Unit 19.E (Blocker) — E2E torch-dynamo compile coverage gap
+- [X] Unit 19.E (Blocker) — E2E torch-dynamo compile coverage gap
 - [ ] Unit 19.F (Blocker) — SlidingWindowAttention torch.compile failure
 - [ ] Unit 19.G (Plan Blocker) — Inference-path torch.compile: static vs dynamic cache decision
 - [ ] Unit 19.H — Final audit
@@ -2184,35 +2184,37 @@ The sliding window attention system takes certain liberties which are incompatib
 
 ---
 
-### Unit 19.G (Plan Blocker) — Inference-path torch.compile: static vs dynamic cache decision
+### Unit 19.G static inference
 
-**THIS IS NOT AN ACTIONABLE UNIT. It must be resolved into a full plan unit before any work proceeds.**
+**Responsibility**: Rebuild system to use static caches so that huggingface inference can be run in compiled mode; test that such compiled mode works
 
-**The unresolved decision:**
+**Context of Correctness**
 
-Whether to rebuild the cache system around `StaticCache` to enable compiled inference, or accept the dynamic cache and forgo it. This matters because sticking with the dynamic cache means the model simply cannot be compiled in inference mode — `torch.compile` requires static shapes. Running inference uncompiled with flex_attention may be significantly slower, potentially making RULER benchmarking prohibitively expensive. Whether that cost is acceptable depends on estimates that have not yet been made.
+Flex_attention is designed to run compiled — uncompiled inference makes benchmarking prohibitively expensive, so compiled cached inference is a major incentive. Caching rebuilds issues is the major blocker to allowing full compiled compatibility. A small probe has discovered however that besids for the expansion guard in the MosRAH layer and the count in the sliding window cache, all else in the cache is compatible through dynamo without recompile, and without graph breaks. Additionally, the caches are already statically preallocated, with a resizing functionality. As such, it should be very straightforward to switch from a dynamic to a static style of cache, and allow compiled huggingface inference. 
 
-**Why it matters:**
+**Invariants**
 
-Uncompiled inference with flex_attention may be significantly slower — flex_attention is designed to be used compiled, and running it uncompiled during evaluation could make RULER benchmarking prohibitively expensive. The magnitude of this cost is currently unknown and must be estimated before the decision can be made.
+* The SlidingWindowCacheLayer is statically initialized and reuses it's internal memory. 
+* The item call on SlidingWindowCacheLayer which causes graph breaks is refactored to use a tensor for counting; instead conversion happens on accessing the feature using the helper method.
+* The MoSRAH cache system is rebuilt to statically allocate all cache ahead of time. Automatic expansion mechanisms are removed to prevent the associated graph break.
+* Both caches, and their parents, now support the maximum length archtype, which is always given as the requested maximum inference length. 
+* All such caches have the "is_compilable" class field set to true so huggingface knows how to use it, and otherwise fulfills the necessary contracts
+* Necessary changes to the config are made to support static allocation paradigm
 
-**Action items required to make the decision:**
+**Tests**
 
-- Research how heavily RULER relies on inference generation — frequency and length of generation calls determines how much the compile speedup matters.
-- Estimate how much slower uncompiled flex_attention inference is versus compiled — quantify the cost of staying dynamic.
-- Investigate how large a job a `StaticCache` rebuild would be for SHRAM given the ragged MoSRAH structure.
+* SlidingWindowCacheLayer can be compiled then run over several simulated cache cycles without triggering graph breaks
+* MoSRAH can be compiled then run over several simulated cache cycles without triggering graph breaks.
+* When a transformer "CompileConfig" is passed into generate in dynamic mode, the cache is in fact scripted and the model does in fact generate without crashing.
+* These changes are made to the respective cache tests, and the e2e testing file, as appropriate. 
 
-**Relevant context:**
+**Preliminary Implementation Strategies**
 
-- The current cache system is dynamic and ragged by design — MoSRAH token counts vary per head and per batch item. Rebuilding around `StaticCache` is a significant undertaking.
-- `flex_attention` already handles masked/inactive positions natively, which is favorable if a padded static approach is pursued.
-- HuggingFace's `CompileConfig` is the known integration hook for making `generate()` compilation-aware once static caches exist — not a blocker in itself.
-- `test_compile_cached_forward` in `test_end_to_end.py` is skipped pending resolution.
-
-**Possible paths:**
-
-- Accept dynamic cache; compiled inference is not supported; document the limitation and close the skipped test.
-- Rebuild around `StaticCache`; enables compiled inference at significant implementation cost.
+* The amount of theoredical sequence length needed in the MosRAH packed mode is, in theory, num_tokens * num_selected_heads/num_mosrah_heads. This should help considerably figuring out how many tokens to preallocate.
+* num_tokens should be set to inference_sequence_length since this is the maximum number we can infer over. 
+* It is recommended to introduce an additional config argument such as "inference_buffer_factor". It is a multiplier greater than one, is set to 2.0 originally, and multiplies the assigned mosrah sequence cache by this length to cover imperfect load balancing. 
+* Anything which calls .item in the main chain will cause a graph break in the cache and should be avoided. 
+* The documentation for compile config is at https://huggingface.co/docs/transformers/internal/generation_utils.
 
 ---
 
