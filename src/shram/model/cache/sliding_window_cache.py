@@ -92,6 +92,15 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
             device=device,
         )
 
+        # Absolute sequence positions of each retained slot. Inactive slots
+        # retain zero; correctness is carried by active_mask.
+        self.positions = torch.zeros(
+            batch_size,
+            sliding_window,
+            dtype=torch.long,
+            device=device,
+        )
+
         self.is_initialized = True
 
         # Cumulative count of all token positions presented through update() for
@@ -104,8 +113,9 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         active_mask: torch.Tensor,
+        positions: torch.Tensor,
         cache_kwargs: dict | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the current-step local frame and retain the next-step window.
 
         Args:
@@ -115,6 +125,8 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
                 current chunk.
             active_mask: Shape `(B, T_new)` bool. `True` means the
                 corresponding token position in the current chunk is active.
+            positions: Shape `(B, T_new)` long. Absolute sequence position of
+                each token in the current chunk.
             cache_kwargs: Present only to satisfy the `CacheLayerMixin`
                 interface. Unused by this cache.
 
@@ -123,6 +135,7 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
               - visible_keys: `(B, H, sliding_window + T_new, D)`
               - visible_values: `(B, H, sliding_window + T_new, D)`
               - visible_active_mask: `(B, sliding_window + T_new)`
+              - visible_positions: `(B, sliding_window + T_new)`
 
             These are the tensors the local attention path should consume
             directly for the current step.
@@ -134,10 +147,11 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
 
         # The current-step local frame is just retained cache state followed by
         # the current chunk in chronological order.
-        composite_keys, composite_values, composite_mask = self._make_composite_frame(
+        composite_keys, composite_values, composite_mask, composite_positions = self._make_composite_frame(
             key_states=key_states,
             value_states=value_states,
             active_mask=active_mask,
+            positions=positions,
         )
 
         # The cache remembers only the last raw sliding-window positions of that
@@ -147,11 +161,12 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
             composite_keys=composite_keys,
             composite_values=composite_values,
             composite_mask=composite_mask,
+            composite_positions=composite_positions,
         )
 
         self._total_processed += key_states.shape[2]
 
-        return composite_keys, composite_values, composite_mask
+        return composite_keys, composite_values, composite_mask, composite_positions
 
     def _ensure_state_compatibility(
         self,
@@ -185,17 +200,25 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
                 non_blocking=True,
             )
 
+        if self.positions.device != key_states.device:
+            self.positions = self.positions.to(
+                key_states.device,
+                non_blocking=True,
+            )
+
     def _make_composite_frame(
         self,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         active_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the current-step local frame in chronological order."""
         return (
             torch.cat([self.keys, key_states], dim=-2),
             torch.cat([self.values, value_states], dim=-2),
             torch.cat([self.active_mask, active_mask], dim=-1),
+            torch.cat([self.positions, positions], dim=-1),
         )
 
     def _retain_next_window(
@@ -203,6 +226,7 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         composite_keys: torch.Tensor,
         composite_values: torch.Tensor,
         composite_mask: torch.Tensor,
+        composite_positions: torch.Tensor,
     ) -> None:
         """Remember the next-step retained local state.
 
@@ -212,6 +236,7 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         self.keys[:] = composite_keys[:, :, -self.sliding_window :, :]
         self.values[:] = composite_values[:, :, -self.sliding_window :, :]
         self.active_mask[:] = composite_mask[:, -self.sliding_window :]
+        self.positions[:] = composite_positions[:, -self.sliding_window :]
 
     def get_seq_length(self) -> int:
         """Return the cumulative number of token positions processed by this cache.
@@ -239,6 +264,7 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         self.keys.zero_()
         self.values.zero_()
         self.active_mask.zero_()
+        self.positions.zero_()
         self._total_processed = 0
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
@@ -246,12 +272,14 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         self.keys = self.keys[beam_idx]
         self.values = self.values[beam_idx]
         self.active_mask = self.active_mask[beam_idx]
+        self.positions = self.positions[beam_idx]
 
     def batch_repeat_interleave(self, repeats: int) -> None:
         """Expand the batch dimension for beam-search initialisation."""
         self.keys = self.keys.repeat_interleave(repeats, dim=0)
         self.values = self.values.repeat_interleave(repeats, dim=0)
         self.active_mask = self.active_mask.repeat_interleave(repeats, dim=0)
+        self.positions = self.positions.repeat_interleave(repeats, dim=0)
         self.batch_size = self.batch_size * repeats
 
     def batch_select_indices(self, indices: torch.Tensor) -> None:
@@ -259,18 +287,24 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         self.keys = self.keys[indices]
         self.values = self.values[indices]
         self.active_mask = self.active_mask[indices]
+        self.positions = self.positions[indices]
         self.batch_size = int(indices.shape[0])
 
     def offload(self) -> None:
         """Offload cache tensors to CPU."""
         super().offload()
         self.active_mask = self.active_mask.to("cpu", non_blocking=True)
+        self.positions = self.positions.to("cpu", non_blocking=True)
 
     def prefetch(self) -> None:
         """Move cache tensors back to the model device ahead of time."""
         super().prefetch()
         if self.active_mask.device != self.keys.device:
             self.active_mask = self.active_mask.to(
+                self.keys.device,
+                non_blocking=True,
+            )
+            self.positions = self.positions.to(
                 self.keys.device,
                 non_blocking=True,
             )

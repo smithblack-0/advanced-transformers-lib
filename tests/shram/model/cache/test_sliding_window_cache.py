@@ -27,9 +27,10 @@ HF CacheLayerMixin protocol and construction:
 
 update() contract:
 - First update returns retained buffer (zeros) concatenated with current chunk,
-  with aligned mask; retained buffer positions are marked dead
+  with aligned mask and aligned positions; retained buffer positions are zero
 - Repeated updates show only the last sliding_window raw positions are retained,
-  verified observationally via the next update's returned frame
+  verified observationally via the next update's returned frame; retained
+  positions are preserved and correctly carried forward
 - Ragged batch masks are supported: different masks per batch item are preserved
 - Dead positions may remain present in the returned frame but are marked dead
 - All-live case behaves like simple positional concat followed by positional trim
@@ -65,6 +66,11 @@ def v(rows: list[list[float]]) -> torch.Tensor:
 def m(rows: list[list[bool]]) -> torch.Tensor:
     """Build `(B, T)` active masks."""
     return torch.tensor(rows, dtype=torch.bool)
+
+
+def p(rows: list[list[int]]) -> torch.Tensor:
+    """Build `(B, T)` absolute position tensors."""
+    return torch.tensor(rows, dtype=torch.long)
 
 
 def make_cache(
@@ -107,27 +113,27 @@ def test_get_seq_length_is_zero_at_construction():
 
 def test_get_seq_length_counts_first_chunk():
     cache = make_cache(sliding_window=3, batch_size=1)
-    cache.update(k([[1.0, 2.0, 3.0]]), v([[1.0, 2.0, 3.0]]), m([[True, True, True]]))
+    cache.update(k([[1.0, 2.0, 3.0]]), v([[1.0, 2.0, 3.0]]), m([[True, True, True]]), p([[0, 1, 2]]))
     assert cache.get_seq_length() == 3
 
 
 def test_get_seq_length_accumulates_across_updates():
     cache = make_cache(sliding_window=3, batch_size=1)
-    cache.update(k([[1.0, 2.0]]), v([[1.0, 2.0]]), m([[True, True]]))
-    cache.update(k([[3.0]]), v([[3.0]]), m([[True]]))
+    cache.update(k([[1.0, 2.0]]), v([[1.0, 2.0]]), m([[True, True]]), p([[0, 1]]))
+    cache.update(k([[3.0]]), v([[3.0]]), m([[True]]), p([[2]]))
     assert cache.get_seq_length() == 3
 
 
 def test_get_seq_length_counts_all_positions_not_just_active():
     # Dead positions still count toward processed sequence length.
     cache = make_cache(sliding_window=3, batch_size=1)
-    cache.update(k([[1.0, 2.0]]), v([[1.0, 2.0]]), m([[False, True]]))
+    cache.update(k([[1.0, 2.0]]), v([[1.0, 2.0]]), m([[False, True]]), p([[0, 1]]))
     assert cache.get_seq_length() == 2
 
 
 def test_get_seq_length_resets_to_zero_after_reset():
     cache = make_cache(sliding_window=3, batch_size=1)
-    cache.update(k([[1.0, 2.0]]), v([[1.0, 2.0]]), m([[True, True]]))
+    cache.update(k([[1.0, 2.0]]), v([[1.0, 2.0]]), m([[True, True]]), p([[0, 1]]))
     cache.reset()
     assert cache.get_seq_length() == 0
 
@@ -146,19 +152,22 @@ def test_get_mask_sizes_raises_not_implemented():
 def test_first_update_returns_retained_buffer_concatenated_with_current_chunk():
     cache = make_cache(sliding_window=3, batch_size=1)
 
-    out_k, out_v, out_m = cache.update(
+    out_k, out_v, out_m, out_p = cache.update(
         k([[10.0, 11.0]]),
         v([[110.0, 111.0]]),
         m([[True, False]]),
+        p([[0, 1]]),
     )
 
     expected_k = k([[0.0, 0.0, 0.0, 10.0, 11.0]])
     expected_v = v([[0.0, 0.0, 0.0, 110.0, 111.0]])
     expected_m = m([[False, False, False, True, False]])
+    expected_p = p([[0, 0, 0, 0, 1]])
 
     assert torch.equal(out_k, expected_k)
     assert torch.equal(out_v, expected_v)
     assert torch.equal(out_m, expected_m)
+    assert torch.equal(out_p, expected_p)
 
 
 def test_second_update_observationally_shows_only_last_window_is_retained():
@@ -168,24 +177,28 @@ def test_second_update_observationally_shows_only_last_window_is_retained():
         k([[10.0, 11.0]]),
         v([[110.0, 111.0]]),
         m([[True, False]]),
+        p([[0, 1]]),
     )
 
-    out_k, out_v, out_m = cache.update(
+    out_k, out_v, out_m, out_p = cache.update(
         k([[12.0]]),
         v([[112.0]]),
         m([[True]]),
+        p([[2]]),
     )
 
     # After the first update, the retained next-step cache is the last three raw
-    # positions of [0, 0, 0, 10, 11], i.e. [0, 10, 11], with mask [F, T, F].
-    # The second update should therefore return [0, 10, 11] + [12].
+    # positions of [0, 0, 0, 10, 11], i.e. [0, 10, 11], with mask [F, T, F] and
+    # positions [0, 0, 1]. The second update returns [0, 10, 11] + [12].
     expected_k = k([[0.0, 10.0, 11.0, 12.0]])
     expected_v = v([[0.0, 110.0, 111.0, 112.0]])
     expected_m = m([[False, True, False, True]])
+    expected_p = p([[0, 0, 1, 2]])
 
     assert torch.equal(out_k, expected_k)
     assert torch.equal(out_v, expected_v)
     assert torch.equal(out_m, expected_m)
+    assert torch.equal(out_p, expected_p)
 
 
 def test_ragged_batch_masks_are_supported():
@@ -195,12 +208,14 @@ def test_ragged_batch_masks_are_supported():
         k([[10.0, 11.0], [20.0, 21.0]]),
         v([[110.0, 111.0], [120.0, 121.0]]),
         m([[False, True], [True, True]]),
+        p([[0, 1], [0, 1]]),
     )
 
-    out_k, out_v, out_m = cache.update(
+    out_k, out_v, out_m, _ = cache.update(
         k([[12.0], [22.0]]),
         v([[112.0], [122.0]]),
         m([[True], [False]]),
+        p([[2], [2]]),
     )
 
     expected_k = k([
@@ -224,10 +239,11 @@ def test_ragged_batch_masks_are_supported():
 def test_dead_positions_may_remain_present_but_are_marked_dead():
     cache = make_cache(sliding_window=3, batch_size=1)
 
-    out_k, out_v, out_m = cache.update(
+    out_k, out_v, out_m, _ = cache.update(
         k([[7.0, 8.0]]),
         v([[107.0, 108.0]]),
         m([[False, True]]),
+        p([[0, 1]]),
     )
 
     expected_k = k([[0.0, 0.0, 0.0, 7.0, 8.0]])
@@ -246,12 +262,14 @@ def test_all_live_case_behaves_like_simple_positional_concat_and_trim():
         k([[1.0, 2.0]]),
         v([[101.0, 102.0]]),
         m([[True, True]]),
+        p([[0, 1]]),
     )
 
-    out_k, out_v, out_m = cache.update(
+    out_k, out_v, out_m, _ = cache.update(
         k([[3.0]]),
         v([[103.0]]),
         m([[True]]),
+        p([[2]]),
     )
 
     expected_k = k([[0.0, 1.0, 2.0, 3.0]])
@@ -275,14 +293,16 @@ def test_reset_restores_fresh_cache_behavior_observationally():
         k([[10.0, 11.0]]),
         v([[110.0, 111.0]]),
         m([[True, True]]),
+        p([[0, 1]]),
     )
 
     cache.reset()
 
-    out_k, out_v, out_m = cache.update(
+    out_k, out_v, out_m, _ = cache.update(
         k([[5.0]]),
         v([[105.0]]),
         m([[True]]),
+        p([[0]]),
     )
 
     expected_k = k([[0.0, 0.0, 0.0, 5.0]])
@@ -301,14 +321,16 @@ def test_reorder_cache_preserves_alignment_observationally():
         k([[10.0], [20.0]]),
         v([[110.0], [120.0]]),
         m([[True], [False]]),
+        p([[0], [0]]),
     )
 
     cache.reorder_cache(torch.tensor([1, 0]))
 
-    out_k, out_v, out_m = cache.update(
+    out_k, out_v, out_m, _ = cache.update(
         k([[21.0], [11.0]]),
         v([[121.0], [111.0]]),
         m([[True], [True]]),
+        p([[1], [1]]),
     )
 
     expected_k = k([
@@ -336,14 +358,16 @@ def test_batch_repeat_interleave_preserves_alignment_observationally():
         k([[10.0], [20.0]]),
         v([[110.0], [120.0]]),
         m([[True], [False]]),
+        p([[0], [0]]),
     )
 
     cache.batch_repeat_interleave(2)
 
-    out_k, out_v, out_m = cache.update(
+    out_k, out_v, out_m, _ = cache.update(
         k([[1.0], [2.0], [3.0], [4.0]]),
         v([[101.0], [102.0], [103.0], [104.0]]),
         m([[True], [True], [True], [True]]),
+        p([[1], [1], [1], [1]]),
     )
 
     expected_k = k([
@@ -377,14 +401,16 @@ def test_batch_select_indices_preserves_alignment_observationally():
         k([[10.0], [20.0], [30.0]]),
         v([[110.0], [120.0], [130.0]]),
         m([[True], [False], [True]]),
+        p([[0], [0], [0]]),
     )
 
     cache.batch_select_indices(torch.tensor([2, 0]))
 
-    out_k, out_v, out_m = cache.update(
+    out_k, out_v, out_m, _ = cache.update(
         k([[31.0], [11.0]]),
         v([[131.0], [111.0]]),
         m([[True], [True]]),
+        p([[1], [1]]),
     )
 
     expected_k = k([
