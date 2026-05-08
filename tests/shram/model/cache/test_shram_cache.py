@@ -61,7 +61,8 @@ def sw_update(layer_cache: ShramLayerCache, batch: int, num_tokens: int) -> None
     k = torch.randn(batch, LOCAL_HEADS, num_tokens, LOCAL_HEAD_DIM)
     v = torch.randn(batch, LOCAL_HEADS, num_tokens, LOCAL_HEAD_DIM)
     mask = torch.ones(batch, num_tokens, dtype=torch.bool)
-    layer_cache.sliding_window_cache.update(k, v, mask)
+    positions = torch.arange(num_tokens, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+    layer_cache.sliding_window_cache.update(k, v, mask, positions)
 
 
 def mosrah_update(layer_cache: ShramLayerCache, batch: int, num_tokens: int) -> None:

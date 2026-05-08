@@ -53,65 +53,49 @@ Sparse attention is usually framed as a computational concession: a way to make 
 
 \section{Introduction}
 
-Long-sequence performance remains one of the central unresolved limitations of modern attention architectures; as sequence length grows, attention must discriminate among an increasingly large set of candidate tokens, and performance correspondingly degrades. While existing sparse-attention methods such as LSH, recurrent formulations, and SSMs have enabled computationally operational architectures in the long sequence regime, the ability to extract an acceptable level of task performance at arbitrarily long sequence length remains elusive. \citep{kitaev2020reformer, katharopoulos2020transformers, gu2022efficiently}
+The scaling of long-sequence performance remains one of the central unresolved limitations of modern attention architectures. As attention lengths grow, so too do issues with focus and resolution, due to the underlying issue that the model must handle a longer sequence of tokens with the same set of parameters. \citep{liu2024lost, vasylenko2026longcontextgeneralizationsparseattention}. While existing sparse-attention methods such as LSH, recurrent formulations, and SSMs have enabled computationally operational architectures in the long sequence regime, the ability to scale sequence length easily remains elusive, with most solutions being variations on specially designed architectures or auxiliary memory workarounds. \citep{kitaev2020reformer, katharopoulos2020transformers, gu2022efficiently, piekos2025mosa}.
 
-The \emph{Mixture of Sparse Attention} formulation by \citet{piekos2025mosa} (MoSA) is one such formulation in the long line of long-sequence computational research. Pi\k{e}kos used a form of expert-choice head selection to have expert heads attend only to a sparse subset of input tokens. This produced significant performance gains over several more conventional alternatives. However underexplored within the original paper are the consequences sparsification of attention had on the tradeoffs that can be made between long-sequence task performance and the assignment of parameters per head. At a purely \emph{conceptual} level an architecture such as MoSA is distributing the epistemological responsibility of attending to $N$ tokens among $L$ expert heads. It should thus follow that each head is in concept responsible for $\approx \frac{N}{L}$ tokens. Assurances that models will train to use this capacity are another matter entirely.
+At a purely \emph{conceptual} level, combining token-routed mixture of expert technology with long-sequence operation has an beneficial property which may enable scaling of long sequence performance by simply scaling hardware. For an expert mixture system which is performing token-choice routing and dividing $N$ tokens up among $L$ experts, the average sequence length per expert is $N/L$. This implies on average attention sequences occur over this length, which is reduced from the full token sequence length by the factor $1/L$ and thus presumably easier to attend to. If we then naively assume that this expert routing does not harm the model when trained, it follows from the marginal sequence length gain per expert -- $\Delta N / L$ -- that a model built on top of these principles should see marginal long sequence performance improve linearly in $L$. Since $L$ is controlled by the number of parameters, this implies such scaling can be done solely in terms of additional hardware.
 
-This paper studies a potential approach to attacking this underexplored consequence. We find that for the right architectural class,a mixture of attention sparsity can be used not merely to reduce cost, but to change the scaling laws of long-sequence performance itself. Beginning from the observation that sparsely distributing tokens among attention experts reduces the attended tokens per head, we argue that there exists a regime under which the novel Token-Choice Sparse Routed Attention formulation can trade parameters directly for improved long-sequence performance at a theoretically guaranteed at-least-linear rate.
-
-We offer the following contributions:
+We find that for the right formally defined architectural class limited theoretical guarantees exist which imply a mixture of attention sparsity will exhibit the hypothesized guarantees. We find furthermore by empirical studies that there [is/is\_not] evidence this effect. We concretely contribute:
 
 \begin{itemize}
-    \item The presentation and applicable conditions and limitations of the \emph{SRAM Design Law} and the ontology of \emph{Token-Choice Sparse Routed Attention Mixtures}, accompanied by the formal proof of its existence in the appendix and the limitations on its applicability.
-    \item The introduction of the \emph{Mixture of Sparse Routed Attention Heads} (MoSRAH) attention layer for concrete exploration of the theorem, its practical implementation as part of the Sparse Hybrid Routed Attention Mixture (SHRAM) layer as a concrete TC-SRAM instance to probe the effect.
-    \item An empirical study of the MoSRAH layer contrasting long-sequence performance and assigned parameters to verify or refute the applicability of the performance law.
+    \item The presentation and applicable conditions and limitations of the \emph{Token-Choice Sparse Routed Attention Mixtures} architecture classes, and the corrosponding \emph{SRAM Design Law} which the class enforces.
+    \item The empirical study of the \emph{Sparse Hybrid Routed Attention Mixture} (SHRAM) model, a TC--SRAM compliant model designed deliberately to explore the effect, and the contextualization of the result in terms of supporting or negating a viably large beneficial regime as defined under the SRAM design law.
+    \item A full derivation of SRAM design law. the model architecture, and how the model architecture satisfies the design law. This is located largely in the appendix for brevity.
 \end{itemize}
-
-\section{Background}
-\label{sec:background}
-
-Standard self-attention, as introduced by \citet{vaswani2017attention}, uses a query to attend over a set of keys, and is central to auto-regressive decoders.
-
-Attention derives much of its expressive power from permitting each token to compare against a large candidate set of contextual tokens. This same property, however, makes long-sequence processing difficult: full self-attention scales as $\mathcal{O}(N^2)$ in sequence length, motivating a large literature on sparse-attention methods that restrict the set of candidate interactions in order to reduce both the computational and representational burden of long-context modeling~\citep{kitaev2020reformer,roy2021routing,liu2024lost}.
-
-In parallel with the long-sequence developments, Mixture-of-Experts architectures showed that parameter count can be increased dramatically without activating all parameters on every input, using learned routing and load-balancing mechanisms to distribute computation selectively across experts~\citep{shazeer2017outrageously,fedus2022switch}. The development of mixture-of-experts arguably enabled the rise of the modern large-scale LLM. More recently MegaBlocks introduced the terms "Permutation" and "Unpermutation" for the step of placing tokens into tensors with a per-expert index to perform a fused GEMM~\citep{gale2023megablocks}. The usage of the term "Expert Packing" to refer to this occurred within the context of an Nvidia technical exploration~\citep{alvarez2025wideepnvl72}.
-
-The possibility of fusing these threads was brought into explicit focus by \citet{piekos2025mosa} in \emph{Mixture of Sparse Attention} (MoSA). MoSA applied expert-choice routing to sparse attention itself: Given N tokens each head chose k=64 tokens to attend to and attended only within this smaller subset. A separate subset of heads applied sliding window attention to capture short range connections. Of significance for the upcoming discussion is the decision of MoSA to use a hybrid local-global attention system in which a number of local attention heads worked along the MoSA operator sparse heads to complete attention and the expert-choice formulation.
 
 \section{Theory}
 \label{sec:theory}
 
 \subsection{The Token-Choice Sparse Routed Attention Mixture}
 
-A \textbf{token-choice sparse routed attention mixture} model belongs to a family of attention layers characterized by the following invariants.
+Presume initial embedded input $x \in \mathbb{R}^{B \times N \times d}$ where B is batches, N is sequence length, and d is the embedding width. A \textbf{Token-Choice Sparse Routed Attention Mixture} is an abstract model class characterized by the following invariants.
 
 \begin{itemize}
     \item There exists an underlying attention formulation primitive $A(\tilde{x}_h)$ acting on an input token representation $\tilde{x}_h$.
-    \item This formulation is replicated into indexed but individually attention suboperators $A_h(\tilde{x}_h)$ over $L$ distinct experts where, critically, each replication is independently reinitialized and has independent parameters.
-    \item Each input token is routed by token choice into a fixed finite number $K$ of selected experts; routing uses additional parameters for each additional possible router.
+    \item This formulation is replicated into indexed but individually executed attention suboperators, $A_h(\tilde{x}_h)$, over $L \in \mathbb{Z}$ distinct experts where $0 < h < L-1$. Each replication is independently reinitialized and has independent parameters.
+    \item Each input token is routed by token choice into a fixed finite number $K \in \mathbb{Z}$ of selected experts; routing uses additional parameters for each additional possible router, and $0 \geq K\leq L$
     \item This routing induces, for each expert $h$, a packed subset representation $\tilde{x}_h$ consisting only of those tokens routed to that expert.
     \item Attention is evaluated only within these packed expert-local subsets.
     \item The expert-local responses are recombined to produce the final token outputs.
 \end{itemize}
 
-Satisfaction of all these conditions at a conceptual level by a given concrete implementation is sufficient to classify a layer as a member of the family. It should, however, be emphasized that what is needed for applicability is for a conceptual decomposition to exist that mathematically matches this description \citep{vaswani2017attention, wang2023interpretability}.\footnote{An interesting consequence is that even Vaswani attention is a form of TC-SRAM in a routing limit. The viewpoint that makes this work is to view attention as a set of independent heads that always start from the embedding, independently project into a bottlenecked head representation $x_h$, attend within it, project back to the main embedding width, then add up the results from each head. This satisfies the invariants, with the heads representing experts.}
-
-The truly interesting properties of TC-SRAM formulations begin to emerge, however, when sparsity of routing is allowed. If there is a total of $N$ tokens to be processed, then by simple arithmetic there are $NK$ tokens after routing to assign and process. It follows by simple arithmetic that the average tokens attended to within a particular expert bucket $\tilde{x}_h$ is given by
+Satisfaction of all these conditions at a mathematical level by a given concrete implementation is sufficient to classify a layer as a member of the family. It should, however, be emphasized that what is needed for applicability is for a decomposition to exist that mathematically matches this description.\footnote{An interesting consequence is that even Vaswani attention is a form of TC-SRAM in a routing limit. The viewpoint that makes this work is to view attention as a set of independent heads that always start from the embedding, independently project into a bottlenecked head representation $x_h$, attend within it, project back to the main embedding width, then add up the results from each head. This satisfies the invariants, with the heads representing experts.  \citep{vaswani2017attention, wang2023interpretability}.} If there is a total of $N$ tokens to be processed, then by simple arithmetic there are $NK$ tokens after routing to assign and process. It follows by simple arithmetic that the average tokens attended to within a particular expert bucket $\tilde{x}_h$ is given by
 
 \[
 \approx \frac{NK}{L}
 \]
 
-This thus indicates that for these formulations increasing the number of heads $L$ while holding the number of heads chosen $K$ fixed must necessarily reduce the average tokens attended to within each expert bucket $x_h$.
+\subsection{The SRAM Design Law}
 
-\subsection{Design Law}
-
-The central theoretical locus of focus within this work is that a load-balanced TC-SRAM layer -- such as the upcoming MoSRAH attention layer -- is \emph{theoretically bounded to have a regime of operation in which parameters can be traded directly for long-sequence task performance at at least a linear rate}. The formal statement of this effect is as follows.
+An ideally load-balanced TC-SRAM layer is \emph{theoretically bounded to have a regime of operation in which parameters can be traded directly for long-sequence task performance at at least a linear rate}. The formal statement of this effect is as follows.
 
 \begin{quote}
 \begin{theorem}[SRAM Design Law]
 \label{theorem}
-Let $\tau$ denote an arbitrary average long-sequence \emph{task}\footnote{as opposed to computational performance} performance target. Let $K$ be the number of heads selected per token and let $L$ be the total number of heads instantiated by a TC-SRAM attention layer. Let $\Omega$ be the total parameters allocated to those heads, at fixed per-head budget $k$, so that $\Omega=Lk$. Additionally let the TC-SRAM layer have near-perfect load balancing such that the tokens in $\tilde{x}_h$ scale roughly as $\approx \frac{NK}{L}$. Let additional parameters be introduced for routing on any additional token-choice route.
+
+Let $\tau$ denote an arbitrary average long-sequence \emph{task}\footnote{as opposed to computational performance} performance target. Let $K$ be the number of heads selected per token and let $L$ be the total number of heads instantiated by a TC-SRAM attention layer. Let $\Omega$ be the total parameters allocated to those heads, at fixed per-head budget $k$, so that $\Omega=Lk$. Additionally let the TC-SRAM layer have near-perfect load balancing such that the tokens in $\tilde{x}_h$ scale as $\approx \frac{NK}{L}$. Let the additional parameters introduced with increasing $L$ be beneficial for $K \approx L$ and harmful in the extremum $K << L$.
 
 Then there exists a sparsity regime in the long-sequence asymptotic limit
 \[
@@ -126,42 +110,49 @@ where $d_\tau$ and $b_\tau$ depend on the architectural configuration and the se
 \end{theorem}
 \end{quote}
 
-The fully formal derivation of the theorem is available in appendix \ref{app:proof}, but a brief semi-formal summary of it is as follows.
+A brief semi-formal primer illustrating why the effect takes place is the following
 
 \begin{quote}
-If a load-balanced model sparsely divides $N$ tokens $K$ times among $L$ heads, then the tokens per head is on average $\frac{NK}{L}$. Suppose attention is performed on this group; then attention difficulty now decreases with increasing $L$. However, the routing process itself can cause performance degradation; in fact in the infinite-head limit load balancing assigns one token per head and thus no attention occurs at all. In tension, however, whenever we add heads we use more parameters, thus adding more capacity. Since attention becomes computationally sparse at long sequence lengths, there are lots of degrees of freedom to rearrange the computation. Thus this extra capacity will be beneficial to a point until the penalty of sparsity outweighs the benefits of additional parameter capacity.
+If a load-balanced model sparsely divides $N$ tokens $K$ times among $L$ heads, then the tokens per head is on average $\frac{NK}{L}$. Suppose attention is performed on this group; then attention difficulty now decreases with increasing $L$ by our assumptions of attention focus dilution. However, the routing process itself can cause performance changes. When $K \approx L$ we must be able to reproduce the vaswani formulation; therefore, at this location any additional parameters must just be beneficial as they increase capacity. However, at $NK/L < 1$ load balancing assigns at most one token per head which means nothing is attended to at all, an extremely harmful configuration. Therefore, by virtue of starting with a beneficial return and ending with a harmful one, there must be some region $1 > \frac{K}{L} > r$ in which, for whatever definition of 'beneficial' is chosen, a TC-SRAM model with load balancing will see only a beneficial return.
 \end{quote}
 
-\section{Architectural Design}
-\label{sec:design}
+The fully formal derivation of the theorem is available in appendix \ref{app:proof}.
 
-Theorem \ref{theorem} predicts a regime in which additional parameters can be traded for improved long-sequence task performance, but only if the resulting layer actually realizes the conditions under which that tradeoff becomes available. We therefore designed the Sparse Hybrid Token Routed Attention Mixture (SHRAM) layer and its sparse routed subcomponent, the Mixture of Sparse Routed Attention Heads (MoSRAH), specifically to probe this regime.
+\subsection{Predictions}
 
-\subsection{Success Conditions}
-\label{sec:design_success}
+Theorem \ref{theorem} predicts a load-balanced TC-SRAM model has a regime in which additional parameters can be traded for additional long sequence capability at a given performance target.  Long-context benchmarks such as RULER, however, report performance at specified sequence lengths rather than directly returning the maximum supported sequence length at a common score threshold. This makes direct testing difficult.Instead, we may fit a statistical model to predict what the score is at a particular sequence length, then use this model to form predictions all at the same score so the theory can be made directly applicable. This is discussed more deeply in the methodology.
 
-Three design conditions had to be satisfied to begin meaningful exploration of theorem \ref{theorem}. The first two were theoretically imposed by the design law itself:
+Once this has been done, it becomes possible to use that fit to build a dataset of $(\tau, N, \Omega)$ pairs where $\tau$ is the RULER score targeted, $N$ is the predicted sequence length for that score, and $\Omega$ the total number of parameters invested in MoSRAH layers. A linear fit of theorem \ref{theorem} fit at all scores of $N$ and $\Omega$ may then be performed to discover $d_\tau$ and $b_\tau$. We predict the following
 
 \begin{itemize}
-    \item Attention had to remain performant as the number of available heads increased, so that added sparsity did not immediately destroy task performance.
-    \item Attention had to be executed in a repacked expert-choice formulation, ensuring that the average sequence length per expert decreased as routing sparsity increased.
+    \item \emph{$d_\tau$ will be positive}: As MoSRAH parameters increase so does supported sequence length at a score
+    \item \emph{The fit may be poor}: We have only established a bound, not a direct relationship. It is quite likely the fit will be poor; success of the theorem should be judged on if the slope is positive, not a strong $R^2$ fit.
+    \item: \emph{The gains taper off with increasing $\tau$}: as we begin to reach the end of the beneficial region, we begin to slow down.
 \end{itemize}
 
-The third condition was empirical rather than theoretical. In the autoregressive setting studied here, token importance is strongly localized, so a purely sparse routed layer risked prematurely discarding short-range structure. For this reason, attention in the decoder cell was executed as a hybrid
+The null hypothesis for this experiment is that no positive slope is found. The alternative hypothesis is that a positive slope is found. A positive slope being found is correlated given our chosen values with a practically large sparsity response regime.
+
+\section{Method}
+
+A specially designed transformer derivative was implemented and pretrained to test this effect.
+
+\subsection{Model}
+
+The model used within this experiment was deliberately conservative. A Llama3 baseline was modified to replace the Grouped Query Attention with a special Sparse Hybrid Routed Attention layer, containing a local attention layer $h_l(x)$ and a MoSRAH layer $h_s$. These were executed as
+
 \[
 H(x) = h_l(x) + h_s(x),
 \]
-where $h_l$ is a local sliding-window attention path that preserves nearby-token behavior and $h_s$ is the sparse routed component responsible for realizing the theorem-conditioned tradeoff. The resulting hybrid layer is referred to as a \emph{Sparse Hybrid Token Routed Attention Mixture} (SHRAM) layer and is loaded with the MoSRAH sparse attention sublayer.
 
-\subsection{Mixture of Sparse Routed Attention Heads}
-\label{sec:design_mosrah}
+Beyond this, the MoSRAH subsystem had it's rope formulation configured to extrapolate using YaRN , and with two positional modes. \citep{peng2024yarn} The "main sequence" mode assigned the position of tokens based on their ordering in the input token sequence $x$. The "semantic sequence" mode assigned rope positions based on index position within the packed group of tokens $x_h$ instead. The latter was hypothesized to allow semantically related but temporally distant tokens to attend more strongly. Besides for changes necessary to support these behaviors, all parts of the model remained standard. The full details may be consulted in appendix \ref{app:architecture}.
 
-The \emph{Mixture of Sparse Routed Attention Heads} (MoSRAH), $h_s$, was defined specifically to satisfy the success conditions applied to the sparse routed component. Its novelty comes from pairing a mathematically TC-SRAM-compatible token-choice routing process with an expert-choice attention execution path that capitalizes computationally on the sparsity induced by routing. In this way, MoSRAH provides a concrete witness architecture in which the structural tradeoff predicted by theorem \ref{theorem} can be explored empirically.
+\subsection{MoSRAH and SHRAM}
 
-\subsection{Layer Structure}
-\label{sec:design_structure}
+The \emph{Mixture of Sparse Routed Attention Heads} (MoSRAH) layer, $h_s$, was defined specifically to satisfy the restriction conditions applied to TC-SRAM layers, and was the primary component under study in tested \emph{Sparse Hybrid Token Routed Attention Mixture} (SHRAM) model.
 
-Writing the routing process as $R$, the expert-choice packing map as $E$, the token-choice unpacking map as $E_*^{-1}$, and the Bottlenecked Ensemble Attention process as $G$, the MoSRAH forward pass is given by Algorithm \ref{alg:mosrah}.
+Let $x \in \mathbb{R}^{B \times N \times D}$ be the input to the MoSRAH layer. Let $R(x)$ represent the routing process. Let the expert-choice packing map be $E$, the token-choice unpacking map as $E_*^{-1}$, and the parallel attention process as $G$
+
+The MoSRAH forward pass is then given by Algorithm \ref{alg:mosrah}.
 
 \begin{algorithm}[H]
 \caption{MoSRAH Forward Pass}
@@ -170,56 +161,38 @@ Writing the routing process as $R$, the expert-choice packing map as $E$, the to
 \Require Input sequence $x \in \mathbb{R}^{B \times N \times d}$
 \State $(I, P) \gets R(x)$ \Comment{Token-choice routing}
 \State $\tilde{x} \gets E(x, I)$ \Comment{Pack into expert-choice form}
-\State $y \gets G(\tilde{x})$ \Comment{Attention over packed experts}
+\State $y \gets G(\tilde{x})$ \Comment{Attention over packed experts (includes rope)}
 \State $\tilde{y} \gets E_*^{-1}(y, I)$ \Comment{Restore token-choice ordering}
 \State $o \gets \sum_{k=1}^{K} \tilde{y}_k P_k$ \Comment{Weighted reduction}
 \State \Return $o$
 \end{algorithmic}
 \end{algorithm}
 
-Here $I \in \mathbb{Z}^{B \times N \times K}$ denotes the selected heads per token, $P \in \mathbb{R}^{B \times N \times K}$ the corresponding routing probabilities, $\tilde{x} \in \mathbb{R}^{B \times L \times T \times d}$ the packed expert-choice representation, and $\tilde{y} \in \mathbb{R}^{B \times N \times K \times d}$ the restored token-choice responses prior to reduction. This architecture was deliberately engineered such that, in the transition from the token-choice form at $x, I$ to the expert-choice form $\tilde{x}$, the expected reduction in average token length $\approx \frac{NK}{L}$ occurs as desired while well load-balanced. Routing, expert-choice packing, and the Bottlenecked Ensemble Attention formulation are discussed in more detail in the Architecture Appendix, \ref{app:architecture}.
+Here $I \in \mathbb{Z}^{B \times N \times K}$ denotes the selected heads per token, $P \in \mathbb{R}^{B \times N \times K}$ the corresponding routing probabilities, $\tilde{x} \in \mathbb{R}^{B \times L \times T \times d}$ the packed expert-choice representation, and $\tilde{y} \in \mathbb{R}^{B \times N \times K \times d}$ the restored token-choice responses prior to reduction.
 
-\section{Methodology}
+This architecture was deliberately engineered such that, in the transition from the token-choice form at $x, I$ to the expert-choice form $\tilde{x}$, the expected reduction in average token length $\approx \frac{NK}{L}$ occurs as desired while well load-balanced. All architectural details such as  routing, expert-choice packing, and the Bottlenecked Ensemble Attention (G) formulation are discussed in more detail in the Architecture Appendix, \ref{app:architecture}
 
-The empirical goal of this study was to probe whether the tradeoff predicted by theorem \ref{theorem} appears in practice under controlled conditions. To do so, only the total routed head capacity of the sparse routed path was varied across the main comparison runs, while the remainder of the model and training configuration was held fixed unless otherwise noted. Concretely, the MoSRAH path always selected $K=16$ heads per token, while the total number of routed heads was varied across $L \in \{16, 32, 64\}$, corresponding respectively to sparsity ratios $K/L \in \{1.0, 0.5, 0.25\}$. Architectures of [Sizes] were examined.
+\section{Experimental Design}
 
-\subsubsection{Standards}
+\subsection{Independent and Dependent Variables}
 
-Research standards was executed in a theory-first, contract-first manner. The architectural design, theoretical framing, and implementation-relevant details of the apparatus were specified prior to experimental execution as an incomplete paper\footnote{Technically, this paper was written first, then the results were substituted into it when they became available. This is a benefit of theory-first ML}. The system was then implemented against this specification, with LLM assistance used in a contract-realization role rather than as an autonomous design authority with heavy human oversight.
+The MoSRAH layer was pretrained with $K=16$ across total expert values of $L$ at 16, 32, and 64. These corresponded to sparsity ratios of $K/L \in \{1.0, 0.5, 0.25\}$ respectively. Three seeds of value 44, 45, and 46 was tested for each model. The RULER long sequence was then applied at lengths of 4096, 8192, 16,384, and 32,768 to enable the capture of marginal degradation in performance. RULER benchmarks were evaluated in YaRN extrapolative mode. In total, models of [SIZES] were tested.
 
-All research and coding was executed to a professional demonstrative standard suitable for reproduction and examination by third parties. Research specified exact hyperparameters and the ways to resolve uncertainties before the LLM build; this is required for LLM contract-first development to be successful. No research or coding was allowed to proceed while any ambiguity was detected; such events were viewed as a hard blocker that had to be documented and resolved by team consensus before the development trajectory could proceed. An exact log of the entire development trajectory as a living document was maintained in the 'plan.md' file in the codebase at all times; this later served as the foundation for the final audit.
+\subsection{Controlled Variables}
 
-\subsection{Experimental Design}
+18 models were trained with 12 decoder layers at an embedding width of 512. A vocabulary size of 50277 was utilized to correlate with the chosen GPT-X Neo BPE tokenizer, and unless otherwise noted components of the architecture corrospond to the equivalent variation used in Llama3. Pretraining processed 6000 batches at a batch size of 128 and with a sequence length of 1024, a total of roughly 786M tokens. Pretrainined was executed on all models under torch Automatic Mixed Precision\footnote{This occurred in hybrid float32/bfloat16 format} at isotoken conditions.
 
-Theorem \ref{theorem} is stated in terms of supported sequence frontier at a fixed performance target. Long-context benchmarks such as RULER, however, report performance at specified sequence lengths rather than directly returning the maximum supported sequence length at a common score threshold. The central experimental-design problem was therefore to map benchmark outputs into a quantity that could serve as a probe of the theorem's predicted frontier behavior.
-\[
-\mathrm{score} = A N^{k} + B,
-\]
-where $N$ denotes sequence length and $A$, $k$, and $B$ are fitted coefficients. These predicted frontier lengths were then related to routed parameter count through a quadratic fit of the form
-\[
-N = a\Omega^2 + b\Omega + c.
-\]
-Where $\Omega$ designates parameters assigned to MoSRAH layers in total. Evidence for the predicted tradeoff was sought in regions exhibiting positive slope within the first quadrant, with either sign of curvature permitted. Evidence against the predicted tradeoff would be detected if no such region of increasing slope could be detected on the fit.
+Optimization was executed with the AdamW optimizer with the configuration of a learning rate of 6e-4, betas of $(0.9, 0.99)$, and weight decay of $1e-1$. Gradient clipping occurred at a value of 1.0. A cosine annealing learning rate schedule was used with a warmup for 600 batches and which decayed down to 6e-5 by training end. The sliding window attention mechanism used a total of 16 heads with head embedding width of 16 and a window size of 128. Evaluation loss, accuracy, perplexity, wall time delta, and MaxVio were monitored during training to ensure training was successful.
 
-\subsection{Model Hyperparameters}
-\label{app:hyperparameters}
+\subsection{Fit Data Construction}
 
-[DEVELOPMENT NOTE [STRIP BEFORE PUBLISHING]: Exact parameters may need to vary. The invariant is we have to have the control model somewhere in the 180M-220M range. Exceeding 220M will invalidate the kaplan pretraining numbers and should be considered very carefully before usage.]
+The results of the ruler benchmarks produced information in the form of $\Omega$, the number of parameters in total dedicated to MoSRAH layers, $K$, the number of layers chosen, $N$, the sequence length evaluated at, and as the response variable $S$ the score. Theorem \ref{theorem} however is stated in terms of variation in $N$ and $\Omega$ all at the same score to be properly examined.
 
-The SHRAM layer was loaded into a Llama3 model. The sliding window attention mechanism used a total of 16 heads with head embedding width of 16 and a window size of 128. The MoSRAH layers also chose $K=16$ heads at head embedding width of 16. The total number of MoSRAH heads were tested at amount of $L$ = 16, 32, and 64 for sparsity ratios of 1.0, 0.5, and 0.25 respectively.\footnote{This configuration was chosen to divide compute roughly equally between the local attention formulation and the long-range MoSRAH layers}
+To accommodate this we performed a quadratic fit against the RULER data between (N, S) at each $\Omega$, incorporating all seeds. We then reversed this relationship to be able to predict a value of $N$ given a constant value of $S$ at a given $\Omega$, paralleling the assumption of theorem \ref{theorum} of constant $\tau$. We then drew four samples at all values of $\Omega$ and retaining fit accuracies between the observed minimum $S$ and maximum $S$. This formed the data needed to perform the fit analysis to test theorem \ref{theorem}
 
-All models were trained at an embedding width of 512, with 12 total decoder layers. A vocabulary size of 50277 was utilized to correlate with the chosen GPT-X Neo BPE tokenizer. A prenorm architecture with RMSNorm was used between all major layers in the style of Llama3. SwiGLU layers were executed at hidden widths of 1366. \footnote{This is the standard $\mathrm{embedding\_width}*\frac{8/3}$ applied at 512} Dropout was not used, and all long-sequence extrapolation was done using RoPE formulations operating in YaRN extrapolation mode. Details on hyperparameter tuning  -- or the lack of it -- are available in appendix \ref{app:hyperparameter_tuning}
+\subsection{Statistical Analysis}
 
-\subsection{Pretraining}
-
-Pretrainined was executed on all models under torch Automatic Mixed Precision\footnote{This occurred in hybrid float32/bfloat16 format} at isotoken conditions. [Num] models were pretrained on the FineWeb-Edu dataset at the seeds of 44, 45, and 46. (\citep{penedo2024fineweb}) A total of $\approx 655\mathrm{M}$ tokens were processed over the course of 5000 batches for each at a batch size of 128. \footnote{This exceeds the Kaplan recommendations applicable to the small-sized control model. (\citep{kaplan2020scaling})}. Due to the small model size no epochs needed to be repeated.
-
-Opimization was executed with AdamW optimizer at a learning rate of 6e-4 and betas of $\beta_1=0.9$ and $\beta_2 = 0.99$. Weight decay was set to a strength of $1e-1$. Gradient clipping occurred at a value of 1.0. A cosine annealing schedule from 6e-4 to 6e-5 was used with a warmup period of 500 batches. The main loss was cross-entropy configured for causal next-token-prediction in a teacher-forced configuration. The auxiliary loss for load balancing was weighed by 1e-2 before addition to the main loss following which backpropagation occurred. (\citep{fedus2021switch})
-
-Checkpoints were taken at every 1000 batches. Evaluation loss, accuracy, perplexity, wall time delta, and the MaxVio\footnote{Consult appendix \ref{app:maxvio} for more details on this definition, or alternatively the original source at \citet{wang2024auxiliarylossfree}} load balancing metric was taken every 200 batches. Due to the limited computational resource\footnote{The pretraining budget was 100\$} available an an anomaly recovery strategy \footnote{Consult appendix \ref{app:anomaly_recovery} for a clear definition} was utilized to not waste any pretraining run, even if it might degrade the data. This proved [necessary/not\_necessary]. Training occurred on [Hardware] for [Time].
-
-\subsubsection{Processes and Auditing}
-
+Once constructed the fits can be plotted for visual inspection. In addition, we quantify the probability that all the slopes are positive into a p-score for statistical thoroughness by fitting theorem \ref{theorem} at each score, judging the hypothesis that the slope is positive, and combining these results together using Fisher's method. We also explored other forms of fits to more exactly match the actual uncovered patterns.
 
 \section{Results}
 \label{sec:results}
@@ -256,6 +229,7 @@ We wish to justify theorem \ref{theorem}. Theorem \ref{theorem} is a scientific 
 \end{itemize}
 
 Both conditions must be satisfied for this theorem to be both true and useful.
+
 
 \subsection{Necessary Definitions}
 
@@ -381,6 +355,15 @@ x'' = x' + \mathcal{F}(\mathrm{RMSNorm}(x')).
 
 No additional architectural novelties were introduced at the transformer level. The intent was to keep the surrounding model well-understood so that the primary experimental variable remained the substitution of the SHRAM attention node for a standard attention mechanism.
 
+\subsubsection{SHRAM}
+
+
+In the autoregressive setting studied here, token importance is strongly localized, so a purely sparse routed layer risked prematurely discarding short-range structure. For this reason, attention in the decoder cell was executed as a hybrid cell known as shram containing a local attention component $h_l$ and the MoSRAH sparse attention component $h_s$.
+
+\[
+H(x) = h_l(x) + h_s(x),
+\]
+
 \subsubsection{Local Attention Specification}
 \label{app:local_attention}
 
@@ -392,6 +375,8 @@ The local attention component $h_l$ of SHRAM was implemented using flexattention
 \label{app:tokenizer}
 
 To keep the experimental models small and operationally straightforward, tokenization was based on the GPT-NeoX tokenizer family rather than the full LLaMA tokenizer stack. The vocabulary size was correspondingly reduced to approximately $50{,}000$ tokens. This choice was made for practical small-model experimentation and does not otherwise alter the architectural role of SHRAM within the decoder.
+
+
 
 
 \subsection{Routing and Load Balancing}
@@ -808,6 +793,57 @@ The SHRAM layer was located at every location an attention layer would be locate
 All models were trained at an embedding width of 512, with 12 total decoder layers. A vocabulary size of 50277 was utilized to correlate with the chosen GPT-X Neo BPE tokenizer. A prenorm architecture with RMSNorm was used between all major layers in the style of Llama3. SwiGLU layers were executed at hidden widths of 1366. \footnote{This is the standard $\mathrm{embedding\_width}*\frac{8/3}$ applied at 512}
 
 Dropout was not used, and all long-sequence extrapolation was done using RoPE formulations operating in YaRN extrapolation mode. Details on hyperparameter tuning  -- or the lack of it -- are available in appendix \ref{app:hyperparameter_tuning}
+
+\subsection{Metrics}
+\label{app:metrics}
+
+The following metrics were collected throughout pretraining. All metric payloads always included the wall time delta from the last clock step, the current token count, the current optimizer step, and the current batch number when being logged in addition to whatever is specifically logged.
+
+\textbf{Training Metrics}
+
+These metrics were taken every step during training
+
+\begin{itemize}
+
+
+    \item \texttt{raw train loss}: ($\mathcal{L}_\mathrm{CE}$) The raw cross-entropy loss on the current training batch,
+    computed for causal next-token prediction in a teacher-forced configuration.
+    \item \texttt{raw load balancing loss}: ($\mathcal{L}_\mathrm{lb}$) The raw auxiliary load-balancing loss produced by
+    the MoSRAH routing layer, prior to application of the load-balance weight.
+    \item \texttt{effective loss}: ($\mathcal{L}_\mathrm{eff}$) The weighted combined loss that backpropagation
+    operated on, defined as $\mathcal{L}_\mathrm{eff} = \lambda_\mathrm{s} \cdot \mathcal{L}_\mathrm{CE}
+        + \lambda_\mathrm{lb} \cdot \mathcal{L}_\mathrm{lb}$
+    \item \texttt{gradient norm}: The pre-clip gradient norm. Also used to activate anomaly reocvery if needed.
+    \item \texttt{effective learning late}: The product of the scheduled learning rate
+    and the instability scale $\lambda_\mathrm{s}$, representing the true learning rate
+    the model responded to. Anomaly recovery could adjust this
+    \item \texttt{effective load balancing weight}: The current value of
+    $\lambda_\mathrm{lb}$ after any anomaly recovery doublings, representing the true
+    load-balance penalty weight in effect at that step. Anomaly recovery could adjust this.
+\end{itemize}
+
+\subsubsection{Evaluation Metrics}
+
+\begin{itemize}
+    \item \textbf{Evaluation Loss}: The raw cross-entropy loss on the validation split.
+
+    \item \textbf{Load Balance Loss}: The raw auxiliary load-balancing loss on the
+    validation split, recorded to assess whether routing balance generalizes to
+    held-out data.
+
+    \item \textbf{Perplexity}: $\exp(\mathcal{L}_\mathrm{eval})$, derived from the
+    raw evaluation loss.
+
+    \item \textbf{Accuracy}: Fraction of correct next-token predictions on non-padding
+    positions in the validation split.
+
+    \item \textbf{Wall Time Delta}: Elapsed wall time since the previous evaluation,
+    used to monitor training throughput.
+
+    \item \textbf{MaxVio}: The maximum routing imbalance scalar, defined as
+    $L \cdot \max_l(f_l - 1/L)$, where a value of zero indicates perfect load balance.
+    See Appendix \ref{app:maxvio} for a full definition.
+\end{itemize}
 
 
 \subsection{Pretraining}

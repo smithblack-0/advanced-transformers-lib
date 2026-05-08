@@ -71,8 +71,11 @@ is being achieved, one verified unit at a time.
   - [X] Unit 19.A.2 — Local dev environment files per model
   - [X] Unit 19.A.3 — GitHub Actions workflows
 - [X] Unit 19.B — ShramConfig: explicit inference_sequence_length parameter
-- [ ] Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
-- [ ] Unit 19.D — Final audit
+- [X] Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
+- [X] Unit 19.E (Blocker) — E2E torch-dynamo compile coverage gap
+- [ ] Unit 19.F (Blocker) — SlidingWindowAttention torch.compile failure
+- [ ] Unit 19.G (Plan Blocker) — Inference-path torch.compile: static vs dynamic cache decision
+- [ ] Unit 19.H — Final audit
 
 ---
 
@@ -2126,7 +2129,96 @@ confirmed with user before implementation.
 
 ---
 
-### Unit 19.D — Final Audit
+### Unit 19.E (Blocker) — E2E torch-dynamo compile coverage gap
+
+**Responsibility:** Add torch dynamo compile verification to the end-to-end test suite so that the existing compile failure is surfaced as a test failure rather than being silently missed.
+
+**Context of Correctness:**
+
+Upon attempt to use this system in the real world, it was identified torch dynamo is not operational. However, no test is raising. This situation should not be possible, as the end to end test series should be testing torch dynamo as well. An oversight means it is not. We must ensure the tests correctly fail before debugging is possible.
+
+**Invariants this unit must satisfy:**
+
+- The end-to-end test suite contains a test that calls `torch.compile` on the model and executes a forward pass through the compiled result.
+- That test fails on the current implementation.
+- No currently passing tests are broken by this addition.
+
+**Tests:**
+
+- Call `torch.compile(model)` and execute a forward pass. Verify this test fails on the current codebase — failure here is the definition of done for this unit.
+
+**Preliminary implementation strategy:**
+
+- Locate the existing end-to-end test file and add the compile test alongside the existing smoke tests, reusing the same config and input setup already established there.
+- Do not mark this unit complete if the test passes — that contradicts the known failure and must be investigated before proceeding.
+
+---
+
+### Unit 19.F (Blocker) — SlidingWindowAttention torch.compile failure
+
+**Responsibility:** Fix `_make_block_mask` in `SlidingWindowAttention` to eliminate the data-dependent control flow that prevents torch dynamo from compiling the flex attention block mask.
+
+**Context of Correctness:**
+
+The sliding window attention system takes certain liberties which are incompatible with torch dynamo. In specific, it mixes control flow with data flow in a manner that is incompatible with flex attention's desire to build flex attention windows. In the sliding window attention formulation a cumsum is used to know the positions of semantic tokens given the elements of the attention mask. This, however, means that when dynamo builds a block attention mask it is attempting to compile control flow on a data-dependent quantity.
+
+**Invariants this unit must satisfy:**
+
+- `SlidingWindowAttention` compiles successfully under `torch.compile`.
+- The compiled model produces identical attention outputs to the uncompiled model for all valid inputs.
+- Active mask structures that are not supported by the revised implementation raise explicitly rather than silently producing incorrect results.
+- All existing `SlidingWindowAttention` tests continue to pass.
+
+**Tests:**
+
+- Verify `torch.compile` on a model containing `SlidingWindowAttention` followed by a forward pass completes without error.
+- Verify compiled and uncompiled forward passes produce numerically identical outputs on the same inputs.
+- Verify unsupported mask structures raise rather than producing wrong results silently.
+
+**Preliminary implementation strategy:**
+
+- **Research required before implementation:** Verify exactly what structures `active_mask` can hold in practice across all call sites (training, cached inference, masked continuation). This determines which structures must be supported and which may raise.
+- If `active_mask` is always left-justified (all `True` values precede all `False` values): assert left-justification at the `_make_block_mask` boundary and raise on violation; replace the `cumsum`-based semantic position computation with `torch.arange`, which is data-independent and dynamo-safe.
+- Verify the `arange`-based positions produce identical masking behavior to the `cumsum` approach for all valid inputs before marking this unit complete.
+- If the research reveals mask structures other than left-justified are valid, surface them explicitly before proceeding — do not resolve the gap autonomously.
+
+---
+
+### Unit 19.G static inference
+
+**Responsibility**: Rebuild system to use static caches so that huggingface inference can be run in compiled mode; test that such compiled mode works
+
+**Context of Correctness**
+
+Flex_attention is designed to run compiled — uncompiled inference makes benchmarking prohibitively expensive, so compiled cached inference is a major incentive. Caching rebuilds issues is the major blocker to allowing full compiled compatibility. A small probe has discovered however that besids for the expansion guard in the MosRAH layer and the count in the sliding window cache, all else in the cache is compatible through dynamo without recompile, and without graph breaks. Additionally, the caches are already statically preallocated, with a resizing functionality. As such, it should be very straightforward to switch from a dynamic to a static style of cache, and allow compiled huggingface inference. 
+
+**Invariants**
+
+* The SlidingWindowCacheLayer is statically initialized and reuses it's internal memory. 
+* The item call on SlidingWindowCacheLayer which causes graph breaks is refactored to use a tensor for counting; instead conversion happens on accessing the feature using the helper method.
+* The MoSRAH cache system is rebuilt to statically allocate all cache ahead of time. Automatic expansion mechanisms are removed to prevent the associated graph break.
+* Both caches, and their parents, now support the maximum length archtype, which is always given as the requested maximum inference length. 
+* All such caches have the "is_compilable" class field set to true so huggingface knows how to use it, and otherwise fulfills the necessary contracts
+* Necessary changes to the config are made to support static allocation paradigm
+
+**Tests**
+
+* SlidingWindowCacheLayer can be compiled then run over several simulated cache cycles without triggering graph breaks
+* MoSRAH can be compiled then run over several simulated cache cycles without triggering graph breaks.
+* When a transformer "CompileConfig" is passed into generate in dynamic mode, the cache is in fact scripted and the model does in fact generate without crashing.
+* These changes are made to the respective cache tests, and the e2e testing file, as appropriate. 
+
+**Preliminary Implementation Strategies**
+
+* The amount of theoredical sequence length needed in the MosRAH packed mode is, in theory, num_tokens * num_selected_heads/num_mosrah_heads. This should help considerably figuring out how many tokens to preallocate.
+* num_tokens should be set to inference_sequence_length since this is the maximum number we can infer over. 
+* It is recommended to introduce an additional config argument such as "inference_buffer_factor". It is a multiplier greater than one, is set to 2.0 originally, and multiplies the assigned mosrah sequence cache by this length to cover imperfect load balancing. 
+* Anything which calls .item in the main chain will cause a graph break in the cache and should be avoided. 
+* The documentation for compile config is at https://huggingface.co/docs/transformers/internal/generation_utils.
+
+---
+
+### Unit 19.H — Final Audit
 
 **What:** Review every file in `src/shram/` against the invariants in `job.md`. Verify no
 hardcoded values, no missing documentation, no gaps between tests and intent. Apply the

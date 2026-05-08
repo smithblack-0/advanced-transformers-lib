@@ -474,10 +474,12 @@ def test_shram_cache_initializes_correctly_for_batch_size_two() -> None:
     local_values = torch.randn(2, 4, 3, 16)
     local_active_mask = torch.ones(2, 3, dtype=torch.bool)
 
-    returned_keys, returned_values, returned_mask = layer_cache.sliding_window_cache.update(
+    local_positions = torch.arange(3, dtype=torch.long).unsqueeze(0).expand(2, -1)
+    returned_keys, returned_values, returned_mask, _ = layer_cache.sliding_window_cache.update(
         local_keys,
         local_values,
         local_active_mask,
+        local_positions,
     )
 
     assert returned_keys.shape[0] == 2

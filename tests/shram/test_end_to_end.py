@@ -12,6 +12,8 @@ Two test layers live here:
    this library.
 """
 
+import shutil
+
 import torch
 import pytest
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -116,6 +118,38 @@ class TestIntegrationTrainable:
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for {name}"
 
+
+
+# ---------------------------------------------------------------------------
+# Integration — Compilable
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrationCompilable:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "flex_attention compile fails under inductor on CPU "
+            "(pytorch/pytorch#139434); CUDA required."
+        ),
+    )
+    def test_compile_uncached_forward(self):
+        """torch.compile must succeed on the uncached (training) forward path."""
+        m = ShramForCausalLM(small_config()).cuda()
+        compiled = torch.compile(m, fullgraph=False, dynamic=True)
+        ids = torch.randint(0, 256, (1, 4)).cuda()
+        compiled(ids, use_cache=False)
+
+    @pytest.mark.skip(
+        reason="Inference-path compilation requires static caches and CompileConfig "
+               "support — see Plan Blocker 19.G for resolution."
+    )
+    def test_compile_cached_forward(self):
+        """torch.compile must succeed on the cached (inference) forward path."""
+        m = ShramForCausalLM(small_config()).eval()
+        compiled = torch.compile(m)
+        ids = torch.randint(0, 256, (1, 4))
+        compiled.generate(ids, max_new_tokens=3)
 
 
 # ---------------------------------------------------------------------------

@@ -120,12 +120,15 @@ class SlidingWindowAttention(nn.Module):
         # The cache returns the current-step visible local frame, not merely the
         # retained next-step cache buffer.
         if cache is not None:
-            k_full, v_full, full_active_mask = cache.update(k, v, active_mask)
+            k_full, v_full, full_active_mask, full_positions = cache.update(
+                k, v, active_mask, position_ids
+            )
         else:
-            k_full, v_full, full_active_mask = k, v, active_mask
+            k_full, v_full, full_active_mask, full_positions = k, v, active_mask, position_ids
 
         block_mask = self._make_block_mask(
             active_mask=full_active_mask,
+            positions=full_positions,
             batch_size=batch_size,
             num_heads=self.num_heads,
             query_len=query_len,
@@ -182,6 +185,7 @@ class SlidingWindowAttention(nn.Module):
     def _make_block_mask(
         self,
         active_mask: torch.Tensor,
+        positions: torch.Tensor,
         batch_size: int,
         num_heads: int,
         query_len: int,
@@ -191,17 +195,14 @@ class SlidingWindowAttention(nn.Module):
     ) -> Any:
         """Create the FlexAttention block mask for masked local continuation.
 
-        The returned local frame is chronological in raw buffer order, but dead
-        positions may remain inside it. Effective local order is therefore
-        recovered from the active mask itself by taking a cumulative count over
-        active positions.
-
-        Queries still occupy the tail of the returned frame, so raw buffer order
-        is used to locate query rows. Semantic active-token positions are then
-        used to decide causality and sliding-window distance.
+        The returned local frame is chronological in raw buffer order; dead
+        positions may remain inside it. Liveness is carried by `active_mask`.
+        Causality and window distance are determined from `positions`, which
+        holds the absolute sequence position of every slot in the composite
+        frame. Using absolute positions rather than a cumsum over the active
+        mask eliminates the data-dependent computation that blocks torch.compile.
         """
         query_offset = kv_len - query_len
-        semantic_positions = active_mask.long().cumsum(dim=-1) - 1
 
         def sliding_window_mask(
             batch_idx: torch.Tensor,
@@ -215,11 +216,11 @@ class SlidingWindowAttention(nn.Module):
             query_is_active = active_mask[batch_idx, q_abs]
             key_is_active = active_mask[batch_idx, kv_idx]
 
-            q_sem = semantic_positions[batch_idx, q_abs]
-            k_sem = semantic_positions[batch_idx, kv_idx]
+            q_pos = positions[batch_idx, q_abs]
+            k_pos = positions[batch_idx, kv_idx]
 
-            is_causal = k_sem <= q_sem
-            in_window = (q_sem - k_sem) < window_size
+            is_causal = k_pos <= q_pos
+            in_window = (q_pos - k_pos) < window_size
 
             return query_is_active & key_is_active & is_causal & in_window
 

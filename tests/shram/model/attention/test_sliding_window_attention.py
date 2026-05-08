@@ -226,8 +226,14 @@ class TestLocalWindowBehavior:
 
 
 class TestMaskedContinuationSemantics:
-    def test_noncontiguous_live_token_inside_semantic_window_affects_output(self):
-        """A live token outside the raw tail but inside the semantic window must matter."""
+    def test_live_token_within_absolute_window_despite_inactive_gap_affects_output(self):
+        """A live token within the absolute window must affect output even across an inactive gap.
+
+        With window_size=4 and a query at position 6, the absolute window covers
+        positions 3-6. Position 3 (active) is within this window despite an
+        inactive token at position 2 between it and the earlier live tokens.
+        Perturbing position 3 must change the query output.
+        """
         torch.manual_seed(11)
         config = synthetic_config(window_size=4)
         attn = SlidingWindowAttention(config).eval()
@@ -237,19 +243,17 @@ class TestMaskedContinuationSemantics:
             hidden_size=config.hidden_size,
         )
         position_ids = torch.arange(7).unsqueeze(0)
+        # Gap at position 2; positions 3-6 are active and within the absolute window
+        # of the query at position 6 (distances 3, 2, 1, 0 — all < window_size=4).
         active_mask = torch.tensor(
-            [[True, True, True, False, False, True, True]],
+            [[True, True, False, True, True, True, True]],
             dtype=torch.bool,
         )
 
         out_original = attn(x, position_ids, active_mask)
 
-        # For the final live query, the semantic live sequence is
-        # [0, 1, 2, 5, 6], so with window_size=4 the visible live keys are
-        # positions [1, 2, 5, 6]. Position 1 is outside the raw tail but inside
-        # the semantic active window.
         x_modified = x.clone()
-        x_modified[:, 1:2, :] = x_modified[:, 1:2, :] + 500.0
+        x_modified[:, 3:4, :] = x_modified[:, 3:4, :] + 500.0
         out_modified = attn(x_modified, position_ids, active_mask)
 
         assert not torch.allclose(
@@ -396,8 +400,16 @@ class TestSlidingWindowCache:
 
         torch.testing.assert_close(out_original, out_modified)
 
-    def test_live_cached_token_inside_semantic_window_affects_later_live_output(self):
-        """A live cached token outside the raw tail but inside the semantic window must matter."""
+    def test_live_cached_token_within_absolute_window_affects_later_live_output(self):
+        """A live cached token within the absolute window must affect a later live query.
+
+        After prefill at positions [0, 1, 2, 3] with mask [T, T, F, F], the retained
+        frame holds positions 0-3. On the next step (query at position 4, window_size=4),
+        the composite frame is positions [0, 1, 2, 3, 4] with mask [T, T, F, F, T].
+        Position 1 is at absolute distance 3 (< 4) so it IS visible. Position 0 is at
+        absolute distance 4 (not < 4) so it is NOT visible.
+        Perturbing position 1 must change the query output.
+        """
         torch.manual_seed(15)
         config = synthetic_config(window_size=4)
         attn = SlidingWindowAttention(config).eval()
@@ -418,11 +430,10 @@ class TestSlidingWindowCache:
 
         attn(prefill_x, prefill_pos, prefill_mask, cache=cache_a)
 
-        # On the next step the returned frame is positions [0, 1, 2, 3, 4] with mask
-        # [T, T, F, F, T]. Position 0 is outside the raw last-4 tail but inside the
-        # semantic active window for the final live query.
+        # Position 1 is at absolute distance 3 from the query at position 4 — within
+        # window_size=4, so it is visible. Perturbing it must change the output.
         prefill_x_modified = prefill_x.clone()
-        prefill_x_modified[:, 0:1, :] = prefill_x_modified[:, 0:1, :] + 500.0
+        prefill_x_modified[:, 1:2, :] = prefill_x_modified[:, 1:2, :] + 500.0
         attn(prefill_x_modified, prefill_pos, prefill_mask, cache=cache_b)
 
         out_original = attn(next_x, next_pos, next_mask, cache=cache_a)
