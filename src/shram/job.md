@@ -14,10 +14,11 @@ The library is a repository, not a PyPI package. Distribution is via HuggingFace
 
 ## Governing Principle
 
-Hours of LLM work rejected due to failing to follow governing principles: 7.9
-Total sessions completely rolled back: 8
+Hours of LLM work rejected due to failing to follow governing principles: 9.9
+Total sessions completely rolled back: 9
 
 **Process violation log (most recent first):**
+- 2026-05-09: Rolled back for operating as an independent executor rather than a teammate. Made edits without bilateral consensus, treated corrections as approval to proceed alone, and when asked to derive from first principles read only enough to produce a justification rather than actually reasoning. The model was filling gaps independently rather than working with the user. Three explicit warnings issued before rollback. 2 hours wasted.
 - 2026-05-07: Rolled back for treating process rules as suggestions rather than law. Was warned explicitly for wandering outside scope. Instead of stopping and recentering, immediately did it again. This revealed the model was operating as an independent executor rather than as a team member maintaining a shared mental model. Rules are not compliance checkboxes — they define what correct means. Work produced outside process is invalid regardless of technical quality. 30 minutes wasted.
 **These rules are serious**
 
