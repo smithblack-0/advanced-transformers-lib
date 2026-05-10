@@ -135,6 +135,16 @@ class TestIntegrationCompilable:
     )
     def test_compile_uncached_forward(self):
         """torch.compile must succeed on the uncached (training) forward path."""
+        # REMOVE WHEN DEBUGGING DONE: explain mode to surface graph breaks
+        torch._dynamo.reset()
+        torch._dynamo.config.verbose = True
+        explanation = torch._dynamo.explain(ShramForCausalLM(small_config()))(
+            torch.randint(0, 256, (1, 4)), use_cache=False
+        )
+        print(f"\n{explanation}")
+
+        torch._dynamo.reset()
+        # END REMOVE WHEN DEBUGGING DONE
         m = ShramForCausalLM(small_config()).cuda()
         compiled = torch.compile(m, fullgraph=False, dynamic=True)
         ids = torch.randint(0, 256, (1, 4)).cuda()

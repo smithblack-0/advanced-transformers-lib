@@ -69,6 +69,7 @@ class SlidingWindowAttention(nn.Module):
             mode="default",
             head_dim=self.head_dim,
             theta=config.local_rope_theta,
+            maximum_sequence_length=config.inference_sequence_length,
         )
 
     def forward(

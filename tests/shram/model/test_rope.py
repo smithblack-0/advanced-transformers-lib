@@ -9,7 +9,8 @@ Invariant groups:
    frequency schedule and A_rope formula; s=1 makes yarn identical to default.
 4. Parameter validation — unsupported mode raises NotImplementedError; missing yarn
    parameters raise ValueError.
-5. Cache extension — the cache grows lazily and covers the maximum position seen.
+5. Cache preallocation — the cache is built at construction to cover
+   maximum_sequence_length positions; it is rebuilt on dtype or device change only.
 6. Cache sharing — instances with identical parameters reference the same cached tensors.
 7. Arbitrary position shape — forward accepts 2D and 3D position_ids correctly.
 """
@@ -28,22 +29,23 @@ from src.shram.model.rope import RotaryEmbedding, _rotate_half
 
 HEAD_DIM = 16
 THETA = 10000.0
+MAX_SEQ = 64  # covers all positions used in tests
 
 
 def default_rope(**kwargs) -> RotaryEmbedding:
     """Construct a default-mode RotaryEmbedding with small test dimensions."""
-    params = dict(mode="default", head_dim=HEAD_DIM, theta=THETA)
+    params = dict(mode="default", head_dim=HEAD_DIM, theta=THETA, maximum_sequence_length=MAX_SEQ)
     params.update(kwargs)
     return RotaryEmbedding(**params)
 
 
-def yarn_rope(s: float = 2.0, **kwargs) -> RotaryEmbedding:
+def yarn_rope(s: float = 2.0, maximum_sequence_length: int = 1024, **kwargs) -> RotaryEmbedding:
     """Construct a yarn-mode RotaryEmbedding with scale factor s."""
     params = dict(
         mode="yarn",
         head_dim=HEAD_DIM,
         theta=THETA,
-        initial_seq_length=512,
+        maximum_sequence_length=maximum_sequence_length,
         dilation=s,
         alpha=1.0,
         beta=32.0,
@@ -228,8 +230,8 @@ class TestModeBehaviour:
         training, s, alpha, beta = 512, 4.0, 1.0, 32.0
         rope = RotaryEmbedding(
             mode="yarn", head_dim=HEAD_DIM, theta=THETA,
-            initial_seq_length=training, dilation=s,
-            alpha=alpha, beta=beta,
+            maximum_sequence_length=round(training * s),
+            dilation=s, alpha=alpha, beta=beta,
         )
 
         d_index = torch.arange(0, HEAD_DIM, 2, dtype=torch.float32)
@@ -249,42 +251,35 @@ class TestParameterValidation:
     def test_unknown_mode_raises(self):
         """Unsupported mode must raise NotImplementedError."""
         with pytest.raises(NotImplementedError, match="not supported"):
-            RotaryEmbedding(mode="longrope", head_dim=HEAD_DIM, theta=THETA)
-
-    def test_yarn_missing_initial_seq_length_raises(self):
-        with pytest.raises(ValueError, match="initial_seq_length"):
-            RotaryEmbedding(
-                mode="yarn", head_dim=HEAD_DIM, theta=THETA,
-                dilation=4.0, alpha=1.0, beta=32.0,
-            )
+            RotaryEmbedding(mode="longrope", head_dim=HEAD_DIM, theta=THETA, maximum_sequence_length=64)
 
     def test_yarn_missing_dilation_raises(self):
         with pytest.raises(ValueError, match="dilation"):
             RotaryEmbedding(
                 mode="yarn", head_dim=HEAD_DIM, theta=THETA,
-                initial_seq_length=512, alpha=1.0, beta=32.0,
+                maximum_sequence_length=1024, alpha=1.0, beta=32.0,
             )
 
     def test_yarn_missing_alpha_raises(self):
         with pytest.raises(ValueError, match="alpha"):
             RotaryEmbedding(
                 mode="yarn", head_dim=HEAD_DIM, theta=THETA,
-                initial_seq_length=512, dilation=4.0, beta=32.0,
+                maximum_sequence_length=1024, dilation=4.0, beta=32.0,
             )
 
     def test_yarn_missing_beta_raises(self):
         with pytest.raises(ValueError, match="beta"):
             RotaryEmbedding(
                 mode="yarn", head_dim=HEAD_DIM, theta=THETA,
-                initial_seq_length=512, dilation=4.0, alpha=1.0,
+                maximum_sequence_length=1024, dilation=4.0, alpha=1.0,
             )
 
 
 # ---------------------------------------------------------------------------
-# 5. Cache extension
+# 5. Cache preallocation
 # ---------------------------------------------------------------------------
 
-class TestCacheExtension:
+class TestCachePreallocation:
     def test_short_then_long_sequence_consistent(self):
         """Positions 0..3 must produce identical output whether computed in a short or long pass."""
         rope = default_rope()
@@ -305,13 +300,11 @@ class TestCacheExtension:
         torch.testing.assert_close(q_rot_short, q_rot_long[:, :, :4, :])
         torch.testing.assert_close(k_rot_short, k_rot_long[:, :, :4, :])
 
-    def test_cache_length_covers_max_position(self):
-        """After processing a sequence the cache must cover all positions seen."""
+    def test_cache_size_equals_maximum_sequence_length(self):
+        """The cache must be preallocated to exactly maximum_sequence_length at construction."""
         rope = default_rope()
-        q, k, pos = random_qk(seq=32)
-        rope(q, k, pos)
         assert rope._cos_cached is not None
-        assert rope._cos_cached.shape[0] >= 32
+        assert rope._cos_cached.shape[0] == rope._maximum_sequence_length
 
 
 # ---------------------------------------------------------------------------
@@ -328,11 +321,7 @@ class TestCacheSharing:
         rope_a = default_rope()
         rope_b = default_rope()
 
-        q, k, pos = random_qk(seq=8)
-        rope_a(q, k, pos)
-        rope_b(q, k, pos)
-
-        # Both instances must point to the same tensor object in memory.
+        # The cache is built at construction; no forward call is needed to verify sharing.
         assert rope_a._cos_cached is rope_b._cos_cached
         assert rope_a._sin_cached is rope_b._sin_cached
 
@@ -340,10 +329,6 @@ class TestCacheSharing:
         """Instances with different theta must not share a cache."""
         rope_a = default_rope(theta=10000.0)
         rope_b = default_rope(theta=500000.0)
-
-        q, k, pos = random_qk(seq=8)
-        rope_a(q, k, pos)
-        rope_b(q, k, pos)
 
         assert rope_a._cos_cached is not rope_b._cos_cached
 

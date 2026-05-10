@@ -73,8 +73,14 @@ is being achieved, one verified unit at a time.
 - [X] Unit 19.B — ShramConfig: explicit inference_sequence_length parameter
 - [X] Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
 - [X] Unit 19.E (Blocker) — E2E torch-dynamo compile coverage gap
-- [ ] Unit 19.F (Blocker) — SlidingWindowAttention torch.compile failure
-- [ ] Unit 19.G (Plan Blocker) — Inference-path torch.compile: static vs dynamic cache decision
+- [X] Unit 19.F (Blocker) — SlidingWindowAttention torch.compile failure
+- [ ] Unit 19.F.1 — Position-zero constraint: compile-compatible enforcement (revised)
+- [ ] Unit 19.F.2 — Compile-time error for missing capture_scalar_outputs
+- [X] Unit 19.G (Blocker) — RotaryEmbedding: preallocate to maximum_sequence_length, eliminate .item()
+- [ ] Unit 19.G.1 (Blocker) — Expert packing: static T preallocation and overflow detection
+- [ ] Unit 19.G.2 (Blocker) — Expert packing: replace _bincount_rows with scatter_add
+- [ ] Unit 19.G.3 (Blocker) — Load balance frequency aggregation: p-mean and load_balance_p
+- [ ] Unit 19.G.4 (Blocker) — Static cache rebuild for compiled inference
 - [ ] Unit 19.H — Final audit
 
 ---
@@ -1813,7 +1819,7 @@ The SRAM effect is a hypothesized trade that lets certain classes of models trad
 - The documentation makes the connection to the paper explicit and easy to find.
 - The documentation tells a user how to instantiate and use the SHRAM portion of the repository at its intended surface, rather than forcing them to infer basic usage from source code.
 - The documentation identifies the main SHRAM control surfaces relevant to operating or probing the system, without trying to restate the full theory from the paper.
-- The documentation identifies the major caveats or unusual usage constraints a user must know in order to use the SHRAM portion of the repository correctly.
+- The documentation identifies the major caveats or unusual usage constraints a 1user must know in order to use the SHRAM portion of the repository correctly.
 - - The documentation provides sufficient context for ongoing maintenance of the SHRAM portion of the repository.
 - The documentation explains the relevant software-artifact surface: where the important SHRAM entrypoints are, how this part of the repository is structured at a high level, and how new versions are uploaded or exposed.
 - The documentation defers deeper theory, proofs, and detailed architectural justification to the paper rather than attempting to duplicate them.
@@ -2184,37 +2190,256 @@ The sliding window attention system takes certain liberties which are incompatib
 
 ---
 
-### Unit 19.G static inference
+### Unit 19.F.1 — Position-zero constraint: compile-compatible enforcement (revised)
 
-**Responsibility**: Rebuild system to use static caches so that huggingface inference can be run in compiled mode; test that such compiled mode works
+**Responsibility:** Enforce the uncached starting-position constraint in both compiled and eager execution modes without graph breaks.
 
-**Context of Correctness**
+**Context of Correctness:**
 
-Flex_attention is designed to run compiled — uncompiled inference makes benchmarking prohibitively expensive, so compiled cached inference is a major incentive. Caching rebuilds issues is the major blocker to allowing full compiled compatibility. A small probe has discovered however that besids for the expansion guard in the MosRAH layer and the count in the sliding window cache, all else in the cache is compatible through dynamo without recompile, and without graph breaks. Additionally, the caches are already statically preallocated, with a resizing functionality. As such, it should be very straightforward to switch from a dynamic to a static style of cache, and allow compiled huggingface inference. 
+Error messages at misuse boundaries are a long-term support requirement for any system whose outputs must be trusted. One such error condition is nonzero starting positions passed to an uncached forward — there is no prior KV state to justify positions other than zero, and the violation produces silently incorrect RoPE encoding and attention outputs. The check belongs in `huggingface.py`, before the main model runs, so it intercepts the misuse at the outermost boundary.
 
-**Invariants**
+In compiled mode, data-dependent Python control flow including `raise` causes graph breaks. The sole exception is `torch._check` used with `capture_scalar_outputs = True`: this configuration enables `.item()` to be captured by dynamo as a SymInt, allowing the assertion to fold into the compiled graph without breaking it. However when `torch._check` fires, the error surfaces at the C++ level — the message string is not cleanly propagated; the call stack lands on the calling function, and only that frame is reported.
 
-* The SlidingWindowCacheLayer is statically initialized and reuses it's internal memory. 
-* The item call on SlidingWindowCacheLayer which causes graph breaks is refactored to use a tensor for counting; instead conversion happens on accessing the feature using the helper method.
-* The MoSRAH cache system is rebuilt to statically allocate all cache ahead of time. Automatic expansion mechanisms are removed to prevent the associated graph break.
-* Both caches, and their parents, now support the maximum length archtype, which is always given as the requested maximum inference length. 
-* All such caches have the "is_compilable" class field set to true so huggingface knows how to use it, and otherwise fulfills the necessary contracts
-* Necessary changes to the config are made to support static allocation paradigm
+Therefore the most effective approach is to assume `capture_scalar_outputs = True` and implement an eager/compiled branch split inside a dedicated helper, triggered via `torch._check` on invalid conditions. The helper's docstring becomes the primary diagnostic surface.
 
-**Tests**
+**Invariants this unit must satisfy:**
 
-* SlidingWindowCacheLayer can be compiled then run over several simulated cache cycles without triggering graph breaks
-* MoSRAH can be compiled then run over several simulated cache cycles without triggering graph breaks.
-* When a transformer "CompileConfig" is passed into generate in dynamic mode, the cache is in fact scripted and the model does in fact generate without crashing.
-* These changes are made to the respective cache tests, and the e2e testing file, as appropriate. 
+- Uncached forward with nonzero starting positions raises in both compiled and eager execution
+- The error is sufficient for the caller to identify the misuse and correct it
 
-**Preliminary Implementation Strategies**
+**Tests:**
 
-* The amount of theoredical sequence length needed in the MosRAH packed mode is, in theory, num_tokens * num_selected_heads/num_mosrah_heads. This should help considerably figuring out how many tokens to preallocate.
-* num_tokens should be set to inference_sequence_length since this is the maximum number we can infer over. 
-* It is recommended to introduce an additional config argument such as "inference_buffer_factor". It is a multiplier greater than one, is set to 2.0 originally, and multiplies the assigned mosrah sequence cache by this length to cover imperfect load balancing. 
-* Anything which calls .item in the main chain will cause a graph break in the cache and should be avoided. 
-* The documentation for compile config is at https://huggingface.co/docs/transformers/internal/generation_utils.
+- Compile the validation method in isolation; verify it raises under a violating condition
+- Verify it raises under the same condition in eager mode
+
+**Audit:**
+
+- That the call site passes the correct condition tensor to the validator
+
+**Preliminary implementation strategy:**
+
+- `capture_scalar_outputs = True` is a precondition; 19.F.2 owns the warning when it is absent
+- A dedicated static method owns the validation, branching on `torch.compiler.is_compiling()`: compiled path uses `.item()` + `torch._check`; eager path uses `.item()` + direct raise
+- The method is static so it can be compiled and tested in isolation
+- The method's docstring specifies what a failure means and how to resolve it
+- The bool tensor condition is computed at the call site and passed into the method
+
+---
+
+### Unit 19.F.2 — Compile-time warning for missing `capture_scalar_outputs`
+
+**Responsibility:** Raise an error at compile time when `capture_scalar_outputs = True` is absent, making the missing precondition immediately visible rather than leaving the user to discover it from downstream behaviour.
+
+**Context of Correctness:**
+
+`capture_scalar_outputs = True` is a non-default dynamo flag required for the safety checks established in 19.F.1 to fold into compiled graphs. Without it those checks silently revert to graph-breaking behaviour or are skipped. A compiled model with fewer safety properties than its eager counterpart produces no diagnostic output to that effect — the user has no indication that the protections they observed in eager mode are absent. For a research baseline this is a support liability: misconfiguration is invisible until something goes wrong downstream.
+
+`torch.compiler.is_compiling()` returns True during dynamo tracing. `torch._dynamo.config.capture_scalar_outputs` is readable as a Python attribute at trace time. Together these make it possible to detect the misconfiguration at the exact moment it takes effect and raise before the compiled region executes.
+
+**Invariants this unit must satisfy:**
+
+- When the model is compiled without `capture_scalar_outputs = True`, an error is raised that identifies the missing flag and its consequence
+- When `capture_scalar_outputs = True` is set, no error fires
+
+**Tests:**
+
+- Compile a minimal stand-in containing the check without the flag set; verify the error fires
+- Verify no error fires when the flag is set
+
+**Preliminary implementation strategy:**
+
+- A dedicated static method raises the error, gated on `torch.compiler.is_compiling()` and the flag value
+- Called at the entry point of `ShramForCausalLM.forward` so it fires on the first compilation pass
+- Error message names the flag, its required value, and the consequence of absence
+
+---
+
+### Unit 19.G (Blocker) — RotaryEmbedding: preallocate to maximum_sequence_length, eliminate .item()
+
+**Responsibility:** Rebuild `RotaryEmbedding` to preallocate the cos/sin table to a fixed `maximum_sequence_length` at construction time, eliminating the `position_ids.max().item()` call in `forward` that causes a graph break under torch.compile.
+
+**Context of Correctness:**
+
+The current lazy extension design calls `position_ids.max().item()` in every forward pass to determine the required cache length. This forces a CPU sync (data-dependent scalar extraction) and causes a dynamo graph break. Since the system is moving toward fixed-length preallocation for inference (Unit 19.H), the correct resolution is to preallocate at construction to a caller-supplied `maximum_sequence_length`. The `forward` path then only performs metadata checks (dtype, device) to determine if a rebuild is needed — both of which dynamo can handle without a break.
+
+**Invariants this unit must satisfy:**
+
+- `RotaryEmbedding` accepts a new required `maximum_sequence_length: int` constructor parameter.
+- The cos/sin table is built at construction time to cover positions `[0, maximum_sequence_length)`. No lazy extension occurs on the first forward call. No remaining initial sequence length.
+- `forward` contains no `.item()` call. Cache validity is checked via dtype and device metadata only.
+- All existing `RotaryEmbedding` tests continue to pass. Constructor call sites are updated to supply `maximum_sequence_length`.
+- For `mode="yarn"`, logic is changed as appropriate. 
+
+**Tests:**
+
+- Existing rope tests updated for new constructor signature — all must pass.
+- Verify no `.item()` call appears in `forward` after the change.
+
+**Audit**
+
+- Verify by inspection no further rope graph breaks occur. 
+---
+
+### Unit 19.G.1 (Blocker) — Expert packing: static T preallocation and overflow detection
+
+**Responsibility:** Replace the data-dependent packed time dimension T with a statically derived allocation, and introduce compile-compatible overflow detection.
+
+**Context of Correctness:**
+
+Expert packing currently sizes the packed time dimension T by computing the maximum per-head token count at runtime — a data-dependent shape that dynamo cannot trace without breaking the graph. The expected token count per head is fully derivable from config: `training_sequence_length * num_selected_heads / num_mosrah_heads` is the average under perfectly balanced routing, a compile-time constant. Overallocating this by a configurable factor provides margin for routing imbalance while keeping T static.
+
+This unit is also foundational for the static cache rebuild in 19.G.4, which requires static MoSRAH buffer sizes. The same T derived here is the natural size for those buffers — establishing it now avoids a redundant derivation later and ensures the two subsystems agree on the same value.
+
+Overflow — actual per-head count exceeding T — is now detectable via `torch._check` with `capture_scalar_outputs = True` (established in 19.F.1 and 19.F.2), which fires in both compiled and eager modes. The overallocation factor is an architectural parameter governing core data structure sizes and belongs in `ShramConfig`. The load balancing system provides the ongoing guarantee that actual counts stay within T under normal operation; 19.G.3 addresses the correctness of that guarantee.
+
+**Invariants this unit must satisfy:**
+
+- `ShramConfig` declares `mosrah_overallocation_factor: float` with value > 1.0, default 1.1, which survives `to_dict`/`from_dict` roundtrip
+- `ShramConfig` exposes `mosrah_packed_length` as a computed property equal to `ceil(training_sequence_length * num_selected_heads / num_mosrah_heads * mosrah_overallocation_factor)` — the single source of truth for the packed time dimension consumed by all downstream users
+- When actual per-head token count exceeds `mosrah_packed_length`, the system raises with a message identifying `mosrah_overallocation_factor` as the remedy, in both compiled and eager modes
+
+**Tests:**
+
+- Verify `mosrah_overallocation_factor` roundtrips through `to_dict`/`from_dict`
+- Verify values ≤ 1.0 raise `ValueError` at construction
+- Verify `mosrah_packed_length` returns the correct value for any valid config
+- Verify overflow raises with an informative message in eager mode
+- Compile the overflow check in isolation; verify it raises in compiled mode
+
+**Audit:**
+
+- That no data-dependent `.item()` calls remain in the T-sizing path after this unit
+
+**Preliminary implementation strategy:**
+
+- Add `mosrah_overallocation_factor` to `ShramConfig` with validation (> 1.0) and default 1.1
+- Add `mosrah_packed_length` as a computed property on `ShramConfig`; all consumers read T from there
+- Derive T in `pack_experts` from config parameters directly; remove `max_tokens_per_expert = int(tokens_per_expert.max().item())`
+- Overflow detection follows the dedicated static method pattern from 19.F.1: a static method with a precise docstring, branching on `torch.compiler.is_compiling()`
+- `_bincount_rows` remains for count computation in this unit; that is addressed in 19.G.2
+
+---
+
+### Unit 19.G.2 (Blocker) — Expert packing: replace `_bincount_rows` with `scatter_add`
+
+**Responsibility:** Replace the `_bincount_rows` helper with a `scatter_add` into a pre-sized buffer, eliminating the dynamic output shape that causes a graph break in the count computation path.
+
+**Context of Correctness:**
+
+Computing per-expert token counts is a prerequisite for constructing the unpacking mask and verifying occupancy against `mosrah_packed_length`. The current implementation uses `torch.bincount`, whose output shape depends on the maximum value in the input — a data-dependent shape that dynamo cannot trace without a graph break regardless of the `minlength` argument.
+
+The per-expert count tensor has shape `(B, num_mosrah_heads)` — fully known at compile time. `scatter_add` into a pre-sized zero buffer of that shape accumulates ones at the expert index positions to produce identical counts with a static output shape. No alternative achieves this without either dynamic shapes or sequential iteration over batch items.
+
+**Invariants this unit must satisfy:**
+
+- Per-expert token counts are produced into a pre-sized `(B, num_mosrah_heads)` buffer — no dynamic output shapes
+- The counts are numerically identical to those previously produced by `_bincount_rows`
+- `_bincount_rows` is removed
+
+**Tests:**
+
+- Verify counts match `_bincount_rows` output for a range of routing configurations
+- Verify no graph break occurs in the count computation path when compiled
+
+**Audit:**
+
+- That no `bincount` calls remain anywhere in the packing path
+- Verify functional equivalence of the new count computation against the old `_bincount_rows` approach — either by manual inspection of the algebra or by running both on the same inputs and comparing outputs before removal
+
+**Preliminary implementation strategy:**
+
+- Allocate a zeros buffer of shape `(B, num_mosrah_heads)` on the correct device
+- Scatter ones at `flattened_selected_heads` positions via `scatter_add`
+- Remove `_bincount_rows` entirely
+
+---
+
+### Unit 19.G.3 (Blocker) — Load balance frequency aggregation: p-mean and `load_balance_p`
+
+**Responsibility:** Replace arithmetic mean routing frequency aggregation with p-mean, making the load balance correction signal sensitive to per-item allocation spikes that cause overflow.
+
+**Context of Correctness:**
+
+Load balancing exists to keep per-head token counts within `mosrah_packed_length`. Unlike MoE routing, MoSRAH routing is fully data-dependent — a head may be rarely selected but receive a large number of tokens when it is, causing overflow regardless of its average allocation. `expert_bias` is a global parameter with L degrees of freedom applied equally to all inputs; it cannot protect individual batch items directly. What it can do is shift the statistical tendency of each head's allocation. The relevant question is therefore not what the mean allocation is, but what aggregation of per-item frequencies best uses those L degrees of freedom to minimize overflow probability.
+
+Arithmetic mean is blind to per-item spikes: a head that averages near 1/L while occasionally spiking produces no correction signal. P-mean with p > 1 penalizes distributional spread — a head with high per-item variance inflates its p-mean above 1/L even when its arithmetic mean is near 1/L, triggering correction. At p=2 this is the RMS, which directly captures the combination of mean and variance. Higher p increases outlier sensitivity; p=1 reduces to the original arithmetic mean. The correct p is a research question, so it is configurable.
+
+**Invariants this unit must satisfy:**
+
+- `ShramConfig` declares `load_balance_p: float`, default 2.0, which survives `to_dict`/`from_dict` roundtrip
+- `routing_freqs` passed to `LoadBalanceLoss` is shape `(L,)`, computed as the p-mean over batch items of per-item frequencies
+- `MaxVio` reflects worst-case per-item imbalance across the batch, not the p-mean
+
+**Tests:**
+
+- Verify `load_balance_p` roundtrips through `to_dict`/`from_dict`
+- Verify a batch where one item spikes on a head produces a higher `routing_freqs` value for that head than arithmetic mean alone would give
+- Verify `MaxVio` reflects the worst-case item
+
+**Preliminary implementation strategy:**
+
+- Add `load_balance_p` to `ShramConfig` with default 2.0
+- Compute per-item frequencies `(B, L)` — sum active assignments over sequence per item, normalize per item
+- Apply p-mean over batch dimension: `(mean_b(f_{b,l}^p))^(1/p)` → `(L,)` passed to `LoadBalanceLoss` unchanged
+- `LoadBalanceLoss` requires no changes
+- `MaxVio` updated to take max over batch items of per-item imbalance
+
+---
+
+### Unit 19.G.4 (Blocker) — Static cache rebuild for compiled inference
+
+**Responsibility:** Rebuild `MoSRAHCache` and `LocalSlidingWindowLayerCache` to satisfy the HuggingFace static cache contract, eliminating all graph breaks in the cache update path and enabling end-to-end compiled inference.
+
+**Context of Correctness:**
+
+Given the time investment in this system and its intended use across multiple research efforts, the model should support compiled inference.
+
+Compiled inference requires all cache operations to execute within the compiled graph on statically-shaped tensors. `MoSRAHCache` violates this in three independently graph-breaking ways: dynamic buffer allocation on overflow (`_expand()`), data-dependent overflow detection via `.item()`, and data-dependent-length index extraction via `torch.where`. `LocalSlidingWindowLayerCache` is already structurally static — its buffer is fixed at construction and its update path introduces no dynamic shapes. The maximum per-`(batch, head)` slot occupancy over a full inference run is `ceil(inference_sequence_length * K / L * mosrah_overallocation_factor)` — fully derivable from config, making static pre-allocation of `MoSRAHCache` possible and establishing `mosrah_cache_length` as the required config property. HuggingFace's generation machinery routes between static and dynamic cache execution via `is_compileable` and `get_max_cache_shape()`; without truthful declarations on both caches, the compiled path is unavailable regardless of how cache internals are structured.
+
+**Invariants this unit must satisfy:**
+
+- `ShramConfig` exposes `mosrah_cache_length` as a computed property equal to `ceil(inference_sequence_length * num_selected_heads / num_mosrah_heads * mosrah_overallocation_factor)`, which survives `to_dict`/`from_dict` roundtrip
+- `MoSRAHCache` buffer capacity is fixed at `mosrah_cache_length` at construction and never changes during inference
+- `MoSRAHCache.update()` contains no data-dependent shape operations
+- When any `(batch, head)` slot would exceed `mosrah_cache_length`, the system raises in both compiled and eager modes
+- `MoSRAHCache.is_compileable = True` and `get_max_cache_shape()` returns `mosrah_cache_length`
+- `LocalSlidingWindowLayerCache.is_compileable = True` and `get_max_cache_shape()` returns `sliding_window`
+- `ShramLayerCache` and `ShramCache` construct from `ShramConfig` rather than individual parameters
+- `ShramLayerCache.is_compileable = True` and `get_max_cache_shape()` returns `inference_sequence_length`
+- `ShramCache.is_compileable = True` and `max_cache_len` delegates to `layers[0].get_max_cache_shape()`
+- `SlowMoSRAHCache` accepts `mosrah_cache_length` as its static capacity to maintain oracle contract with `MoSRAHCache`
+- A compiled model with `ShramCache` executes cached inference without graph breaks
+
+**Tests:**
+
+- Verify `mosrah_cache_length` returns the correct value for a given config
+- Verify `mosrah_cache_length` survives `to_dict`/`from_dict` roundtrip
+- Compile `MoSRAHCache.update()` and run over several simulated decode steps; verify no graph breaks
+- Compile `LocalSlidingWindowLayerCache.update()` and run over several simulated decode steps; verify no graph breaks
+- Verify `ShramLayerCache.get_max_cache_shape()` returns `inference_sequence_length`
+- Verify `ShramCache.max_cache_len` returns `inference_sequence_length`
+- Verify overflow raises in eager mode
+- Verify overflow raises in compiled mode
+- Verify end-to-end `generate()` with a compiled model completes without error
+
+**Audit:**
+
+- No `_expand()` or equivalent dynamic reallocation remains in `MoSRAHCache`
+- No `.item()` call remains in the `MoSRAHCache.update()` hot path
+- No `torch.where` or equivalent variable-shape index extraction remains in `MoSRAHCache.update()`
+- `get_max_cache_shape()` returns correct values on `MoSRAHCache`, `LocalSlidingWindowLayerCache`, and `ShramLayerCache`
+- `is_compileable = True` on `MoSRAHCache`, `LocalSlidingWindowLayerCache`, `ShramLayerCache`, and `ShramCache`
+
+**Preliminary implementation strategy:**
+
+- Add `mosrah_cache_length` as a computed property to `ShramConfig`: `ceil(inference_sequence_length * num_selected_heads / num_mosrah_heads * mosrah_overallocation_factor)`; all consumers of the MoSRAH cache buffer size read from there
+- `MoSRAHCache`: pre-allocate `keys` and `values` to `mosrah_cache_length` at construction; remove `_expand()`; update constructor to accept `mosrah_cache_length` in place of `initial_buffer_size`
+- Replace the `.item()` overflow guard in `update()` with a dedicated `torch._check` helper following the pattern established in 19.F.1
+- Replace `torch.where(active_mask)` scatter with a fixed-shape transfer matrix operation; confirmed graph-break-free by probe
+- `SlowMoSRAHCache`: update constructor to accept `mosrah_cache_length` directly (not full config — it is a test oracle, not a model component); pre-allocate to that capacity so oracle comparison with `MoSRAHCache` remains valid
+- Refactor `ShramLayerCache` and `ShramCache` constructors to accept `(config: ShramConfig, batch_size, device)` rather than individual parameters; implement `get_max_cache_shape()` on `ShramLayerCache` returning `config.inference_sequence_length`; implement `max_cache_len` on `ShramCache` delegating to `layers[0].get_max_cache_shape()`
+- Set `is_compileable = True` on `MoSRAHCache`, `LocalSlidingWindowLayerCache`, `ShramLayerCache`, and `ShramCache`
+- Add compiled inference coverage to the e2e test suite
 
 ---
 

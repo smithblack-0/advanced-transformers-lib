@@ -180,7 +180,7 @@ def pack_experts(
         values=flattened_selected_heads,
         num_bins=num_experts,
     )
-    max_tokens_per_expert = int(tokens_per_expert.max().item())
+    max_tokens_per_expert = int(tokens_per_expert.max())
 
     # -----------------------------------------------------------------------
     # Construct the active-token mask M.
@@ -198,7 +198,8 @@ def pack_experts(
     ).view(1, 1, max_tokens_per_expert)
     unpacking_mask = time_axis < tokens_per_expert.unsqueeze(-1)
 
-    # -----------------------------------------------------------------------
+
+    # -------------------------------dur----------------------------------------
     # Materialize the padded packed tensors.
     #
     # The packed hidden states x', packed original-token positions J', and packed

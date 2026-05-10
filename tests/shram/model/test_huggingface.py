@@ -315,6 +315,31 @@ class TestDirectCachePolicy:
 
 
 # ---------------------------------------------------------------------------
+# Uncached position constraint
+# ---------------------------------------------------------------------------
+
+
+class TestUncachedPositionConstraint:
+    def test_uncached_forward_rejects_nonzero_starting_position(
+        self, model: ShramForCausalLM
+    ) -> None:
+        """Uncached forward must raise at the wrapper boundary when positions start nonzero."""
+        ids = torch.randint(0, model.config.vocab_size, (1, 4))
+        position_ids = torch.arange(10, 14, dtype=torch.long).unsqueeze(0)
+        with pytest.raises(AssertionError, match="nonzero starting positions"):
+            model(ids, position_ids=position_ids, use_cache=False)
+
+    def test_uncached_forward_accepts_zero_starting_position(
+        self, model: ShramForCausalLM
+    ) -> None:
+        """Uncached forward must succeed when positions start at zero."""
+        ids = torch.randint(0, model.config.vocab_size, (1, 4))
+        position_ids = torch.arange(4, dtype=torch.long).unsqueeze(0)
+        out = model(ids, position_ids=position_ids, use_cache=False)
+        assert out.logits is not None
+
+
+# ---------------------------------------------------------------------------
 # Generation cache hook
 # ---------------------------------------------------------------------------
 

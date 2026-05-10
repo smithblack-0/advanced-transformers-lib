@@ -38,8 +38,8 @@ class BottleneckedEnsembleAttention(nn.Module):
 
     Args:
         config: SHRAM config. Must expose `hidden_size`, `num_mosrah_heads`,
-            `head_dim`, `mosrah_rope_theta`, `training_sequence_length`,
-            `inference_sequence_length`, `alpha`, and `beta`.
+            `head_dim`, `mosrah_rope_theta`, `inference_sequence_length`,
+            `scale`, `alpha`, and `beta`.
     """
 
     def __init__(self, config: ShramConfig) -> None:
@@ -72,7 +72,7 @@ class BottleneckedEnsembleAttention(nn.Module):
             mode="yarn",
             head_dim=self.head_dim,
             theta=config.mosrah_rope_theta,
-            initial_seq_length=config.training_sequence_length,
+            maximum_sequence_length=config.inference_sequence_length,
             dilation=config.scale,
             alpha=config.alpha,
             beta=config.beta,
