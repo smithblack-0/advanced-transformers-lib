@@ -352,6 +352,63 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
                 f"Unsupported forward kwargs for ShramForCausalLM: {unsupported}"
             )
 
+    @staticmethod
+    def _enforce_uncached_starting_position(condition: torch.Tensor) -> None:
+        """Enforce that an uncached forward pass begins at position 0.
+
+        An uncached forward has no prior KV state. Nonzero starting positions
+        produce silently incorrect RoPE encoding and attention outputs with no
+        downstream diagnostic. This method intercepts that misuse at the
+        outermost boundary before any backbone computation runs.
+
+        To resolve a violation: either supply a ShramCache populated with the
+        prefix (for continued decoding), or rebase the sequence so positions
+        start at 0.
+
+        Args:
+            condition: Scalar bool tensor. True = all batch items start at 0
+                (valid); False = at least one batch item starts nonzero
+                (violated).
+        """
+        if torch.compiler.is_compiling():
+            # bool.item() is not captured as a SymBool by dynamo; converting to
+            # int first produces a SymInt, and the Python comparison (!=0) then
+            # yields a SymBool that torch._check folds into the compiled graph.
+            condition_as_int = condition.to(torch.int).item()
+            torch._check(condition_as_int != 0)
+        else:
+            if not condition.item():
+                raise RuntimeError(
+                    "Uncached ShramForCausalLM forward does not support nonzero "
+                    "starting positions. Either provide a ShramCache populated "
+                    "with the prefix for continued decoding, or rebase the "
+                    "uncached sequence to start at 0.",
+                )
+
+    @staticmethod
+    def _enforce_capture_scalar_outputs() -> None:
+        """Enforce that capture_scalar_outputs is enabled when compiling.
+
+        The safety checks in this model (e.g. position-zero constraint, packing
+        overflow detection) rely on torch._check folding into the compiled graph,
+        which requires torch._dynamo.config.capture_scalar_outputs = True. Without
+        it those checks are silently absent in the compiled model while appearing
+        to work in eager mode — a misconfiguration with no diagnostic output.
+
+        This method fires during dynamo tracing so the missing flag is surfaced
+        immediately at compile time rather than discovered from downstream failures.
+        """
+        if torch.compiler.is_compiling():
+            torch._check(
+                torch._dynamo.config.capture_scalar_outputs,
+                lambda: RuntimeError(
+                    "ShramForCausalLM requires torch._dynamo.config.capture_scalar_outputs = True "
+                    "when compiled. Without it, runtime safety checks (position constraints, "
+                    "overflow detection) are silently absent in the compiled model. Set the flag "
+                    "before calling torch.compile()."
+                ),
+            )
+
     def _standardize_full_attention_mask(
         self,
         input_ids: torch.Tensor,
@@ -449,6 +506,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
         # This keeps the main sequence readable while ensuring invalid states
         # fail before they can silently contaminate backbone execution.
         # ------------------------------------------------------------------
+        self._enforce_capture_scalar_outputs()
         self._validate_input_ids(input_ids)
         self._validate_attention_mask(input_ids, attention_mask)
         self._validate_position_ids(input_ids, position_ids)
@@ -486,6 +544,10 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             full_attention_mask=full_attention_mask,
         )
         shram_cache: ShramCache | None = past_key_values if use_cache else None
+
+        if shram_cache is None:
+            positions_start_sane = torch.all(current_position_ids[:, 0] == 0)
+            self._enforce_uncached_starting_position(positions_start_sane)
 
         # ------------------------------------------------------------------
         # Core wrapper responsibilities.

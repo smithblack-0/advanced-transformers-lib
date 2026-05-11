@@ -3,26 +3,30 @@
 This module implements the low-level token-choice -> expert-choice -> token-choice
 conversion boundary specified in the paper. The externally visible behavior is fixed:
 
-- setup_packing() prepares the auxiliary ordering data.
-- pack_experts() converts routed token-choice state into packed expert-choice state.
+- setup_packing() prepares the auxiliary ordering data and returns it as a dict
+  payload forwarded whole to pack_experts and unpack_experts.
+- pack_experts() converts a dict of routed token-choice tensors into packed
+  expert-choice form. Each entry is paired with its intended padding value; all
+  entries undergo the same expert-major gather-scatter so they remain aligned.
 - unpack_experts() restores token-choice ordering afterward.
 
 Stable sort is a correctness requirement. It preserves causal ordering inside each
 expert bucket, which is the foundation on which BEA's later triangular causal mask
 is correct.
 
-pack_experts() returns two distinct masks that serve different roles and must not
-be interchanged:
+pack_experts() returns the packed entries dict together with a separate unpacking_mask.
+Two masks serve different roles and must not be interchanged:
 
 - unpacking_mask: marks every packed slot that contains a routed token copy,
   live or dead. Always has exactly B*N*K True entries. Required by unpack_experts
   so its reshape invariant holds regardless of outer token liveness.
-- active_mask: marks only the packed slots whose source token was semantically
-  live. This is what BEA consumes for attention gating. Dead outer tokens must
-  not influence sparse attention outputs.
+- active_mask (caller-supplied entry): marks only the packed slots whose source
+  token was semantically live. This is what BEA consumes for attention gating.
+  Dead outer tokens must not influence sparse attention outputs.
 """
 
 import torch
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +35,7 @@ import torch
 
 def setup_packing(
     selected_heads: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """Prepare the auxiliary ordering data used by pack/unpack.
 
     Routing produces token-choice state I of shape (B, N, K): for each token, which
@@ -48,10 +52,11 @@ def setup_packing(
         selected_heads: Routed token-choice head selections I of shape (B, N, K).
 
     Returns:
-        Tuple of:
-          - flattened_selected_heads: H of shape (B, N*K)
-          - permutation: stable expert-major permutation Pi of shape (B, N*K)
-          - inverse_permutation: inverse permutation Pi^{-1} of shape (B, N*K)
+        Auxiliary payload dict with keys:
+          - "flattened_selected_heads": H of shape (B, N*K)
+          - "permutation": stable expert-major permutation Pi of shape (B, N*K)
+          - "inverse_permutation": inverse permutation Pi^{-1} of shape (B, N*K)
+        This dict is forwarded whole to pack_experts and unpack_experts.
     """
     batch_size, sequence_length, num_selected_heads = selected_heads.shape
     flattened_selected_heads = selected_heads.reshape(
@@ -62,7 +67,11 @@ def setup_packing(
     permutation = torch.argsort(flattened_selected_heads, dim=-1, stable=True)
     inverse_permutation = torch.argsort(permutation, dim=-1)
 
-    return flattened_selected_heads, permutation, inverse_permutation
+    return {
+        "flattened_selected_heads": flattened_selected_heads,
+        "permutation": permutation,
+        "inverse_permutation": inverse_permutation,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -70,27 +79,22 @@ def setup_packing(
 # ---------------------------------------------------------------------------
 
 def pack_experts(
-    hidden_states: torch.Tensor,
-    position_ids: torch.Tensor,
+    entries: dict[str, tuple[torch.Tensor, Any]],
+    setup: dict[str, torch.Tensor],
     selected_heads: torch.Tensor,
     num_experts: int,
-    flattened_selected_heads: torch.Tensor,
-    permutation: torch.Tensor,
-    outer_active_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack token-choice hidden states into expert-choice padded form.
+    packed_length: int,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Pack token-choice tensors into expert-choice padded form.
 
     The paper's packing path has two jobs:
 
     1. Convert routed token-choice copies into expert-major order.
     2. Materialize that expert-major order into a padded tensor layout BEA can consume.
 
-    The routed hidden-state copies are not stored explicitly in token-choice form.
-    Instead, the same token hidden state is conceptually copied once per selected expert.
-    The packing step reconstructs those copies by expanding local source-token indices,
-    reordering those indices with Pi, then gathering hidden states, positions, and outer
-    liveness in that packed order. All three are carried through the same expert-major
-    rearrangement so they remain aligned in the packed frame.
+    All entries in the provided dict undergo the same expert-major gather-scatter so
+    they remain mutually aligned in the packed frame. Each entry is paired with its
+    intended padding value, which fills slots that contain no routed token copy.
 
     Packed positions are sourced from the authoritative upstream position_ids tensor
     rather than synthesized locally from arange(N). This preserves advanced positions
@@ -98,40 +102,40 @@ def pack_experts(
     unchanged when position_ids is the ordinary sequential token positions.
 
     Args:
-        hidden_states: Token-choice hidden states x of shape (B, N, d).
-        position_ids: Authoritative upstream token positions J of shape (B, N).
+        entries: Mapping from string keys to (tensor, padding_value) pairs. Each
+            tensor has shape (B, N, ...) and is rearranged into expert-choice layout
+            (B, L, T, ...). The returned dict carries the same keys.
+        setup: Auxiliary payload returned by setup_packing().
         selected_heads: Routed head selections I of shape (B, N, K).
         num_experts: Total number of experts L.
-        flattened_selected_heads: H from setup_packing(), shape (B, N*K).
-        permutation: Pi from setup_packing(), shape (B, N*K).
-        outer_active_mask: Current-chunk active mask of shape (B, N), where True
-            means the token is semantically live. Dead tokens do not become
-            semantically active in the packed sparse representation.
+        packed_length: Static packed time dimension T. All per-expert buffers are
+            allocated to exactly this length. Use config.mosrah_packed_length as the
+            source of this value. Raises if any actual per-expert token count exceeds
+            this value.
 
     Returns:
         Tuple of:
-          - packed_hidden_states: x' of shape (B, L, T, d)
-          - packed_positions: J' of shape (B, L, T)
-          - unpacking_mask: of shape (B, L, T). True where a slot contains any
-            routed token copy, live or dead. Always has exactly B*N*K True entries.
-            Pass this to unpack_experts — not active_mask.
-          - active_mask: of shape (B, L, T). True only where a slot contains a
-            copy of a live outer token. Pass this to BEA for attention gating.
+          - packed_entries: Dict with same keys as entries; each value is the
+            packed tensor of shape (B, L, T, ...).
+          - unpacking_mask: Boolean tensor of shape (B, L, T). True where a slot
+            contains any routed token copy, live or dead. Always has exactly
+            B*N*K True entries. Pass this to unpack_experts — not active_mask.
     """
-    batch_size, sequence_length, hidden_dim = hidden_states.shape
-    _, _, num_selected_heads = selected_heads.shape
+    batch_size, sequence_length, num_selected_heads = selected_heads.shape
+
+    flattened_selected_heads = setup["flattened_selected_heads"]
+    permutation = setup["permutation"]
 
     # -----------------------------------------------------------------------
     # Reconstruct routed local source-token indices in token-choice order.
     #
-    # The internal arange(N) is no longer the packed position tensor. It is only
-    # the local source-row index object used to gather from the current chunk
-    # tensor x. Flattening this object gives a (B, N*K) tensor aligned with H's
-    # token-major routed-copy order.
+    # The internal arange(N) is only the local source-row index object used to
+    # gather from the current chunk tensors. Flattening gives a (B, N*K) tensor
+    # aligned with H's token-major routed-copy order.
     # -----------------------------------------------------------------------
     source_token_indices = torch.arange(
         sequence_length,
-        device=hidden_states.device,
+        device=flattened_selected_heads.device,
         dtype=torch.long,
     ).view(1, sequence_length, 1).expand(
         batch_size,
@@ -147,90 +151,71 @@ def pack_experts(
     # Reorder source-token indices into expert-major order.
     #
     # Applying Pi yields the local source-token rows in the packed expert-major
-    # order required by the paper. Those same reordered source indices are then
-    # used to gather hidden states, authoritative upstream positions, and outer
-    # liveness so all three remain aligned under the exact same packing
-    # transformation.
+    # order required by the paper. All entries are then gathered using these same
+    # reordered indices so they remain aligned under the exact same transformation.
     # -----------------------------------------------------------------------
     sorted_source_indices = flattened_source_indices.gather(
         dim=1,
         index=permutation,
     )
-    sorted_hidden_states = hidden_states.gather(
-        dim=1,
-        index=sorted_source_indices.unsqueeze(-1).expand(-1, -1, hidden_dim),
-    )
-    sorted_positions = position_ids.gather(
-        dim=1,
-        index=sorted_source_indices,
-    )
-    sorted_active_mask = outer_active_mask.gather(
-        dim=1,
-        index=sorted_source_indices,
-    )
 
     # -----------------------------------------------------------------------
-    # Count how many routed copies land in each expert bucket.
+    # Count how many routed copies land in each expert bucket and verify
+    # that no bucket exceeds the statically preallocated packed_length T.
     #
-    # S[b, l] is the number of routed token copies assigned to expert l in batch b.
-    # T is the maximum such count across all batches and experts; it determines the
-    # padded expert-length dimension of the packed representation.
+    # S[b, l] is the number of routed token copies assigned to expert l in
+    # batch b. T (packed_length) is a static allocation derived from config,
+    # not a data-dependent maximum. Overflow is detected here and raises in
+    # both eager and compiled modes.
     # -----------------------------------------------------------------------
-    tokens_per_expert = _bincount_rows(
-        values=flattened_selected_heads,
-        num_bins=num_experts,
-    )
-    max_tokens_per_expert = int(tokens_per_expert.max())
+    tokens_per_expert = _count_tokens_per_expert(flattened_selected_heads, num_experts)
+    max_count = tokens_per_expert.max().item()
+    no_overflow = max_count <= packed_length
+    _enforce_no_overflow(no_overflow)
 
     # -----------------------------------------------------------------------
-    # Construct the active-token mask M.
+    # Construct the unpacking mask.
     #
     # Each expert bucket is left-justified: if S[b, l] = s, then slots
-    # t = 0, ..., s-1 are active and all later slots are padding. The resulting
-    # mask therefore both identifies real packed tokens and enforces left-justified
-    # packing. This is the unpacking_mask — it marks slot occupancy regardless of
-    # outer token liveness, and always has exactly B*N*K True entries.
+    # t = 0, ..., s-1 are occupied and all later slots are padding. The mask
+    # marks slot occupancy regardless of outer token liveness, and always has
+    # exactly B*N*K True entries.
     # -----------------------------------------------------------------------
     time_axis = torch.arange(
-        max_tokens_per_expert,
-        device=hidden_states.device,
+        packed_length,
+        device=flattened_selected_heads.device,
         dtype=torch.long,
-    ).view(1, 1, max_tokens_per_expert)
+    ).view(1, 1, packed_length)
     unpacking_mask = time_axis < tokens_per_expert.unsqueeze(-1)
 
-
-    # -------------------------------dur----------------------------------------
-    # Materialize the padded packed tensors.
-    #
-    # The packed hidden states x', packed original-token positions J', and packed
-    # active-token mask are allocated as zero-filled tensors. Active entries are
-    # then written into those buffers in the expert-major order established above.
-    # Padding remains zero / inactive.
     # -----------------------------------------------------------------------
-    packed_hidden_states = hidden_states.new_zeros(
-        batch_size,
-        num_experts,
-        max_tokens_per_expert,
-        hidden_dim,
-    )
-    packed_positions = position_ids.new_zeros(
-        batch_size,
-        num_experts,
-        max_tokens_per_expert,
-    )
-    active_mask = torch.zeros(
-        batch_size,
-        num_experts,
-        max_tokens_per_expert,
-        dtype=torch.bool,
-        device=hidden_states.device,
-    )
+    # Materialize all entries into the packed expert-choice frame.
+    #
+    # Each entry is gathered using the expert-major sorted source indices, then
+    # scattered into a padded buffer. The gather index is expanded to cover each
+    # tensor's trailing dimensions. Padding slots receive the caller-supplied fill
+    # value rather than an implicit zero.
+    # -----------------------------------------------------------------------
+    packed_entries: dict[str, torch.Tensor] = {}
+    for key, (tensor, padding_value) in entries.items():
+        extra_shape = tensor.shape[2:]
 
-    packed_hidden_states[unpacking_mask] = sorted_hidden_states.reshape(-1, hidden_dim)
-    packed_positions[unpacking_mask] = sorted_positions.reshape(-1)
-    active_mask[unpacking_mask] = sorted_active_mask.reshape(-1)
+        # Expand gather index to cover trailing dimensions, if any.
+        idx = sorted_source_indices.view(
+            batch_size,
+            sequence_length * num_selected_heads,
+            *(1,) * len(extra_shape),
+        ).expand(-1, -1, *extra_shape)
+        sorted_tensor = tensor.gather(dim=1, index=idx)
 
-    return packed_hidden_states, packed_positions, unpacking_mask, active_mask
+        packed_tensor = tensor.new_full(
+            (batch_size, num_experts, packed_length, *extra_shape),
+            fill_value=padding_value,
+        )
+        packed_tensor[unpacking_mask] = sorted_tensor.reshape(-1, *extra_shape)
+        packed_entries[key] = packed_tensor
+
+    return packed_entries, unpacking_mask
 
 
 # ---------------------------------------------------------------------------
@@ -239,9 +224,9 @@ def pack_experts(
 
 def unpack_experts(
     expert_outputs: torch.Tensor,
-    selected_heads: torch.Tensor,
+    setup: dict[str, torch.Tensor],
     unpacking_mask: torch.Tensor,
-    inverse_permutation: torch.Tensor,
+    selected_heads: torch.Tensor,
 ) -> torch.Tensor:
     """Restore token-choice ordering from BEA expert-choice output.
 
@@ -258,14 +243,16 @@ def unpack_experts(
 
     Args:
         expert_outputs: Expert-choice BEA output y of shape (B, L, T, d).
-        selected_heads: Routed head selections I of shape (B, N, K).
+        setup: Auxiliary payload returned by setup_packing().
         unpacking_mask: From pack_experts(), shape (B, L, T). Identifies all
             occupied packed slots regardless of outer token liveness.
-        inverse_permutation: Pi^{-1} from setup_packing(), shape (B, N*K).
+        selected_heads: Routed head selections I of shape (B, N, K).
 
     Returns:
         Restored token-choice tensor y_tilde of shape (B, N, K, d).
     """
+    inverse_permutation = setup["inverse_permutation"]
+
     batch_size, sequence_length, num_selected_heads = selected_heads.shape
     hidden_dim = expert_outputs.shape[-1]
 
@@ -292,45 +279,63 @@ def unpack_experts(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _bincount_rows(
-    values: torch.Tensor,
-    num_bins: int,
-) -> torch.Tensor:
-    """Count per-row integer occurrences for a 2D tensor.
+def _enforce_no_overflow(condition: bool) -> None:
+    """Enforce that no expert bucket exceeds the preallocated packed length.
 
-    torch.bincount operates on a flat 1D vector, but the packing algorithm needs
-    one bincount per batch row. The trick used here is to shift each row into its
-    own disjoint bin range before flattening:
+    This check fires when the number of tokens assigned to any expert in any
+    batch item exceeds mosrah_packed_length. When that limit is exceeded, the
+    packed buffer is too small to hold all assignments and data would be dropped.
+    Increase mosrah_overallocation_factor in ShramConfig to resolve.
 
-      row 0 uses bins [0, ..., num_bins - 1]
-      row 1 uses bins [num_bins, ..., 2*num_bins - 1]
-      row 2 uses bins [2*num_bins, ..., 3*num_bins - 1]
-      ...
-
-    After that shift, one global torch.bincount produces all row-local counts at
-    once. Reshaping the result back to (B, num_bins) recovers the per-row bincount.
-
-    This is a vectorized implementation detail only; externally visible behavior
-    remains exactly the paper's S tensor of per-batch per-expert token counts.
+    The caller must derive condition via .item() on the max count tensor so that
+    dynamo captures a SymInt and the comparison produces a SymBool. Passing a
+    tensor comparison result directly bypasses the SymInt mechanism and prevents
+    the check from firing at compiled runtime.
 
     Args:
-        values: Integer tensor of shape (B, M) with entries in [0, num_bins).
-        num_bins: Number of bins.
+        condition: True means no overflow has occurred; False means at least one
+            expert bucket exceeds packed_length. In compiled mode this is a SymBool
+            produced by comparing a SymInt against the static packed_length.
+    """
+    if torch.compiler.is_compiling():
+        torch._check(condition)
+    else:
+        if not condition:
+            raise RuntimeError(
+                "Expert packing overflow: at least one expert bucket contains more "
+                "tokens than mosrah_packed_length allows. Increase "
+                "mosrah_overallocation_factor in ShramConfig to resolve."
+            )
+
+
+def _count_tokens_per_expert(
+    flattened_selected_heads: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Count how many routed token copies are assigned to each expert per batch item.
+
+    Uses scatter_add into a pre-sized (B, num_experts) zero buffer, producing a
+    statically-shaped output that compiles without graph breaks. Each position in
+    flattened_selected_heads contributes one count to the corresponding expert slot.
+
+    Args:
+        flattened_selected_heads: Expert assignments of shape (B, N*K) with values
+            in [0, num_experts).
+        num_experts: Total number of experts L.
 
     Returns:
-        Counts tensor of shape (B, num_bins).
+        Counts tensor of shape (B, num_experts).
     """
-    batch_size = values.shape[0]
-
-    row_offsets = torch.arange(
+    batch_size = flattened_selected_heads.shape[0]
+    counts = torch.zeros(
         batch_size,
-        device=values.device,
-        dtype=values.dtype,
-    ).unsqueeze(1) * num_bins
-    shifted_values = values + row_offsets
-
-    counts = torch.bincount(
-        shifted_values.reshape(-1),
-        minlength=batch_size * num_bins,
+        num_experts,
+        device=flattened_selected_heads.device,
+        dtype=flattened_selected_heads.dtype,
     )
-    return counts.reshape(batch_size, num_bins)
+    counts.scatter_add_(
+        dim=1,
+        index=flattened_selected_heads,
+        src=torch.ones_like(flattened_selected_heads),
+    )
+    return counts

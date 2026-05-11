@@ -74,11 +74,12 @@ is being achieved, one verified unit at a time.
 - [X] Unit 19.C (Blocker) — Expose total MoSRAH layer parameter count
 - [X] Unit 19.E (Blocker) — E2E torch-dynamo compile coverage gap
 - [X] Unit 19.F (Blocker) — SlidingWindowAttention torch.compile failure
-- [ ] Unit 19.F.1 — Position-zero constraint: compile-compatible enforcement (revised)
-- [ ] Unit 19.F.2 — Compile-time error for missing capture_scalar_outputs
+- [X] Unit 19.F.1 — Position-zero constraint: compile-compatible enforcement (revised)
+- [X] Unit 19.F.2 — Compile-time error for missing capture_scalar_outputs
 - [X] Unit 19.G (Blocker) — RotaryEmbedding: preallocate to maximum_sequence_length, eliminate .item()
-- [ ] Unit 19.G.1 (Blocker) — Expert packing: static T preallocation and overflow detection
-- [ ] Unit 19.G.2 (Blocker) — Expert packing: replace _bincount_rows with scatter_add
+- [X] Unit 19.G.0 (Blocker) — Expert packing: interface consolidation
+- [X] Unit 19.G.1 (Blocker) — Expert packing: static T preallocation and overflow detection
+- [X] Unit 19.G.2 (Blocker) — Expert packing: replace _bincount_rows with scatter_add
 - [ ] Unit 19.G.3 (Blocker) — Load balance frequency aggregation: p-mean and load_balance_p
 - [ ] Unit 19.G.4 (Blocker) — Static cache rebuild for compiled inference
 - [ ] Unit 19.H — Final audit
@@ -2278,6 +2279,38 @@ The current lazy extension design calls `position_ids.max().item()` in every for
 **Audit**
 
 - Verify by inspection no further rope graph breaks occur. 
+---
+
+### Unit 19.G.0 (Blocker) — Expert packing: interface consolidation
+
+**Responsibility:** Refactor the expert packing interface to group the setup payload and entry tensors as structured inputs, and eliminate repeated identical gather-scatter operations.
+
+**Context of Correctness:**
+
+Code quality is an unconditional requirement in this project, as stated in job.md. Sane API signatures are part of that requirement. `pack_experts` currently takes seven parameters; the setup payload — three values always produced and forwarded together — is disaggregated into individual arguments, and the three entry tensors — which all undergo the same gather-scatter operation — are treated as separate concerns. This was marginally acceptable at its current size. Unit 19.G.1 must add at least one further parameter. That addition crosses the line from questionable into a clear violation of the code quality standard.
+
+A static analysis of the call sites confirms that the setup payload always travels as a unit and is never partially forwarded. The entry tensors always undergo structurally identical operations. Both groupings are natural; the current interface artificially disaggregates them. Given the code quality axiom and the necessity of 19.G.1's additions, this refactor is required before 19.G.1 can proceed without producing code that fails job.md's unconditional standard.
+
+**Invariants this unit must satisfy:**
+
+- `setup_packing` returns a single auxiliary payload; callers forward it whole to `pack_experts` and `unpack_experts`
+- `pack_experts` accepts entry tensors as a mapping from string keys to tensors, the setup payload, `selected_heads`, and `num_experts`; it returns a mapping from the same string keys to their packed counterparts, plus `unpacking_mask` as a separate output
+- `unpack_experts` accepts `expert_outputs`, the setup payload, `unpacking_mask`, and `selected_heads`; its return type and shape contract are unchanged
+- For all valid inputs, the packed tensor values produced by `pack_experts` are numerically identical to those produced by the previous implementation
+- For all valid inputs, `unpack_experts` produces numerically identical output to the previous implementation
+- No new behavior is introduced; this unit changes structure only
+
+**Tests:**
+
+- All existing tests in `test_expert_packing.py` pass with call sites updated to the new interface; no assertion values change — behavioral equivalence is the sole standard of correctness for this unit
+
+**Preliminary implementation strategy:**
+
+- `setup_packing` returns a dict; `pack_experts` and `unpack_experts` extract what they need from it by key
+- Inside `pack_experts`, a single loop over the entries dict allocates output buffers and performs gather-scatter, using each tensor's trailing shape to determine index expansion — no helper function needed
+- The data-dependent `max_tokens_per_expert` computation remains; 19.G.1 replaces it with `packed_length`
+- Call site in `mosrah.py` updated to use the new interface
+
 ---
 
 ### Unit 19.G.1 (Blocker) — Expert packing: static T preallocation and overflow detection
