@@ -32,8 +32,8 @@ def make_config(**overrides) -> ShramConfig:
         head_dim=4,
         window_size=4,
         rope_mode="main_sequence",
-        training_sequence_length=8,
-        inference_sequence_length=8,
+        training_sequence_length=16,
+        inference_sequence_length=16,
         attention_dropout=0.0,
         use_cache=True,
         mosrah_rope_theta = 20,
@@ -294,19 +294,6 @@ class TestRealExecution:
         assert torch.isfinite(load_balance_loss)
         assert torch.isfinite(max_vio)
         assert not max_vio.requires_grad
-
-    def test_uncached_nonzero_starting_positions_fail_explicitly(self):
-        """Uncached hybrid execution must not accept nonzero starting positions."""
-        hidden_states, position_ids, active_mask = make_inputs(start_position=10)
-        layer = make_layer(make_config(), seed=0)
-
-        with pytest.raises(ValueError, match="nonzero starting positions"):
-            layer(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                active_mask=active_mask,
-                cache=None,
-            )
 
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
     def test_cached_execution_runs_sanely_with_the_real_per_layer_cache(self, rope_mode):

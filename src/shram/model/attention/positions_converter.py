@@ -32,12 +32,17 @@ class SparseMoSRAHPositions(nn.Module):
     def forward(
         self,
         packed_positions: torch.Tensor,
+        active_mask: torch.Tensor,
         cache: MoSRAHCache | None,
     ) -> torch.Tensor:
         """Compute the packed position tensor P consumed by BEA.
 
         Args:
             packed_positions: Packed original-token positions J' of shape (B, L, T).
+            active_mask: Boolean active-token mask of shape (B, L, T). Inactive
+                positions are zeroed in the returned tensor regardless of mode —
+                their position value is semantically irrelevant and 0 is guaranteed
+                to be within any valid RoPE table.
             cache: Optional layer-local MoSRAH cache. When present in semantic-sequence
                 mode, the current per-head occupancies offset the local packed sequence.
 
@@ -45,14 +50,15 @@ class SparseMoSRAHPositions(nn.Module):
             Packed position tensor P of shape (B, L, T).
         """
         if self.rope_mode == "main_sequence":
-            return self._main_sequence_positions(packed_positions)
+            positions = self._main_sequence_positions(packed_positions)
+        elif self.rope_mode == "semantic_sequence":
+            positions = self._semantic_sequence_positions(packed_positions, cache)
+        else:
+            raise NotImplementedError(
+                f"Unsupported MoSRAH rope_mode '{self.rope_mode}'."
+            )
 
-        if self.rope_mode == "semantic_sequence":
-            return self._semantic_sequence_positions(packed_positions, cache)
-
-        raise NotImplementedError(
-            f"Unsupported MoSRAH rope_mode '{self.rope_mode}'."
-        )
+        return torch.where(active_mask, positions, torch.zeros_like(positions))
 
     def _main_sequence_positions(
         self,

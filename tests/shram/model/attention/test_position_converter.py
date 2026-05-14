@@ -3,8 +3,8 @@
 Invariants verified: main-sequence passthrough behavior, semantic-sequence local
 position construction, semantic cached offset behavior, contiguous per-expert
 positions for bulk T > 1 updates, BEA-compatible output shape, explicit cache
-occupancy usage in cached semantic mode, and config-selected behavior across the
-two supported RoPE modes.
+occupancy usage in cached semantic mode, config-selected behavior across the
+two supported RoPE modes, and inactive-position zeroing in both modes.
 """
 
 import torch
@@ -33,6 +33,26 @@ def make_packed_positions() -> torch.Tensor:
             ],
         ],
         dtype=torch.long,
+    )
+
+
+def make_all_active_mask() -> torch.Tensor:
+    """Construct an all-active mask matching the shape of make_packed_positions."""
+    return torch.ones(2, 3, 4, dtype=torch.bool)
+
+
+def make_partial_active_mask() -> torch.Tensor:
+    """Construct a partially active mask aligned with the padding in make_packed_positions."""
+    return torch.tensor(
+        [
+            [[True, True, True, False],
+             [True, True, True, False],
+             [True, True, False, False]],
+            [[True, True, True, True],
+             [True, True, True, False],
+             [True, True, False, False]],
+        ],
+        dtype=torch.bool,
     )
 
 
@@ -72,6 +92,7 @@ class TestMainSequenceBehavior:
 
         positions = layer(
             packed_positions=packed_positions,
+            active_mask=make_all_active_mask(),
             cache=None,
         )
 
@@ -84,6 +105,7 @@ class TestMainSequenceBehavior:
 
         positions = layer(
             packed_positions=packed_positions,
+            active_mask=make_all_active_mask(),
             cache=None,
         )
 
@@ -102,6 +124,7 @@ class TestSemanticSequenceBehavior:
 
         positions = layer(
             packed_positions=packed_positions,
+            active_mask=make_all_active_mask(),
             cache=None,
         )
 
@@ -129,6 +152,7 @@ class TestSemanticSequenceBehavior:
 
         positions = layer(
             packed_positions=packed_positions,
+            active_mask=make_all_active_mask(),
             cache=cache,
         )
 
@@ -157,6 +181,7 @@ class TestSemanticSequenceBehavior:
 
         positions = layer(
             packed_positions=packed_positions,
+            active_mask=make_all_active_mask(),
             cache=cache,
         )
 
@@ -180,6 +205,7 @@ class TestSemanticSequenceBehavior:
 
         _ = layer(
             packed_positions=packed_positions,
+            active_mask=make_all_active_mask(),
             cache=cache,
         )
 
@@ -192,6 +218,7 @@ class TestSemanticSequenceBehavior:
 
         positions = layer(
             packed_positions=packed_positions,
+            active_mask=make_all_active_mask(),
             cache=None,
         )
 
@@ -210,6 +237,7 @@ class TestConfiguredBehavior:
 
         positions = layer(
             packed_positions=packed_positions,
+            active_mask=make_all_active_mask(),
             cache=None,
         )
 
@@ -222,6 +250,7 @@ class TestConfiguredBehavior:
 
         positions = layer(
             packed_positions=packed_positions,
+            active_mask=make_all_active_mask(),
             cache=None,
         )
 
@@ -232,3 +261,83 @@ class TestConfiguredBehavior:
         ).view(1, 1, -1).expand_as(packed_positions)
 
         torch.testing.assert_close(positions, expected)
+
+
+# ---------------------------------------------------------------------------
+# Inactive-position zeroing
+# ---------------------------------------------------------------------------
+
+class TestInactivePositionZeroing:
+    def test_main_sequence_inactive_positions_are_zeroed(self):
+        """Main-sequence: inactive slots must carry position value 0."""
+        packed_positions = make_packed_positions()
+        active_mask = make_partial_active_mask()
+        layer = SparseMoSRAHPositions(make_config("main_sequence"))
+
+        positions = layer(
+            packed_positions=packed_positions,
+            active_mask=active_mask,
+            cache=None,
+        )
+
+        assert (positions[~active_mask] == 0).all()
+
+    def test_semantic_uncached_inactive_positions_are_zeroed(self):
+        """Semantic-sequence without cache: inactive slots must carry position value 0."""
+        packed_positions = make_packed_positions()
+        active_mask = make_partial_active_mask()
+        layer = SparseMoSRAHPositions(make_config("semantic_sequence"))
+
+        positions = layer(
+            packed_positions=packed_positions,
+            active_mask=active_mask,
+            cache=None,
+        )
+
+        assert (positions[~active_mask] == 0).all()
+
+    def test_semantic_cached_inactive_positions_are_zeroed(self):
+        """Semantic-sequence with cache: inactive slots must carry position value 0."""
+        packed_positions = make_packed_positions()
+        active_mask = make_partial_active_mask()
+        layer = SparseMoSRAHPositions(make_config("semantic_sequence"))
+        cache = SpyMoSRAHCache(
+            head_lengths=torch.tensor(
+                [
+                    [5, 2, 0],
+                    [1, 3, 4],
+                ],
+                dtype=torch.long,
+            )
+        )
+
+        positions = layer(
+            packed_positions=packed_positions,
+            active_mask=active_mask,
+            cache=cache,
+        )
+
+        assert (positions[~active_mask] == 0).all()
+
+    def test_active_positions_are_not_affected_by_mask(self):
+        """Masking must not alter position values at active slots."""
+        packed_positions = make_packed_positions()
+        all_active = make_all_active_mask()
+        partial_active = make_partial_active_mask()
+        layer = SparseMoSRAHPositions(make_config("semantic_sequence"))
+
+        all_active_positions = layer(
+            packed_positions=packed_positions,
+            active_mask=all_active,
+            cache=None,
+        )
+        partial_active_positions = layer(
+            packed_positions=packed_positions,
+            active_mask=partial_active,
+            cache=None,
+        )
+
+        torch.testing.assert_close(
+            partial_active_positions[partial_active],
+            all_active_positions[partial_active],
+        )

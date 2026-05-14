@@ -113,6 +113,7 @@ class MoSRAHLayer(nn.Module):
         # -------------------------------------------------------------------
         bea_positions = self.positions(
             packed_positions=packed_positions,
+            active_mask=active_mask,
             cache=cache,
         )
         packed_outputs = self.bea(

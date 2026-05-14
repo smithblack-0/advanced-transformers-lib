@@ -68,11 +68,22 @@ class BottleneckedEnsembleAttention(nn.Module):
         # BEA uses the YaRN-capable RoPE path. The caller supplies the position tensor;
         # this unit only consumes it. In training modes, dilation will be 1.0 and so
         # no yarn dilation occurs.
+        #
+        # The required table size depends on position semantics:
+        #   main_sequence    — positions are original token positions, bounded by
+        #                      inference_sequence_length.
+        #   semantic_sequence — positions are local per-expert slot indices, bounded
+        #                       by mosrah_packed_length.
+        maximum_rope_length = (
+            config.mosrah_packed_length
+            if config.rope_mode == "semantic_sequence"
+            else config.inference_sequence_length
+        )
         self.rope = RotaryEmbedding(
             mode="yarn",
             head_dim=self.head_dim,
             theta=config.mosrah_rope_theta,
-            maximum_sequence_length=config.inference_sequence_length,
+            maximum_sequence_length=maximum_rope_length,
             dilation=config.scale,
             alpha=config.alpha,
             beta=config.beta,

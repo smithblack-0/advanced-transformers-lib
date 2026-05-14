@@ -32,8 +32,8 @@ def make_config(rope_mode: str = "main_sequence") -> ShramConfig:
         head_dim=4,
         window_size=4,
         rope_mode=rope_mode,
-        training_sequence_length=8,
-        inference_sequence_length=8,
+        training_sequence_length=16,
+        inference_sequence_length=16,
         attention_dropout=0.0,
     )
 
