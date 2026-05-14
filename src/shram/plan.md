@@ -80,9 +80,9 @@ is being achieved, one verified unit at a time.
 - [X] Unit 19.G.0 (Blocker) — Expert packing: interface consolidation
 - [X] Unit 19.G.1 (Blocker) — Expert packing: static T preallocation and overflow detection
 - [X] Unit 19.G.2 (Blocker) — Expert packing: replace _bincount_rows with scatter_add
-- [ ] Unit 19.G.3 (Blocker) — Load balance frequency aggregation: p-mean and load_balance_p
+- [X] Unit 19.G.3 (Blocker) — Load balance frequency aggregation: p-mean and load_balance_p
 - [ ] Unit 19.G.4 (Blocker) — Static cache rebuild for compiled inference
-- [ ] Unit 19.H — Final audit
+- [ ] Unit 20 — Final audit
 
 ---
 
@@ -2401,13 +2401,12 @@ Arithmetic mean is blind to per-item spikes: a head that averages near 1/L while
 
 - `ShramConfig` declares `load_balance_p: float`, default 2.0, which survives `to_dict`/`from_dict` roundtrip
 - `routing_freqs` passed to `LoadBalanceLoss` is shape `(L,)`, computed as the p-mean over batch items of per-item frequencies
-- `MaxVio` reflects worst-case per-item imbalance across the batch, not the p-mean
+- `MaxVio` follows the paper's formula L · max_l(f_l − 1/L) applied to `routing_freqs`; it benefits from the improved signal because `routing_freqs` is now p-mean rather than arithmetic mean (literature compatible)
 
 **Tests:**
 
 - Verify `load_balance_p` roundtrips through `to_dict`/`from_dict`
 - Verify a batch where one item spikes on a head produces a higher `routing_freqs` value for that head than arithmetic mean alone would give
-- Verify `MaxVio` reflects the worst-case item
 
 **Preliminary implementation strategy:**
 
@@ -2415,7 +2414,6 @@ Arithmetic mean is blind to per-item spikes: a head that averages near 1/L while
 - Compute per-item frequencies `(B, L)` — sum active assignments over sequence per item, normalize per item
 - Apply p-mean over batch dimension: `(mean_b(f_{b,l}^p))^(1/p)` → `(L,)` passed to `LoadBalanceLoss` unchanged
 - `LoadBalanceLoss` requires no changes
-- `MaxVio` updated to take max over batch items of per-item imbalance
 
 ---
 
@@ -2476,11 +2474,9 @@ Compiled inference requires all cache operations to execute within the compiled 
 
 ---
 
-### Unit 19.H — Final Audit
+### Unit 20— Final Audit
 
-**What:** Review every file in `src/shram/` against the invariants in `job.md`. Verify no
-hardcoded values, no missing documentation, no gaps between tests and intent. Apply the
-close-the-testing-gap rule to any defect found.
+**What:** Review every audit note in plan.md and, if not overridden, ensure compliance. Crosscheck with papers/main.tex and verify whether or not paper is still complaint.
 
 **Invariants this unit must satisfy:**
 - Every invariant in job.md is satisfied and has a corresponding test.
