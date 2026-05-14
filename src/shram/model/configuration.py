@@ -83,7 +83,11 @@ class ShramConfig(PretrainedConfig):
             buffer. ``mosrah_packed_length`` = ceil(training_sequence_length *
             num_selected_heads / num_mosrah_heads * mosrah_overallocation_factor).
             Must be > 1.0 to guarantee a buffer larger than the balanced-routing
-            baseline. Default 1.1.
+            baseline. Default 2.0.
+        load_balance_p: Exponent p for the p-mean aggregation of per-item routing
+            frequencies into the load balance signal. Higher p weights aggregation
+            toward the worst-case batch item, making the correction signal more
+            sensitive to per-item allocation spikes. Must be positive. Default 2.0.
     """
 
     model_type = "shram"
@@ -116,7 +120,8 @@ class ShramConfig(PretrainedConfig):
         use_cache: bool = True,
         output_hidden_states: bool = False,
         tie_word_embeddings: bool = False,
-        mosrah_overallocation_factor: float = 1.1,
+        mosrah_overallocation_factor: float = 2.0,
+        load_balance_p: float = 2.0,
         **kwargs,
     ):
         if head_dim % 2 != 0:
@@ -152,6 +157,11 @@ class ShramConfig(PretrainedConfig):
                 f"Got {mosrah_overallocation_factor}."
             )
 
+        if load_balance_p <= 0.0:
+            raise ValueError(
+                f"load_balance_p must be positive, got {load_balance_p}."
+            )
+
         self.vocab_size = vocab_size
         self.hidden_size = embedding_width
         self.intermediate_size = mlp_width
@@ -170,6 +180,7 @@ class ShramConfig(PretrainedConfig):
         self.alpha = alpha
         self.beta = beta
         self.mosrah_overallocation_factor = mosrah_overallocation_factor
+        self.load_balance_p = load_balance_p
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
 

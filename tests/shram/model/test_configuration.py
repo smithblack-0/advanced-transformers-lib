@@ -323,9 +323,9 @@ class TestSerialisation:
 
 class TestMosrahPackedLength:
     def test_overallocation_factor_default(self):
-        """mosrah_overallocation_factor must default to 1.1."""
+        """mosrah_overallocation_factor must default to 2.0."""
         config = ShramConfig()
-        assert config.mosrah_overallocation_factor == 1.1
+        assert config.mosrah_overallocation_factor == 2.0
 
     def test_overallocation_factor_stored(self):
         config = small_config(mosrah_overallocation_factor=1.2)
