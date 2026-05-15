@@ -1,16 +1,17 @@
-"""Tests for ShramLayerCache — Unit 6.B / Unit 14.D.
+"""Tests for ShramLayerCache — Unit 6.B / Unit 14.D / Unit 19.G.4.
 
 Invariants verified in this file:
 
 HF CacheLayerMixin protocol and construction:
 - ShramLayerCache subclasses CacheLayerMixin
+- is_compileable is True
 - is_initialized is True at construction
 - sliding_window_cache is a LocalSlidingWindowLayerCache with the correct window
-- mosrah_cache is a MoSRAHCache with the correct buffer shape
+- mosrah_cache is a MoSRAHCache with the correct buffer shape (from config.mosrah_cache_length)
 - lazy_initialization() is a no-op; is_initialized remains True
 - update() raises NotImplementedError — no composite update semantics
-- get_seq_length() raises NotImplementedError — no scalar sequence length available
-- get_max_cache_shape() raises NotImplementedError — composite has no single max shape
+- get_seq_length() delegates to sliding_window_cache — cumulative local token count
+- get_max_cache_shape() returns config.inference_sequence_length
 - get_mask_sizes() raises NotImplementedError — two paths, different mask semantics
 
 Composite behaviors:
@@ -25,6 +26,7 @@ from transformers.cache_utils import CacheLayerMixin
 from src.shram.model.cache.shram_layer_cache import ShramLayerCache
 from src.shram.model.cache.mosrah_cache import MoSRAHCache
 from src.shram.model.cache.sliding_window_cache import LocalSlidingWindowLayerCache
+from src.shram.model.configuration import ShramConfig
 
 
 # ---------------------------------------------------------------------------
@@ -32,32 +34,39 @@ from src.shram.model.cache.sliding_window_cache import LocalSlidingWindowLayerCa
 # ---------------------------------------------------------------------------
 
 SLIDING_WINDOW = 16
-NUM_MOSRAH_HEADS = 4
-MOSRAH_HEAD_DIM = 8
-BATCH = 2
-INITIAL_BUFFER_SIZE = 8
-
 LOCAL_HEADS = 3
-LOCAL_HEAD_DIM = 8
+NUM_MOSRAH_HEADS = 4
+NUM_SELECTED_HEADS = 2
+HEAD_DIM = 8
+TRAINING_SEQ_LEN = 64
+INFERENCE_SEQ_LEN = 64
+BATCH = 2
+
+
+def make_config() -> ShramConfig:
+    return ShramConfig(
+        window_size=SLIDING_WINDOW,
+        num_sliding_window_heads=LOCAL_HEADS,
+        num_mosrah_heads=NUM_MOSRAH_HEADS,
+        num_selected_heads=NUM_SELECTED_HEADS,
+        head_dim=HEAD_DIM,
+        training_sequence_length=TRAINING_SEQ_LEN,
+        inference_sequence_length=INFERENCE_SEQ_LEN,
+    )
 
 
 def make_cache(batch: int = BATCH) -> ShramLayerCache:
     return ShramLayerCache(
-        sliding_window=SLIDING_WINDOW,
-        num_local_heads=LOCAL_HEADS,
-        local_head_dim=LOCAL_HEAD_DIM,
-        num_mosrah_heads=NUM_MOSRAH_HEADS,
-        mosrah_head_dim=MOSRAH_HEAD_DIM,
+        config=make_config(),
         batch_size=batch,
         device=torch.device("cpu"),
-        initial_buffer_size=INITIAL_BUFFER_SIZE,
     )
 
 
 def sw_update(cache: ShramLayerCache, batch: int, num_tokens: int) -> None:
     """Drive sliding_window_cache.update() with num_tokens of all-active random data."""
-    k = torch.randn(batch, LOCAL_HEADS, num_tokens, LOCAL_HEAD_DIM)
-    v = torch.randn(batch, LOCAL_HEADS, num_tokens, LOCAL_HEAD_DIM)
+    k = torch.randn(batch, LOCAL_HEADS, num_tokens, HEAD_DIM)
+    v = torch.randn(batch, LOCAL_HEADS, num_tokens, HEAD_DIM)
     mask = torch.ones(batch, num_tokens, dtype=torch.bool)
     positions = torch.arange(num_tokens, dtype=torch.long).unsqueeze(0).expand(batch, -1)
     cache.sliding_window_cache.update(k, v, mask, positions)
@@ -65,7 +74,7 @@ def sw_update(cache: ShramLayerCache, batch: int, num_tokens: int) -> None:
 
 def mosrah_update(cache: ShramLayerCache, batch: int, num_tokens: int) -> None:
     """Drive mosrah_cache.update() with num_tokens active per head."""
-    B, L, T, u = batch, NUM_MOSRAH_HEADS, num_tokens, MOSRAH_HEAD_DIM
+    B, L, T, u = batch, NUM_MOSRAH_HEADS, num_tokens, HEAD_DIM
     k = torch.randn(B, L, T, u)
     v = torch.randn(B, L, T, u)
     mask = torch.ones(B, L, T, dtype=torch.bool)
@@ -79,6 +88,11 @@ def mosrah_update(cache: ShramLayerCache, batch: int, num_tokens: int) -> None:
 def test_shram_layer_cache_is_cachelayermixin_subclass():
     """ShramLayerCache satisfies the HuggingFace per-layer cache role."""
     assert issubclass(ShramLayerCache, CacheLayerMixin)
+
+
+def test_is_compileable_true():
+    """is_compileable is True — ShramLayerCache participates in the static cache contract."""
+    assert ShramLayerCache.is_compileable is True
 
 
 def test_is_initialized_true_at_construction():
@@ -101,11 +115,10 @@ def test_update_raises():
         cache.update(torch.zeros(1), torch.zeros(1))
 
 
-def test_get_max_cache_shape_raises():
-    """get_max_cache_shape() raises NotImplementedError — composite has no single max shape."""
+def test_get_max_cache_shape_returns_inference_sequence_length():
+    """get_max_cache_shape() returns config.inference_sequence_length."""
     cache = make_cache()
-    with pytest.raises(NotImplementedError):
-        cache.get_max_cache_shape()
+    assert cache.get_max_cache_shape() == INFERENCE_SEQ_LEN
 
 
 def test_get_mask_sizes_raises():
@@ -132,7 +145,7 @@ def test_owns_mosrah_cache():
 
 
 def test_sliding_window_cache_has_correct_window():
-    """sliding_window_cache.sliding_window matches the constructor argument."""
+    """sliding_window_cache.sliding_window matches config.window_size."""
     cache = make_cache()
     assert cache.sliding_window_cache.sliding_window == SLIDING_WINDOW
 
@@ -145,10 +158,12 @@ def test_get_seq_length_delegates_to_sliding_window_cache():
 
 
 def test_mosrah_cache_has_correct_buffer_shape():
-    """mosrah_cache buffers have shape (B, L, initial_buffer_size, u) at construction."""
+    """mosrah_cache buffers have shape (B, L, mosrah_cache_length, u) at construction."""
+    config = make_config()
     cache = make_cache()
-    assert cache.mosrah_cache.keys.shape == (BATCH, NUM_MOSRAH_HEADS, INITIAL_BUFFER_SIZE, MOSRAH_HEAD_DIM)
-    assert cache.mosrah_cache.values.shape == (BATCH, NUM_MOSRAH_HEADS, INITIAL_BUFFER_SIZE, MOSRAH_HEAD_DIM)
+    expected_len = config.mosrah_cache_length
+    assert cache.mosrah_cache.keys.shape == (BATCH, NUM_MOSRAH_HEADS, expected_len, HEAD_DIM)
+    assert cache.mosrah_cache.values.shape == (BATCH, NUM_MOSRAH_HEADS, expected_len, HEAD_DIM)
 
 
 # ---------------------------------------------------------------------------
