@@ -222,3 +222,28 @@ class ShramConfig(PretrainedConfig):
             * self.mosrah_overallocation_factor
         )
 
+    @property
+    def mosrah_cache_length(self) -> int:
+        """Static per-(batch, head) slot capacity for the MoSRAH inference cache.
+
+        The expected tokens per expert over the full inference context under perfectly
+        balanced routing is ``inference_sequence_length * num_selected_heads /
+        num_mosrah_heads``. Multiplying by ``mosrah_overallocation_factor`` provides
+        a buffer above that baseline. The ceiling ensures the result is always an
+        integer >= 1.
+
+        Distinct from ``mosrah_packed_length``, which sizes the training packing buffer
+        using ``training_sequence_length``. This property uses
+        ``inference_sequence_length`` because the cache must hold the full accumulated
+        token history across the entire inference run.
+
+        All consumers of the MoSRAH cache buffer size must read this property rather
+        than deriving the capacity independently.
+        """
+        return math.ceil(
+            self.inference_sequence_length
+            * self.num_selected_heads
+            / self.num_mosrah_heads
+            * self.mosrah_overallocation_factor
+        )
+
