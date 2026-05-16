@@ -212,12 +212,10 @@ class ShramLayerCache(CacheLayerMixin):
         self,
         cache_position: torch.Tensor,
     ) -> tuple[int, int]:
-        """Not supported — ShramLayerCache does not participate in HF mask construction.
+        """Return the KV dimensions for HuggingFace causal mask construction.
 
-        The two sub-caches have different mask semantics and their respective attention
-        paths handle masking directly.
+        Returns (inference_sequence_length, 0): the full static cache capacity as
+        kv_length and zero offset. HuggingFace reads these values to size the causal
+        attention mask when is_compileable is True.
         """
-        raise NotImplementedError(
-            "ShramLayerCache does not support get_mask_sizes(). "
-            "Query sliding_window_cache or mosrah_cache directly."
-        )
+        return self._inference_sequence_length, 0

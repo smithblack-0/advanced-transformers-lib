@@ -127,12 +127,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
     ) -> ShramCache:
         """Construct a fresh top-level SHRAM cache."""
         return ShramCache(
-            num_hidden_layers=self.config.num_hidden_layers,
-            sliding_window=self.config.window_size,
-            num_local_heads=self.config.num_sliding_window_heads,
-            local_head_dim=self.config.head_dim,
-            num_mosrah_heads=self.config.num_mosrah_heads,
-            mosrah_head_dim=self.config.head_dim,
+            config=self.config,
             batch_size=batch_size,
             device=device,
         )
@@ -230,6 +225,26 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
         """Reorder the cache in place for beam search."""
         past_key_values.reorder_cache(beam_idx)
         return past_key_values
+
+    @staticmethod
+    def create_masks_for_generate(
+        config: Any,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None,
+        position_ids: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Return the 2D attention_mask unchanged.
+
+        HuggingFace calls this during compiled generation to convert the 2D
+        attention mask into a 4D causal additive-bias mask. SHRAM uses flex
+        attention with custom masking and constructs causality internally; the
+        4D format is incompatible with the SHRAM masking contract. Overriding
+        as a no-op restores symmetry between compiled and non-compiled pathways
+        without any loss of correctness or performance (see Unit 19.G.4).
+        """
+        return attention_mask
 
     def _validate_input_ids(self, input_ids: torch.Tensor) -> None:
         """Validate token IDs at the wrapper boundary."""

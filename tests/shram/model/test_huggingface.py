@@ -24,6 +24,7 @@ from src.shram.model.huggingface import ShramCausalLMOutput, ShramForCausalLM
 
 
 def small_config(**kwargs) -> ShramConfig:
+    """Return a minimal ShramConfig suitable for fast unit tests."""
     defaults = dict(
         vocab_size=256,
         hidden_size=64,
@@ -53,16 +54,12 @@ def build_cache(
     batch_size: int,
     device: torch.device | None = None,
 ) -> ShramCache:
+    """Construct a ShramCache from the given model's config."""
     if device is None:
         device = model.embed_tokens.weight.device
 
     return ShramCache(
-        num_hidden_layers=model.config.num_hidden_layers,
-        sliding_window=model.config.window_size,
-        num_local_heads=model.config.num_sliding_window_heads,
-        local_head_dim=model.config.head_dim,
-        num_mosrah_heads=model.config.num_mosrah_heads,
-        mosrah_head_dim=model.config.hidden_size // model.config.num_selected_heads,
+        config=model.config,
         batch_size=batch_size,
         device=device,
     )
@@ -70,6 +67,7 @@ def build_cache(
 
 @pytest.fixture
 def model() -> ShramForCausalLM:
+    """Provide an eval-mode ShramForCausalLM with a minimal config."""
     return ShramForCausalLM(small_config()).eval()
 
 
@@ -79,12 +77,16 @@ def model() -> ShramForCausalLM:
 
 
 class TestOutputContract:
+    """Verify the ShramCausalLMOutput wrapper boundary: required fields, shapes, and types."""
+
     def test_returns_shram_causal_lm_output(self, model: ShramForCausalLM) -> None:
+        """Forward must return a ShramCausalLMOutput instance."""
         ids = torch.randint(0, model.config.vocab_size, (1, 4))
         out = model(ids, use_cache=False)
         assert isinstance(out, ShramCausalLMOutput)
 
     def test_attribute_access_works(self, model: ShramForCausalLM) -> None:
+        """Standard output fields must be present and non-None on a basic forward pass."""
         ids = torch.randint(0, model.config.vocab_size, (1, 4))
         out = model(ids, use_cache=False)
         assert out.logits is not None
@@ -92,6 +94,7 @@ class TestOutputContract:
         assert out.max_vio is not None
 
     def test_logits_shape(self, model: ShramForCausalLM) -> None:
+        """Logits must have shape (batch, seq_len, vocab_size)."""
         ids = torch.randint(0, model.config.vocab_size, (2, 8))
         out = model(ids, use_cache=False)
         assert out.logits.shape == (2, 8, model.config.vocab_size)
@@ -100,6 +103,7 @@ class TestOutputContract:
         self,
         model: ShramForCausalLM,
     ) -> None:
+        """load_balance_loss must be a finite scalar on every forward pass."""
         ids = torch.randint(0, model.config.vocab_size, (1, 6))
         out = model(ids, use_cache=False)
         assert out.load_balance_loss is not None
@@ -110,6 +114,7 @@ class TestOutputContract:
         self,
         model: ShramForCausalLM,
     ) -> None:
+        """max_vio must be a finite detached scalar — it is a monitoring value, not a loss."""
         ids = torch.randint(0, model.config.vocab_size, (1, 6))
         out = model(ids, use_cache=False)
         assert out.max_vio is not None
@@ -124,7 +129,10 @@ class TestOutputContract:
 
 
 class TestLoss:
+    """Verify the combined loss contract: CE + load-balance weighting, gradient flow, label handling."""
+
     def test_loss_none_without_labels(self, model: ShramForCausalLM) -> None:
+        """loss must be None when no labels are provided."""
         ids = torch.randint(0, model.config.vocab_size, (1, 4))
         out = model(ids, use_cache=False)
         assert out.loss is None
@@ -133,12 +141,14 @@ class TestLoss:
         self,
         model: ShramForCausalLM,
     ) -> None:
+        """loss must be a scalar when labels are provided."""
         ids = torch.randint(0, model.config.vocab_size, (2, 8))
         out = model(ids, labels=ids, use_cache=False)
         assert out.loss is not None
         assert out.loss.shape == ()
 
     def test_loss_is_positive(self, model: ShramForCausalLM) -> None:
+        """Combined loss must be positive on a randomly initialized model."""
         ids = torch.randint(0, model.config.vocab_size, (1, 8))
         out = model(ids, labels=ids, use_cache=False)
         assert out.loss is not None
@@ -186,7 +196,7 @@ class TestLoss:
         torch.testing.assert_close(out.loss, expected)
 
     def test_expert_bias_receives_gradient(self) -> None:
-        """expert_bias must receive a gradient when out.loss.backward() is called."""
+        """expert_bias must receive a gradient through out.loss so the router trains correctly."""
         m = ShramForCausalLM(small_config()).train()
         ids = torch.randint(0, m.config.vocab_size, (1, 4))
         out = m(ids, labels=ids, use_cache=False)
@@ -201,6 +211,8 @@ class TestLoss:
 
 
 class TestAttentionMaskBehavior:
+    """Verify that the wrapper correctly accepts and threads the 2D attention mask."""
+
     def test_all_ones_attention_mask_matches_unmasked(
         self,
         model: ShramForCausalLM,
@@ -255,15 +267,20 @@ class TestAttentionMaskBehavior:
 
 
 class TestWeightTying:
+    """Verify config-controlled tied embedding behavior and its preservation through save/load."""
+
     def test_tied_weights_share_storage(self) -> None:
+        """When tie_word_embeddings=True, lm_head and embed_tokens must share the same tensor."""
         m = ShramForCausalLM(small_config(tie_word_embeddings=True)).eval()
         assert m.lm_head.weight.data_ptr() == m.embed_tokens.weight.data_ptr()
 
     def test_untied_weights_are_independent(self) -> None:
+        """When tie_word_embeddings=False, lm_head and embed_tokens must be independent tensors."""
         m = ShramForCausalLM(small_config(tie_word_embeddings=False)).eval()
         assert m.lm_head.weight.data_ptr() != m.embed_tokens.weight.data_ptr()
 
     def test_tied_round_trip_preserves_tying(self, tmp_path) -> None:
+        """save_pretrained / from_pretrained must preserve tied embedding state."""
         m = ShramForCausalLM(small_config(tie_word_embeddings=True)).eval()
         m.save_pretrained(tmp_path)
         loaded = ShramForCausalLM.from_pretrained(tmp_path)
@@ -272,6 +289,7 @@ class TestWeightTying:
         assert loaded.lm_head.weight.data_ptr() == loaded.embed_tokens.weight.data_ptr()
 
     def test_untied_round_trip_preserves_untied_state(self, tmp_path) -> None:
+        """save_pretrained / from_pretrained must preserve untied embedding state."""
         m = ShramForCausalLM(small_config(tie_word_embeddings=False)).eval()
         m.save_pretrained(tmp_path)
         loaded = ShramForCausalLM.from_pretrained(tmp_path)
@@ -286,10 +304,13 @@ class TestWeightTying:
 
 
 class TestDirectCachePolicy:
+    """Verify cache validation at the direct forward() wrapper boundary."""
+
     def test_use_cache_true_requires_explicit_shram_cache(
         self,
         model: ShramForCausalLM,
     ) -> None:
+        """use_cache=True without a supplied ShramCache must raise at the wrapper boundary."""
         ids = torch.randint(0, model.config.vocab_size, (1, 4))
         position_ids = torch.arange(4).unsqueeze(0)
 
@@ -300,6 +321,7 @@ class TestDirectCachePolicy:
         self,
         model: ShramForCausalLM,
     ) -> None:
+        """A caller-supplied ShramCache must be passed through to the output unchanged."""
         ids = torch.randint(0, model.config.vocab_size, (1, 4))
         position_ids = torch.arange(4).unsqueeze(0)
         cache = build_cache(model, batch_size=1)
@@ -320,6 +342,7 @@ class TestDirectCachePolicy:
 
 
 class TestUncachedPositionConstraint:
+    """Verify that uncached forwards reject nonzero starting positions in both eager and compiled modes."""
     def test_uncached_forward_rejects_nonzero_starting_position(
         self, model: ShramForCausalLM
     ) -> None:
@@ -378,6 +401,7 @@ class TestUncachedPositionConstraint:
 
 
 class TestCaptureScalarOutputsEnforcement:
+    """Verify that compiling without capture_scalar_outputs=True raises at compile time."""
     def test_compiled_without_flag_raises(self) -> None:
         """Compiling without capture_scalar_outputs must raise at compile time."""
         torch._dynamo.reset()
@@ -408,10 +432,13 @@ class TestCaptureScalarOutputsEnforcement:
 
 
 class TestGenerationCacheHook:
+    """Verify that _prepare_cache_for_generation constructs ShramCache and respects caller-supplied caches."""
+
     def test_prepare_cache_for_generation_constructs_shram_cache(
         self,
         model: ShramForCausalLM,
     ) -> None:
+        """Hook must construct a ShramCache when no cache is pre-supplied."""
         generation_config = copy.deepcopy(model.generation_config)
         model_kwargs: dict[str, object] = {}
 
@@ -429,6 +456,7 @@ class TestGenerationCacheHook:
         self,
         model: ShramForCausalLM,
     ) -> None:
+        """Hook must leave a caller-supplied ShramCache untouched."""
         generation_config = copy.deepcopy(model.generation_config)
         cache = build_cache(model, batch_size=2)
         model_kwargs: dict[str, object] = {"past_key_values": cache}
@@ -450,7 +478,10 @@ class TestGenerationCacheHook:
 
 
 class TestGeneration:
+    """Verify that generate() works end-to-end for supported generation modes."""
+
     def test_generate_works(self, model: ShramForCausalLM) -> None:
+        """Greedy generation must complete and return the correct output shape."""
         input_ids = torch.tensor([[5, 6, 7]], dtype=torch.long)
 
         with torch.no_grad():
@@ -463,6 +494,7 @@ class TestGeneration:
         assert generated.shape == (1, 5)
 
     def test_beam_search_generate_works(self, model: ShramForCausalLM) -> None:
+        """Beam search generation must complete and return the correct output shape."""
         input_ids = torch.tensor([[5, 6, 7]], dtype=torch.long)
 
         with torch.no_grad():
@@ -482,7 +514,10 @@ class TestGeneration:
 
 
 class TestConfigDefaults:
+    """Verify that config-level defaults are correctly respected by the wrapper."""
+
     def test_config_output_hidden_states_respected(self) -> None:
+        """output_hidden_states=True in config must produce non-None hidden_states in output."""
         config = small_config(output_hidden_states=True, use_cache=False)
         m = ShramForCausalLM(config).eval()
 
@@ -492,6 +527,7 @@ class TestConfigDefaults:
         assert out.hidden_states is not None
 
     def test_config_use_cache_false_respected(self) -> None:
+        """use_cache=False in config must produce None past_key_values in output."""
         config = small_config(use_cache=False)
         m = ShramForCausalLM(config).eval()
 
@@ -502,11 +538,14 @@ class TestConfigDefaults:
 
 
 class TestSaveLoadAndAutoClass:
+    """Verify HuggingFace save/load round-trip and AutoClass registration."""
+
     def test_save_pretrained_round_trip_preserves_parameter_values(
         self,
         model: ShramForCausalLM,
         tmp_path,
     ) -> None:
+        """All parameter values must survive a save_pretrained / from_pretrained round-trip."""
         model.save_pretrained(tmp_path)
         loaded = ShramForCausalLM.from_pretrained(tmp_path)
 
@@ -517,12 +556,15 @@ class TestSaveLoadAndAutoClass:
             torch.testing.assert_close(p1, p2, msg=f"Mismatch in {name}")
 
     def test_auto_model_from_config(self) -> None:
+        """AutoModelForCausalLM.from_config must return a ShramForCausalLM when registered."""
         AutoModelForCausalLM.register(ShramConfig, ShramForCausalLM)
         config = small_config(use_cache=False)
         model = AutoModelForCausalLM.from_config(config)
         assert isinstance(model, ShramForCausalLM)
 
 class TestNumMosrahParameters:
+    """Verify the MoSRAH parameter count method: scaling, partition, and stability."""
+
     def test_scaling_with_layers(self):
         """2× num_hidden_layers must produce exactly 2× the MoSRAH parameter count."""
         config_base = small_config(num_hidden_layers=2)
@@ -543,16 +585,48 @@ class TestNumMosrahParameters:
         assert model.num_mosrah_parameters() == model.num_mosrah_parameters()
 
 
+class TestCreateMasksForGenerate:
+    """create_masks_for_generate must return the 2D attention_mask unchanged (Unit 19.G.4)."""
+
+    def test_returns_attention_mask_unchanged(self):
+        """The override must pass the attention_mask through without modification."""
+        attention_mask = torch.ones(2, 10, dtype=torch.bool)
+        result = ShramForCausalLM.create_masks_for_generate(
+            config=small_config(),
+            inputs_embeds=torch.empty(2, 1, 0),
+            attention_mask=attention_mask,
+            past_key_values=None,
+        )
+        assert result is attention_mask
+
+    def test_returns_none_when_mask_is_none(self):
+        """None attention_mask must be returned as None."""
+        result = ShramForCausalLM.create_masks_for_generate(
+            config=small_config(),
+            inputs_embeds=torch.empty(2, 1, 0),
+            attention_mask=None,
+            past_key_values=None,
+        )
+        assert result is None
+
+    def test_result_is_still_2d(self):
+        """Returned mask must remain 2D — not converted to 4D additive-bias format."""
+        attention_mask = torch.ones(2, 10, dtype=torch.bool)
+        result = ShramForCausalLM.create_masks_for_generate(
+            config=small_config(),
+            inputs_embeds=torch.empty(2, 1, 0),
+            attention_mask=attention_mask,
+            past_key_values=None,
+        )
+        assert result.ndim == 2
+
+
 def test_shram_cache_initializes_correctly_for_batch_size_two() -> None:
+    """ShramCache constructed with batch_size=2 must propagate that batch dimension correctly."""
     cache = ShramCache(
-        num_hidden_layers=2,
-        sliding_window=8,
-        num_local_heads=4,
-        local_head_dim=16,
-        num_mosrah_heads=4,
-        mosrah_head_dim=16,
-        device=torch.device("cpu"),
+        config=small_config(),
         batch_size=2,
+        device=torch.device("cpu"),
     )
 
     layer_cache = cache.layers[0]

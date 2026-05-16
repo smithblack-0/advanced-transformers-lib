@@ -81,7 +81,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 19.G.1 (Blocker) — Expert packing: static T preallocation and overflow detection
 - [X] Unit 19.G.2 (Blocker) — Expert packing: replace _bincount_rows with scatter_add
 - [X] Unit 19.G.3 (Blocker) — Load balance frequency aggregation: p-mean and load_balance_p
-- [ ] Unit 19.G.4 (Blocker) — Static cache rebuild for compiled inference
+- [X] Unit 19.G.4 (Blocker) — Restore mask symmetry for compiled inference via create_masks_for_generate override
+- [ ] Unit 19.G.5 (Blocker) — Static cache rebuild for compiled inference
 - [ ] Unit 20 — Final audit
 
 ---
@@ -2417,7 +2418,40 @@ Arithmetic mean is blind to per-item spikes: a head that averages near 1/L while
 
 ---
 
-### Unit 19.G.4 (Blocker) — Static cache rebuild for compiled inference
+### Unit 19.G.4 (Blocker) — Restore mask symmetry for compiled inference via create_masks_for_generate override
+
+**Responsibility:** Override `create_masks_for_generate` on `ShramForCausalLM` to return the 2D `attention_mask` unchanged, and restore `is_compileable = True` on `ShramLayerCache` and `ShramCache`.
+
+**Context of Correctness:**
+
+HuggingFace's `prepare_inputs_for_generation` in `GenerationMixin` behaves differently depending on whether a cache entry is marked as compileable. When `is_compileable = True`, it calls `create_masks_for_generate`, which converts the 2D boolean attention mask into a 4D causal additive-bias mask before passing it downstream. This transformation exists to accelerate traditional torch transformer instances under compilation by precomputing the causal mask once — and it is the correct choice for models that consume that format natively.
+
+SHRAM, however, uses flex attention with custom masking; flex attention works with boolean masks instead, has been implemented internally with causality, and only depends on the external mask to know the tokens which are not dead. The existing system expects a 2D boolean mask, and relies on it to ignore attention between dead tokens during training. As such the mask is incompatible, as currently specified, with the downstream system. This must be resolved.
+
+Given the usage of flex attention, the performance implications that motivated the usage of an additive mask do not actually exist. This means the most straightforward option is to standardize back into a 2D mask form; the reason for the additive mask is not relevant. In theory, it would be possible to reverse the additive mask back into a boolean mask by treating sufficiently large negative logits as dead-token signals. In practice, this wastes additional computation for no reason. Instead, HuggingFace provides the `create_masks_for_generate` override point precisely so model implementations can specify their own custom behavior when going through compiled transforms. Overriding this such that it passes the mask through unchanged is the optimal option, as the computation is skipped and it uses the supported framework hooks for the process.
+
+**Invariants this unit must satisfy:**
+
+- `ShramForCausalLM.create_masks_for_generate` exists and returns the 2D `attention_mask` argument unchanged
+- Compiled and non-compiled inference pathways present the same 2D boolean mask format to the SHRAM attention stack
+- `ShramLayerCache.is_compileable = True`
+- `ShramCache.is_compileable = True`
+- All existing inference tests continue to pass
+
+**Tests:**
+
+- Verify `create_masks_for_generate` returns its `attention_mask` argument unchanged
+- Verify tests previously failing due to this asymmetry now pass
+
+**Preliminary implementation strategy:**
+
+- Override `create_masks_for_generate` on `ShramForCausalLM`; inspect the HuggingFace signature and return the `attention_mask` unchanged with no other modifications
+- Set `is_compileable = True` on `ShramLayerCache`; verify `ShramCache` carries this flag or update if not
+- If the HuggingFace override contract proves to require more than a passthrough, surface it rather than filling the gap silently
+
+---
+
+### Unit 19.G.5 (Blocker) — Static cache rebuild for compiled inference
 
 **Responsibility:** Rebuild `MoSRAHCache` and `LocalSlidingWindowLayerCache` to satisfy the HuggingFace static cache contract, eliminating all graph breaks in the cache update path and enabling end-to-end compiled inference.
 
