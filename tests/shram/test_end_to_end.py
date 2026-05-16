@@ -15,8 +15,9 @@ Two test layers live here:
 import shutil
 
 import torch
+import torch._dynamo
 import pytest
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, CompileConfig
 
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.huggingface import ShramForCausalLM
@@ -126,40 +127,28 @@ class TestIntegrationTrainable:
 
 
 class TestIntegrationCompilable:
-    @pytest.mark.skipif(
-        not torch.cuda.is_available(),
-        reason=(
-            "flex_attention compile fails under inductor on CPU "
-            "(pytorch/pytorch#139434); CUDA required."
-        ),
-    )
+
     def test_compile_uncached_forward(self):
         """torch.compile must succeed on the uncached (training) forward path."""
-        # REMOVE WHEN DEBUGGING DONE: explain mode to surface graph breaks
-        torch._dynamo.reset()
-        torch._dynamo.config.verbose = True
-        explanation = torch._dynamo.explain(ShramForCausalLM(small_config()))(
-            torch.randint(0, 256, (1, 4)), use_cache=False
-        )
-        print(f"\n{explanation}")
-
-        torch._dynamo.reset()
-        # END REMOVE WHEN DEBUGGING DONE
-        m = ShramForCausalLM(small_config()).cuda()
+        torch._dynamo.config.capture_scalar_outputs = True
+        m = ShramForCausalLM(small_config())
         compiled = torch.compile(m, fullgraph=False, dynamic=True)
-        ids = torch.randint(0, 256, (1, 4)).cuda()
+        ids = torch.randint(0, 256, (1, 4))
         compiled(ids, use_cache=False)
 
-    @pytest.mark.skip(
-        reason="Inference-path compilation requires static caches and CompileConfig "
-               "support — see Plan Blocker 19.G for resolution."
-    )
-    def test_compile_cached_forward(self):
-        """torch.compile must succeed on the cached (inference) forward path."""
+
+    def test_compile_cached_inference(self):
+        """generate() with CompileConfig(fullgraph=True) must complete without graph breaks.
+
+        fullgraph=True causes torch.compile to raise immediately on any graph break,
+        making this test a strict no-graph-break assertion for the cached inference path.
+        """
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.reset()
         m = ShramForCausalLM(small_config()).eval()
-        compiled = torch.compile(m)
+        compile_config = CompileConfig(fullgraph=True, dynamic=True)
         ids = torch.randint(0, 256, (1, 4))
-        compiled.generate(ids, max_new_tokens=3)
+        m.generate(ids, max_new_tokens=3, compile_config=compile_config)
 
 
 # ---------------------------------------------------------------------------
