@@ -121,13 +121,6 @@ def test_get_max_cache_shape_returns_inference_sequence_length():
     assert cache.get_max_cache_shape() == INFERENCE_SEQ_LEN
 
 
-def test_get_mask_sizes_raises():
-    """get_mask_sizes() raises NotImplementedError — two paths have different mask semantics."""
-    cache = make_cache()
-    with pytest.raises(NotImplementedError):
-        cache.get_mask_sizes(torch.tensor([0]))
-
-
 # ---------------------------------------------------------------------------
 # Construction — sub-cache ownership and shape
 # ---------------------------------------------------------------------------

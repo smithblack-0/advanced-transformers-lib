@@ -64,7 +64,7 @@ def make_cache(config: ShramConfig, batch_size: int) -> MoSRAHCache:
         head_dim=config.head_dim,
         batch_size=batch_size,
         device=torch.device("cpu"),
-        initial_buffer_size=8,
+        mosrah_cache_length=config.mosrah_cache_length,
     )
 
 

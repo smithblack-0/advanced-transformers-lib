@@ -74,17 +74,11 @@ def make_input(
 def make_layer_cache(
     config: ShramConfig,
     batch_size: int,
-    initial_buffer_size: int = 8,
 ) -> ShramLayerCache:
     return ShramLayerCache(
-        sliding_window=config.window_size,
-        num_local_heads=config.num_sliding_window_heads,
-        local_head_dim=config.head_dim,
-        num_mosrah_heads=config.num_mosrah_heads,
-        mosrah_head_dim=config.head_dim,
+        config=config,
         batch_size=batch_size,
         device=torch.device("cpu"),
-        initial_buffer_size=initial_buffer_size,
     )
 
 
@@ -223,7 +217,6 @@ class TestRuntimeSmoke:
         layer_cache = make_layer_cache(
             config,
             batch_size=1,
-            initial_buffer_size=8,
         )
 
         prefix_output, prefix_load_balance_loss, _ = layer(

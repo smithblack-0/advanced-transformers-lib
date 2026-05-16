@@ -731,7 +731,7 @@ class TestCachedCausality:
             head_dim=config.head_dim,
             batch_size=1,
             device=torch.device("cpu"),
-            initial_buffer_size=4,
+            mosrah_cache_length=config.mosrah_cache_length,
         )
         _ = bea(prefix_embeddings, prefix_positions, prefix_active_mask, cache=cache)
         num_tokens_processed = cache.get_heads_lengths().clone()
@@ -931,7 +931,7 @@ class TestCausalityFuzz:
                     head_dim=config.head_dim,
                     batch_size=1,
                     device=torch.device("cpu"),
-                    initial_buffer_size=8,
+                    mosrah_cache_length=config.mosrah_cache_length,
                 )
                 _ = bea(
                     prefix_embeddings,
@@ -964,7 +964,7 @@ class TestCausalityFuzz:
                         head_dim=config.head_dim,
                         batch_size=1,
                         device=torch.device("cpu"),
-                        initial_buffer_size=8,
+                        mosrah_cache_length=config.mosrah_cache_length,
                     )
                     _ = bea(
                         perturbed_prefix_embeddings,

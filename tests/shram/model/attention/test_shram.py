@@ -98,18 +98,12 @@ def make_continued_decoding_inputs(
 def make_layer_cache(
     config: ShramConfig,
     batch_size: int,
-    initial_buffer_size: int = 8,
 ) -> ShramLayerCache:
     """Construct a real per-layer SHRAM cache."""
     return ShramLayerCache(
-        sliding_window=config.window_size,
-        num_local_heads=config.num_sliding_window_heads,
-        local_head_dim=config.head_dim,
-        num_mosrah_heads=config.num_mosrah_heads,
-        mosrah_head_dim=config.head_dim,
+        config=config,
         batch_size=batch_size,
         device=torch.device("cpu"),
-        initial_buffer_size=initial_buffer_size,
     )
 
 
@@ -472,12 +466,10 @@ class TestConfigurationResponse:
             main_sequence_cache = make_layer_cache(
                 main_sequence_config,
                 batch_size=current_hidden_states.shape[0],
-                initial_buffer_size=16,
             )
             semantic_sequence_cache = make_layer_cache(
                 semantic_sequence_config,
                 batch_size=current_hidden_states.shape[0],
-                initial_buffer_size=16,
             )
 
             _, _, _ = main_sequence_layer(
