@@ -16,11 +16,10 @@ from src.shram.model.mlp import SwiGLUMLP
 
 def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
-        hidden_size=64,
-        intermediate_size=128,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        num_hidden_layers=2,
+        embedding_width=64,
+        mlp_width=128,
+        num_mosrah_heads=4,
+        num_decoder_layers=2,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
@@ -32,15 +31,15 @@ def small_config(**kwargs) -> ShramConfig:
 
 class TestShape:
     def test_output_shape_matches_input(self):
-        """(batch, seq, hidden_size) → (batch, seq, hidden_size)."""
-        config = small_config(hidden_size=64, intermediate_size=128)
+        """(batch, seq, embedding_width) → (batch, seq, embedding_width)."""
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         x = torch.randn(2, 8, 64)
         assert mlp(x).shape == x.shape
 
     def test_different_batch_and_seq(self):
         """Shape invariant holds across varying batch and sequence dimensions."""
-        config = small_config(hidden_size=64, intermediate_size=128)
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         x = torch.randn(4, 32, 64)
         assert mlp(x).shape == x.shape
@@ -52,17 +51,17 @@ class TestShape:
 
 class TestNoBias:
     def test_gate_proj_has_no_bias(self):
-        config = small_config(hidden_size=64, intermediate_size=128)
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         assert mlp.gate_proj.bias is None
 
     def test_up_proj_has_no_bias(self):
-        config = small_config(hidden_size=64, intermediate_size=128)
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         assert mlp.up_proj.bias is None
 
     def test_down_proj_has_no_bias(self):
-        config = small_config(hidden_size=64, intermediate_size=128)
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         assert mlp.down_proj.bias is None
 
@@ -73,20 +72,20 @@ class TestNoBias:
 
 class TestProjectionDimensions:
     def test_gate_proj_dimensions(self):
-        """gate_proj must map hidden_size → intermediate_size as specified in config."""
-        config = small_config(hidden_size=64, intermediate_size=128)
+        """gate_proj must map embedding_width → mlp_width as specified in config."""
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         assert mlp.gate_proj.weight.shape == (128, 64)
 
     def test_up_proj_dimensions(self):
-        """up_proj must map hidden_size → intermediate_size as specified in config."""
-        config = small_config(hidden_size=64, intermediate_size=128)
+        """up_proj must map embedding_width → mlp_width as specified in config."""
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         assert mlp.up_proj.weight.shape == (128, 64)
 
     def test_down_proj_dimensions(self):
-        """down_proj must map intermediate_size → hidden_size as specified in config."""
-        config = small_config(hidden_size=64, intermediate_size=128)
+        """down_proj must map mlp_width → embedding_width as specified in config."""
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         assert mlp.down_proj.weight.shape == (64, 128)
 
@@ -103,7 +102,7 @@ class TestGating:
         doubling the input must not double the output. This confirms SiLU is applied
         and not silently removed.
         """
-        config = small_config(hidden_size=64, intermediate_size=128)
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         mlp.eval()
         torch.manual_seed(0)
@@ -120,7 +119,7 @@ class TestGating:
         This confirms the gate is genuinely active: it controls whether any signal
         passes through to W_down. If gating were absent the output would be non-zero.
         """
-        config = small_config(hidden_size=64, intermediate_size=128)
+        config = small_config(embedding_width=64, mlp_width=128)
         mlp = SwiGLUMLP(config)
         torch.nn.init.zeros_(mlp.gate_proj.weight)
 

@@ -74,9 +74,9 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
 
     def __init__(self, config: ShramConfig) -> None:
         super().__init__(config)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.embedding_width)
         self.model = ShramModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.embedding_width, config.vocab_size, bias=False)
         self._configure_tied_embeddings()
         self.post_init()
 

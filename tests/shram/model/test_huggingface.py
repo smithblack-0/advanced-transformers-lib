@@ -27,9 +27,9 @@ def small_config(**kwargs) -> ShramConfig:
     """Return a minimal ShramConfig suitable for fast unit tests."""
     defaults = dict(
         vocab_size=256,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
+        embedding_width=64,
+        mlp_width=128,
+        num_decoder_layers=2,
         num_sliding_window_heads=4,
         num_mosrah_heads=4,
         num_selected_heads=4,
@@ -41,9 +41,6 @@ def small_config(**kwargs) -> ShramConfig:
         use_cache=True,
         output_hidden_states=False,
         tie_word_embeddings=False,
-        bos_token_id=1,
-        eos_token_id=2,
-        pad_token_id=0,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
@@ -566,9 +563,9 @@ class TestNumMosrahParameters:
     """Verify the MoSRAH parameter count method: scaling, partition, and stability."""
 
     def test_scaling_with_layers(self):
-        """2× num_hidden_layers must produce exactly 2× the MoSRAH parameter count."""
-        config_base = small_config(num_hidden_layers=2)
-        config_double = small_config(num_hidden_layers=4)
+        """2× num_decoder_layers must produce exactly 2× the MoSRAH parameter count."""
+        config_base = small_config(num_decoder_layers=2)
+        config_double = small_config(num_decoder_layers=4)
         model_base = ShramForCausalLM(config_base)
         model_double = ShramForCausalLM(config_double)
         assert model_double.num_mosrah_parameters() == 2 * model_base.num_mosrah_parameters()

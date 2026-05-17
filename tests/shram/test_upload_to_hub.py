@@ -22,7 +22,7 @@ MODEL_DIR = Path(__file__).parent.parent.parent / "src" / "shram" / "model"
 def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
         embedding_width=64,
-        intermediate_size=128,
+        mlp_width=128,
         num_decoder_layers=2,
         num_sliding_window_heads=4,
         num_mosrah_heads=4,
@@ -63,8 +63,8 @@ class TestRenderConfigTable:
         """Each config parameter value must appear in the rendered table."""
         config = small_config()
         table = _render_config_table(config)
-        assert str(config.hidden_size) in table
-        assert str(config.num_hidden_layers) in table
+        assert str(config.embedding_width) in table
+        assert str(config.num_decoder_layers) in table
         assert str(config.vocab_size) in table
 
 

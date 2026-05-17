@@ -61,7 +61,7 @@ class MoSRAHRouter(nn.Module):
 
         # W_r: routing projection, no bias (paper specifies xW_r, no additional term).
         self.routing_projection = nn.Linear(
-            config.hidden_size, config.num_mosrah_heads, bias=False
+            config.embedding_width, config.num_mosrah_heads, bias=False
         )
 
         # b: learned per-head bias for load balancing. Initialized to zero so that all

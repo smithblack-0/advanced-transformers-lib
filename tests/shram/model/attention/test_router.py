@@ -32,14 +32,14 @@ def small_config(**kwargs) -> ShramConfig:
     """Small config valid for router tests. num_selected_heads < num_mosrah_heads
     so TopK is genuinely sparse."""
     defaults = dict(
-        hidden_size=64,
+        embedding_width=64,
         num_mosrah_heads=8,
         num_selected_heads=4,
         head_dim=16,
         num_sliding_window_heads=4,
         window_size=16,
-        intermediate_size=128,
-        num_hidden_layers=2,
+        mlp_width=128,
+        num_decoder_layers=2,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
@@ -391,11 +391,11 @@ class TestMaskedContinuationBehavior:
         active_mask[0, 3] = False
 
         torch.manual_seed(11)
-        x = torch.randn(B, N, config.hidden_size)
+        x = torch.randn(B, N, config.embedding_width)
         _, _, loss_a, _ = router(x, active_mask)
 
         x_modified = x.clone()
-        x_modified[0, 3] = torch.randn(config.hidden_size) * 100.0
+        x_modified[0, 3] = torch.randn(config.embedding_width) * 100.0
         _, _, loss_b, _ = router(x_modified, active_mask)
 
         torch.testing.assert_close(loss_a, loss_b)
@@ -409,11 +409,11 @@ class TestMaskedContinuationBehavior:
         active_mask[1, 5] = False
 
         torch.manual_seed(17)
-        x = torch.randn(B, N, config.hidden_size)
+        x = torch.randn(B, N, config.embedding_width)
         _, _, _, vio_a = router(x, active_mask)
 
         x_modified = x.clone()
-        x_modified[1, 5] = torch.randn(config.hidden_size) * 100.0
+        x_modified[1, 5] = torch.randn(config.embedding_width) * 100.0
         _, _, _, vio_b = router(x_modified, active_mask)
 
         torch.testing.assert_close(vio_a, vio_b)
@@ -432,7 +432,7 @@ class TestMaskedContinuationBehavior:
         active_mask = torch.ones(B, N, dtype=torch.bool)
 
         torch.manual_seed(13)
-        x = torch.randn(B, N, config.hidden_size)
+        x = torch.randn(B, N, config.embedding_width)
 
         with torch.no_grad():
             selected_heads, _, _, max_vio = router(x, active_mask)

@@ -122,7 +122,7 @@ class ShramConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         mosrah_overallocation_factor: float = 2.0,
         load_balance_p: float = 2.0,
-        **kwargs,
+        **kwargs
     ):
         if head_dim % 2 != 0:
             raise ValueError(
@@ -163,9 +163,9 @@ class ShramConfig(PretrainedConfig):
             )
 
         self.vocab_size = vocab_size
-        self.hidden_size = embedding_width
-        self.intermediate_size = mlp_width
-        self.num_hidden_layers = num_decoder_layers
+        self.embedding_width = embedding_width
+        self.mlp_width = mlp_width
+        self.num_decoder_layers = num_decoder_layers
         self.num_sliding_window_heads = num_sliding_window_heads
         self.num_mosrah_heads = num_mosrah_heads
         self.num_selected_heads = num_selected_heads
@@ -187,7 +187,7 @@ class ShramConfig(PretrainedConfig):
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             output_hidden_states=output_hidden_states,
-            **kwargs,
+            **kwargs
         )
 
         # Promote auto_map to an instance attribute so PretrainedConfig.to_dict()

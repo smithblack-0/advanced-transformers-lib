@@ -46,8 +46,8 @@ class DecoderLayer(nn.Module):
 
     def __init__(self, config: ShramConfig) -> None:
         super().__init__()
-        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_norm = nn.RMSNorm(config.embedding_width, eps=config.rms_norm_eps)
+        self.mlp_norm = nn.RMSNorm(config.embedding_width, eps=config.rms_norm_eps)
         self.attention = SHRAMHybridLayer(config)
         self.mlp = SwiGLUMLP(config)
 
