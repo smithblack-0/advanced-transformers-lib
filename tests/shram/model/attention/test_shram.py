@@ -23,17 +23,17 @@ def make_config(**overrides) -> ShramConfig:
     """Construct a small SHRAM config for hybrid-layer integration tests."""
     config_kwargs = dict(
         vocab_size=128,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
+        embedding_width=8,
+        mlp_width=16,
+        num_decoder_layers=1,
         num_sliding_window_heads=2,
         num_mosrah_heads=5,
         num_selected_heads=2,
         head_dim=4,
         window_size=4,
         rope_mode="main_sequence",
-        training_sequence_length=8,
-        inference_sequence_length=8,
+        training_sequence_length=16,
+        inference_sequence_length=16,
         attention_dropout=0.0,
         use_cache=True,
         mosrah_rope_theta = 20,
@@ -98,18 +98,12 @@ def make_continued_decoding_inputs(
 def make_layer_cache(
     config: ShramConfig,
     batch_size: int,
-    initial_buffer_size: int = 8,
 ) -> ShramLayerCache:
     """Construct a real per-layer SHRAM cache."""
     return ShramLayerCache(
-        sliding_window=config.window_size,
-        num_local_heads=config.num_sliding_window_heads,
-        local_head_dim=config.head_dim,
-        num_mosrah_heads=config.num_mosrah_heads,
-        mosrah_head_dim=config.head_dim,
+        config=config,
         batch_size=batch_size,
         device=torch.device("cpu"),
-        initial_buffer_size=initial_buffer_size,
     )
 
 
@@ -295,19 +289,6 @@ class TestRealExecution:
         assert torch.isfinite(max_vio)
         assert not max_vio.requires_grad
 
-    def test_uncached_nonzero_starting_positions_fail_explicitly(self):
-        """Uncached hybrid execution must not accept nonzero starting positions."""
-        hidden_states, position_ids, active_mask = make_inputs(start_position=10)
-        layer = make_layer(make_config(), seed=0)
-
-        with pytest.raises(ValueError, match="nonzero starting positions"):
-            layer(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                active_mask=active_mask,
-                cache=None,
-            )
-
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
     def test_cached_execution_runs_sanely_with_the_real_per_layer_cache(self, rope_mode):
         """The real assembled hybrid layer should exercise both owned sub-caches."""
@@ -468,7 +449,7 @@ class TestConfigurationResponse:
             hidden_states = torch.randn(
                 1,
                 total_length,
-                main_sequence_config.hidden_size,
+                main_sequence_config.embedding_width,
                 generator=random_generator,
             )
             position_ids = torch.arange(total_length, dtype=torch.long).unsqueeze(0)
@@ -485,12 +466,10 @@ class TestConfigurationResponse:
             main_sequence_cache = make_layer_cache(
                 main_sequence_config,
                 batch_size=current_hidden_states.shape[0],
-                initial_buffer_size=16,
             )
             semantic_sequence_cache = make_layer_cache(
                 semantic_sequence_config,
                 batch_size=current_hidden_states.shape[0],
-                initial_buffer_size=16,
             )
 
             _, _, _ = main_sequence_layer(

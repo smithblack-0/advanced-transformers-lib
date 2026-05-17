@@ -21,6 +21,7 @@ what HuggingFace generation reads through get_seq_length().
 import torch
 from transformers.cache_utils import Cache
 
+from ..configuration import ShramConfig
 from .shram_layer_cache import ShramLayerCache
 
 
@@ -36,44 +37,28 @@ class ShramCache(Cache):
     via cache.layers[layer_idx].sliding_window_cache or cache.layers[layer_idx].mosrah_cache.
 
     Args:
-        num_hidden_layers: Number of SHRAM decoder layers. Determines how many
-            ShramLayerCache objects are constructed.
-        sliding_window: Token window size passed to each layer's LocalSlidingWindowLayerCache.
-        num_local_heads: Number of local attention heads per layer.
-        local_head_dim: Per-head embedding width for the local path.
-        num_mosrah_heads: Total number of MoSRAH expert heads (L) per layer.
-        mosrah_head_dim: Bottlenecked head embedding width (u) for the MoSRAH path.
+        config: ShramConfig instance. All layer counts, buffer sizes, and sub-cache
+            dimensions are derived from config so that a single source of truth governs
+            every buffer size across the full cache stack.
         batch_size: Number of sequences in the batch.
         device: Device on which to allocate cache tensors.
-        initial_buffer_size: Initial per-(batch, head) capacity for each MoSRAHCache.
-            Doubled when any slot overflows. Defaults to 64 to avoid repeated reallocation
-            during prompt processing.
     """
+
+    is_compileable = True
 
     def __init__(
         self,
-        num_hidden_layers: int,
-        sliding_window: int,
-        num_local_heads: int,
-        local_head_dim: int,
-        num_mosrah_heads: int,
-        mosrah_head_dim: int,
+        config: ShramConfig,
         batch_size: int,
         device: torch.device,
-        initial_buffer_size: int = 64,
     ) -> None:
         layers = [
             ShramLayerCache(
-                sliding_window=sliding_window,
-                num_local_heads=num_local_heads,
-                local_head_dim=local_head_dim,
-                num_mosrah_heads=num_mosrah_heads,
-                mosrah_head_dim=mosrah_head_dim,
+                config=config,
                 batch_size=batch_size,
                 device=device,
-                initial_buffer_size=initial_buffer_size,
             )
-            for _ in range(num_hidden_layers)
+            for _ in range(config.num_decoder_layers)
         ]
         super().__init__(layers=layers)
 
@@ -133,9 +118,10 @@ class ShramCache(Cache):
 
     @property
     def max_cache_len(self) -> int:
-        """Not supported — ShramCache has no single maximum cache length.
+        """Return the maximum sequence length the cache can serve.
 
-        The sliding-window side is bounded by sliding_window; the MoSRAH side is unbounded.
-        No truthful scalar maximum represents the composite.
+        Delegates to layers[0].get_max_cache_shape(), which returns
+        config.inference_sequence_length. HuggingFace's static-cache machinery reads
+        this value to size generation loops and verify compileable cache contracts.
         """
-        raise NotImplementedError("ShramCache does not expose max_cache_len.")
+        return self.layers[0].get_max_cache_shape()

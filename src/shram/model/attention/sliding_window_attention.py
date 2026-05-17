@@ -44,7 +44,7 @@ class SlidingWindowAttention(nn.Module):
     def __init__(self, config: ShramConfig) -> None:
         super().__init__()
 
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.embedding_width
         self.num_heads = config.num_sliding_window_heads
         self.head_dim = config.head_dim
         self.window_size = config.window_size
@@ -69,6 +69,7 @@ class SlidingWindowAttention(nn.Module):
             mode="default",
             head_dim=self.head_dim,
             theta=config.local_rope_theta,
+            maximum_sequence_length=config.inference_sequence_length,
         )
 
     def forward(

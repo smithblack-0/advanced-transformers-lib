@@ -16,6 +16,7 @@ Invariants verified in this file:
 
 HF CacheLayerMixin protocol and construction:
 - LocalSlidingWindowLayerCache subclasses CacheLayerMixin
+- is_compileable is True
 - is_initialized is True at construction
 - get_max_cache_shape() returns the configured sliding_window size
 - get_seq_length() returns 0 at construction
@@ -48,6 +49,7 @@ internal buffer state.
 
 import pytest
 import torch
+import torch._dynamo
 from transformers.cache_utils import CacheLayerMixin
 
 from src.shram.model.cache.sliding_window_cache import LocalSlidingWindowLayerCache
@@ -94,6 +96,10 @@ def make_cache(
 
 def test_local_sliding_window_layer_cache_is_cache_layer_mixin():
     assert issubclass(LocalSlidingWindowLayerCache, CacheLayerMixin)
+
+
+def test_is_compileable_true():
+    assert LocalSlidingWindowLayerCache.is_compileable is True
 
 
 def test_cache_is_initialized_at_construction():
@@ -392,6 +398,30 @@ def test_batch_repeat_interleave_preserves_alignment_observationally():
     assert torch.equal(out_k, expected_k)
     assert torch.equal(out_v, expected_v)
     assert torch.equal(out_m, expected_m)
+
+
+# ---------------------------------------------------------------------------
+# Compiled execution (19.G.4)
+# ---------------------------------------------------------------------------
+
+
+def test_update_compiled_no_graph_breaks():
+    torch._dynamo.reset()
+    torch._dynamo.config.capture_scalar_outputs = True
+
+    cache = make_cache(sliding_window=3, batch_size=1)
+    compiled_update = torch.compile(cache.update, fullgraph=True)
+
+    for step in range(3):
+        keys = torch.randn(1, 1, 2, 1)
+        vals = torch.randn(1, 1, 2, 1)
+        mask = torch.ones(1, 2, dtype=torch.bool)
+        pos = torch.tensor([[step * 2, step * 2 + 1]])
+
+        out_k, out_v, out_m, out_p = compiled_update(keys, vals, mask, pos)
+
+        assert out_k.shape == (1, 1, 3 + 2, 1)
+        assert out_m.dtype == torch.bool
 
 
 def test_batch_select_indices_preserves_alignment_observationally():

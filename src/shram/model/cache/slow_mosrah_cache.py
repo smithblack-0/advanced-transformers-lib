@@ -41,9 +41,9 @@ class SlowMoSRAHCache(CacheLayerMixin):
         batch_size: Number of sequences in the batch. Determines the first dimension
             of all storage tensors.
         device: Device on which to allocate all tensors. Should match the model device.
-        initial_buffer_size: Initial sequence capacity per (batch, head) slot. Doubled
-            when any slot overflows. Defaults to 64 to avoid repeated reallocation
-            during prompt processing.
+        mosrah_cache_length: Static sequence capacity per (batch, head) slot. Equal to
+            config.mosrah_cache_length. The buffer never grows; if any slot would exceed
+            this capacity, update() raises a RuntimeError.
     """
 
     is_compileable = False
@@ -55,22 +55,23 @@ class SlowMoSRAHCache(CacheLayerMixin):
         head_dim: int,
         batch_size: int,
         device: torch.device,
-        initial_buffer_size: int = 64,
+        mosrah_cache_length: int,
     ) -> None:
         super().__init__()
         self.num_mosrah_heads = num_mosrah_heads
         self.head_dim = head_dim
         self.batch_size = batch_size
         self.device = device
+        self.mosrah_cache_length = mosrah_cache_length
 
         # Allocate primary storage into the mixin-standard self.keys / self.values so
         # that inherited methods (offload, prefetch) operate on real tensors. _counts
         # tracks valid occupancy per (batch, head) slot.
         self.keys: torch.Tensor = torch.zeros(
-            batch_size, num_mosrah_heads, initial_buffer_size, head_dim, device=device
+            batch_size, num_mosrah_heads, mosrah_cache_length, head_dim, device=device
         )
         self.values: torch.Tensor = torch.zeros(
-            batch_size, num_mosrah_heads, initial_buffer_size, head_dim, device=device
+            batch_size, num_mosrah_heads, mosrah_cache_length, head_dim, device=device
         )
         self._counts: torch.Tensor = torch.zeros(
             batch_size, num_mosrah_heads, dtype=torch.long, device=device
@@ -87,8 +88,8 @@ class SlowMoSRAHCache(CacheLayerMixin):
     def buffer_capacity(self) -> int:
         """Current number of slots allocated per (batch, head) pair.
 
-        Derived directly from self.keys rather than tracked separately, so it is
-        always consistent with the actual buffer after expansion.
+        Equal to mosrah_cache_length as supplied at construction. Derived from
+        self.keys so it remains consistent with the actual buffer shape.
         """
         return self.keys.shape[2]
 
@@ -111,8 +112,8 @@ class SlowMoSRAHCache(CacheLayerMixin):
         because the t dimension is traversed from 0 to T-1 and counts are updated
         immediately after each write.
 
-        Buffer expansion (doubling buffer_capacity) is triggered before any writes if
-        the incoming tokens would cause any slot to overflow the current capacity.
+        Raises RuntimeError before any writes if the incoming tokens would cause any
+        slot to exceed the static mosrah_cache_length capacity.
 
         Args:
             key_states: Shape (B, L, T, u) — post-RoPE key vectors in expert-choice layout.
@@ -122,17 +123,19 @@ class SlowMoSRAHCache(CacheLayerMixin):
 
         Returns:
             Tuple of (keys, values, active_mask):
-              keys: (B, L, T, u) float — full key buffer including junk slots.
-              values: (B, L, T, u) float — full value buffer including junk slots.
-              active_mask: (B, L, T) bool — True iff slot (b, l, t) has been written.
+              keys: (B, L, mosrah_cache_length, u) float — full key buffer including junk slots.
+              values: (B, L, mosrah_cache_length, u) float — full value buffer including junk slots.
+              active_mask: (B, L, mosrah_cache_length) bool — True iff slot t has been written.
         """
         B, L, T = active_mask.shape
 
-        # Expansion check uses the total active tokens per slot, same as the
-        # vectorized implementation, so both expand under identical conditions.
         incoming_delta = active_mask.long().sum(dim=2)  # (B, L)
-        if (self._counts + incoming_delta).max().item() > self.buffer_capacity:
-            self._expand()
+        if (self._counts + incoming_delta).max().item() > self.mosrah_cache_length:
+            raise RuntimeError(
+                f"SlowMoSRAHCache overflow: a (batch, head) slot would exceed the "
+                f"static buffer capacity of {self.mosrah_cache_length}. Increase "
+                f"mosrah_overallocation_factor in ShramConfig."
+            )
 
         # Write each active position into the next available slot for its (batch, head)
         # pair. Iterating t from 0 to T-1 preserves causal ordering within each slot.
@@ -297,25 +300,3 @@ class SlowMoSRAHCache(CacheLayerMixin):
             < self._counts.unsqueeze(-1)
         )
 
-    def _expand(self) -> None:
-        """Double the buffer capacity, preserving existing data.
-
-        Called by update() when an incoming batch of tokens would cause any
-        (batch, head) slot to exceed the current buffer capacity. All existing
-        key and value data is copied into the low half of the new buffer; the
-        high half is zero-initialised and will be filled by subsequent writes.
-        After reassignment, buffer_capacity reflects the new size automatically.
-        """
-        old_cap = self.buffer_capacity
-        new_cap = old_cap * 2
-        dev = self.keys.device
-        new_keys = torch.zeros(
-            self.batch_size, self.num_mosrah_heads, new_cap, self.head_dim, device=dev
-        )
-        new_values = torch.zeros(
-            self.batch_size, self.num_mosrah_heads, new_cap, self.head_dim, device=dev
-        )
-        new_keys[:, :, :old_cap, :] = self.keys
-        new_values[:, :, :old_cap, :] = self.values
-        self.keys = new_keys
-        self.values = new_values

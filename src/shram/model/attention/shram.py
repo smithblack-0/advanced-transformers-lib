@@ -64,19 +64,6 @@ class SHRAMHybridLayer(nn.Module):
             max_vio: Detached scalar routing-imbalance summary. Passed through
                 unchanged from MoSRAHLayer; see MoSRAHRouter for semantics.
         """
-        # ------------------------------------------------
-        # It is not possible, due to how bea constructs its block mask,
-        # for the model to process a sequence that does not start at zero
-        # without a cache to track the per-head offsets
-        # ------------------------------------------------
-
-        if cache is None and torch.any(position_ids[:, 0] != 0):
-            raise ValueError(
-                "Uncached SHRAMHybridLayer does not support nonzero starting positions. "
-                "Either provide a matching ShramLayerCache populated by the prefix for "
-                "continued decoding, or rebase the uncached sequence to start at 0."
-            )
-
         # -------------------------------------------------------------------
         # The hybrid layer's first responsibility is cache dispatch. The layer
         # cache already owns the concrete sub-cache objects required by each

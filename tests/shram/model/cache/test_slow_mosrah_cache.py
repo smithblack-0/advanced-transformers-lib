@@ -28,7 +28,7 @@ Invariants verified in this file:
 - update() accumulates across calls: second call writes after first call's data
 - update() is sparse: inactive positions (mask False) are not written
 - update() is batch-independent: different batch items accumulate without cross-contamination
-- update() triggers buffer expansion when any slot would overflow; existing data preserved
+- update() raises RuntimeError when any slot would overflow mosrah_cache_length
 - update() returns (keys, values, active_mask) with correct shapes and dtypes
 - returned active_mask is True exactly for slots that have been written
 - update() roundtrip: keys and values written are retrievable in the returned tuple
@@ -48,19 +48,19 @@ from src.shram.model.cache.slow_mosrah_cache import SlowMoSRAHCache
 NUM_HEADS = 4
 HEAD_DIM = 4   # small so expected values are easy to read in assertions
 BATCH = 2
-INITIAL_BUFFER_SIZE = 8
+CACHE_LENGTH = 16
 
 
 def make_cache(
     batch: int = BATCH,
-    initial_buffer_size: int = INITIAL_BUFFER_SIZE,
+    cache_length: int = CACHE_LENGTH,
 ) -> SlowMoSRAHCache:
     return SlowMoSRAHCache(
         num_mosrah_heads=NUM_HEADS,
         head_dim=HEAD_DIM,
         batch_size=batch,
         device=torch.device("cpu"),
-        initial_buffer_size=initial_buffer_size,
+        mosrah_cache_length=cache_length,
     )
 
 
@@ -126,8 +126,8 @@ def test_get_mask_sizes_raises():
 def test_buffer_shapes_at_construction():
     """Key and value buffers have shape (B, L, T, u); counts have shape (B, L)."""
     cache = make_cache()
-    assert cache.keys.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
-    assert cache.values.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
+    assert cache.keys.shape == (BATCH, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
+    assert cache.values.shape == (BATCH, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
     assert cache.get_heads_lengths().shape == (BATCH, NUM_HEADS)
 
 
@@ -140,7 +140,7 @@ def test_counts_zero_at_construction():
 def test_buffer_capacity_at_construction():
     """buffer_capacity reflects the initial allocated slot count."""
     cache = make_cache()
-    assert cache.buffer_capacity == INITIAL_BUFFER_SIZE
+    assert cache.buffer_capacity == CACHE_LENGTH
 
 
 # ---------------------------------------------------------------------------
@@ -534,47 +534,18 @@ def test_update_batch_items_accumulate_independently():
     assert torch.equal(cache.keys[1, 1, 0, :], key_states[1, 1, 0, :])
 
 
-def test_update_expansion_triggers_on_overflow():
-    """buffer_capacity doubles when any slot would overflow."""
-    cache = make_cache(batch=1, initial_buffer_size=2)
-    assert cache.buffer_capacity == 2
-
-    B, L = 1, NUM_HEADS
-    mask = torch.zeros(B, L, 2, dtype=torch.bool)
+def test_update_overflow_raises():
+    """update() raises RuntimeError when any slot would exceed mosrah_cache_length."""
+    B, L, T = 1, NUM_HEADS, 2
+    cache = make_cache(batch=B, cache_length=2)
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
     mask[0, 0, :] = True  # fill head 0 to capacity
+    cache.update(torch.ones(B, L, T, HEAD_DIM), torch.ones(B, L, T, HEAD_DIM), mask)
 
-    cache.update(torch.ones(B, L, 2, HEAD_DIM), torch.ones(B, L, 2, HEAD_DIM), mask)
-    assert cache.buffer_capacity == 2
-
-    # One more token to the same head triggers expansion.
     mask2 = torch.zeros(B, L, 1, dtype=torch.bool)
     mask2[0, 0, 0] = True
-    cache.update(torch.ones(B, L, 1, HEAD_DIM), torch.ones(B, L, 1, HEAD_DIM), mask2)
-    assert cache.buffer_capacity == 4
-
-
-def test_update_expansion_preserves_existing_data():
-    """Existing tokens are intact after buffer expansion."""
-    cache = make_cache(batch=1, initial_buffer_size=2)
-    B, L = 1, NUM_HEADS
-
-    key_first = torch.zeros(B, L, 2, HEAD_DIM)
-    key_first[0, 0, 0, :] = 1.0
-    key_first[0, 0, 1, :] = 2.0
-    mask = torch.zeros(B, L, 2, dtype=torch.bool)
-    mask[0, 0, :] = True
-
-    cache.update(key_first, torch.zeros(B, L, 2, HEAD_DIM), mask)
-
-    key_third = torch.full((B, L, 1, HEAD_DIM), 3.0)
-    mask2 = torch.zeros(B, L, 1, dtype=torch.bool)
-    mask2[0, 0, 0] = True
-    cache.update(key_third, torch.zeros(B, L, 1, HEAD_DIM), mask2)
-
-    assert torch.equal(cache.keys[0, 0, 0, :], key_first[0, 0, 0, :])
-    assert torch.equal(cache.keys[0, 0, 1, :], key_first[0, 0, 1, :])
-    assert torch.equal(cache.keys[0, 0, 2, :], key_third[0, 0, 0, :])
-    assert cache.get_heads_lengths()[0, 0].item() == 3
+    with pytest.raises(RuntimeError):
+        cache.update(torch.ones(B, L, 1, HEAD_DIM), torch.ones(B, L, 1, HEAD_DIM), mask2)
 
 
 # ---------------------------------------------------------------------------
@@ -599,9 +570,9 @@ def test_update_returns_correct_shapes():
     keys_out, vals_out, active_mask = cache.update(
         torch.zeros(B, L, T, HEAD_DIM), torch.zeros(B, L, T, HEAD_DIM), mask
     )
-    assert keys_out.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
-    assert vals_out.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
-    assert active_mask.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE)
+    assert keys_out.shape == (BATCH, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
+    assert vals_out.shape == (BATCH, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
+    assert active_mask.shape == (BATCH, NUM_HEADS, CACHE_LENGTH)
 
 
 def test_update_returns_bool_active_mask():

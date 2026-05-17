@@ -40,6 +40,7 @@ class MoSRAHLayer(nn.Module):
     def __init__(self, config: ShramConfig) -> None:
         super().__init__()
         self.num_experts = config.num_mosrah_heads
+        self.packed_length = config.mosrah_packed_length
 
         self.router = MoSRAHRouter(config)
         self.positions = SparseMoSRAHPositions(config)
@@ -91,18 +92,16 @@ class MoSRAHLayer(nn.Module):
             hidden_states, active_mask
         )
 
-        flattened_selected_heads, permutation, inverse_permutation = setup_packing(
-            selected_heads
-        )
-        packed_hidden_states, packed_positions, unpacking_mask, active_mask = pack_experts(
-            hidden_states=hidden_states,
-            position_ids=position_ids,
-            selected_heads=selected_heads,
-            num_experts=self.num_experts,
-            flattened_selected_heads=flattened_selected_heads,
-            permutation=permutation,
-            outer_active_mask=active_mask,
-        )
+        setup = setup_packing(selected_heads)
+        entries = {
+            "hidden_states": (hidden_states, 0.0),
+            "position_ids": (position_ids, 0),
+            "active_mask": (active_mask, False),
+        }
+        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, self.num_experts, self.packed_length)
+        packed_hidden_states = packed["hidden_states"]
+        packed_positions = packed["position_ids"]
+        active_mask = packed["active_mask"]
 
         # -------------------------------------------------------------------
         # Sparse attention runs entirely in the packed expert-choice frame, so
@@ -114,6 +113,7 @@ class MoSRAHLayer(nn.Module):
         # -------------------------------------------------------------------
         bea_positions = self.positions(
             packed_positions=packed_positions,
+            active_mask=active_mask,
             cache=cache,
         )
         packed_outputs = self.bea(
@@ -133,9 +133,9 @@ class MoSRAHLayer(nn.Module):
         # -------------------------------------------------------------------
         token_choice_outputs = unpack_experts(
             expert_outputs=packed_outputs,
-            selected_heads=selected_heads,
+            setup=setup,
             unpacking_mask=unpacking_mask,
-            inverse_permutation=inverse_permutation,
+            selected_heads=selected_heads,
         )
         final_output = (
             token_choice_outputs * routing_probs.unsqueeze(-1)

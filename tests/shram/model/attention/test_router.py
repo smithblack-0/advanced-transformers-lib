@@ -32,17 +32,48 @@ def small_config(**kwargs) -> ShramConfig:
     """Small config valid for router tests. num_selected_heads < num_mosrah_heads
     so TopK is genuinely sparse."""
     defaults = dict(
-        hidden_size=64,
+        embedding_width=64,
         num_mosrah_heads=8,
         num_selected_heads=4,
         head_dim=16,
         num_sliding_window_heads=4,
         window_size=16,
-        intermediate_size=128,
-        num_hidden_layers=2,
+        mlp_width=128,
+        num_decoder_layers=2,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
+
+
+def _reference_routing_freqs(
+    selected_heads: torch.Tensor,
+    num_heads: int,
+    p: float,
+) -> torch.Tensor:
+    """Reference p-mean routing frequencies with no masking.
+
+    Counts every token unconditionally, divides by N*K per batch item, then
+    applies p-mean over the batch dimension. Trivially correct by inspection;
+    used to verify the production masked path degenerates correctly when all
+    tokens are live.
+
+    Args:
+        selected_heads: Head indices of shape (B, N, K).
+        num_heads: Total number of heads L.
+        p: p-mean exponent.
+
+    Returns:
+        p-mean aggregated routing frequencies of shape (L,).
+    """
+    B, N, K = selected_heads.shape
+    per_item_freqs = torch.zeros(B, num_heads)
+    for b in range(B):
+        counts = torch.zeros(num_heads)
+        for n in range(N):
+            for k in range(K):
+                counts[selected_heads[b, n, k]] += 1
+        per_item_freqs[b] = counts / (N * K)
+    return (per_item_freqs ** p).mean(dim=0) ** (1.0 / p)
 
 
 # ---------------------------------------------------------------------------
@@ -360,11 +391,11 @@ class TestMaskedContinuationBehavior:
         active_mask[0, 3] = False
 
         torch.manual_seed(11)
-        x = torch.randn(B, N, config.hidden_size)
+        x = torch.randn(B, N, config.embedding_width)
         _, _, loss_a, _ = router(x, active_mask)
 
         x_modified = x.clone()
-        x_modified[0, 3] = torch.randn(config.hidden_size) * 100.0
+        x_modified[0, 3] = torch.randn(config.embedding_width) * 100.0
         _, _, loss_b, _ = router(x_modified, active_mask)
 
         torch.testing.assert_close(loss_a, loss_b)
@@ -378,39 +409,34 @@ class TestMaskedContinuationBehavior:
         active_mask[1, 5] = False
 
         torch.manual_seed(17)
-        x = torch.randn(B, N, config.hidden_size)
+        x = torch.randn(B, N, config.embedding_width)
         _, _, _, vio_a = router(x, active_mask)
 
         x_modified = x.clone()
-        x_modified[1, 5] = torch.randn(config.hidden_size) * 100.0
+        x_modified[1, 5] = torch.randn(config.embedding_width) * 100.0
         _, _, _, vio_b = router(x_modified, active_mask)
 
         torch.testing.assert_close(vio_a, vio_b)
 
     def test_all_live_mask_gives_routing_freqs_equivalent_to_pre_masking_formula(self):
-        """With all tokens live, routing_freqs must equal assignment.sum() / (B*N*K).
+        """With all tokens live, max_vio must match the no-masking reference implementation.
 
-        Verified by independently computing the old-style (pre-masking) routing
-        frequencies from the returned selected_heads and confirming max_vio matches.
-        This ensures the all-live path through the masked formula is numerically
-        equivalent to the original unmasked computation.
+        Uses _reference_routing_freqs — a trivially correct no-masking stub — as an
+        independent oracle. Agreement confirms the masked production path degenerates
+        correctly to the simple all-live case.
         """
         config = small_config()
         router = MoSRAHRouter(config)
         B, N = 2, 8
-        K = config.num_selected_heads
         L = config.num_mosrah_heads
         active_mask = torch.ones(B, N, dtype=torch.bool)
 
         torch.manual_seed(13)
-        x = torch.randn(B, N, config.hidden_size)
+        x = torch.randn(B, N, config.embedding_width)
 
         with torch.no_grad():
             selected_heads, _, _, max_vio = router(x, active_mask)
-
-            assignment_mask = torch.zeros(B, N, L)
-            assignment_mask.scatter_(-1, selected_heads, 1.0)
-            expected_freqs = assignment_mask.sum(dim=(0, 1)) / (B * N * K)
+            expected_freqs = _reference_routing_freqs(selected_heads, L, config.load_balance_p)
             expected_max_vio = MoSRAHRouter._compute_max_vio(expected_freqs, L)
 
         torch.testing.assert_close(max_vio, expected_max_vio)

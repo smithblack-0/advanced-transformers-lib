@@ -11,6 +11,8 @@ parameters directly and constructs its own RotaryEmbedding instance explicitly â
 HuggingFace rope infrastructure is used. See Unit 5.A design decisions in plan.md.
 """
 
+import math
+
 from transformers import PretrainedConfig
 
 
@@ -77,6 +79,15 @@ class ShramConfig(PretrainedConfig):
         use_cache: Whether to return past_key_values for KV caching.
         output_hidden_states: Whether to return hidden states after each layer.
         tie_word_embeddings: Whether input embedding and LM head share weights.
+        mosrah_overallocation_factor: Overallocation multiplier for the expert packing
+            buffer. ``mosrah_packed_length`` = ceil(training_sequence_length *
+            num_selected_heads / num_mosrah_heads * mosrah_overallocation_factor).
+            Must be > 1.0 to guarantee a buffer larger than the balanced-routing
+            baseline. Default 2.0.
+        load_balance_p: Exponent p for the p-mean aggregation of per-item routing
+            frequencies into the load balance signal. Higher p weights aggregation
+            toward the worst-case batch item, making the correction signal more
+            sensitive to per-item allocation spikes. Must be positive. Default 2.0.
     """
 
     model_type = "shram"
@@ -109,7 +120,9 @@ class ShramConfig(PretrainedConfig):
         use_cache: bool = True,
         output_hidden_states: bool = False,
         tie_word_embeddings: bool = False,
-        **kwargs,
+        mosrah_overallocation_factor: float = 2.0,
+        load_balance_p: float = 2.0,
+        **kwargs
     ):
         if head_dim % 2 != 0:
             raise ValueError(
@@ -137,10 +150,22 @@ class ShramConfig(PretrainedConfig):
                 f"got {inference_sequence_length}."
             )
 
+        if mosrah_overallocation_factor <= 1.0:
+            raise ValueError(
+                f"mosrah_overallocation_factor must be > 1.0 to guarantee a packed "
+                f"buffer larger than the balanced-routing baseline. "
+                f"Got {mosrah_overallocation_factor}."
+            )
+
+        if load_balance_p <= 0.0:
+            raise ValueError(
+                f"load_balance_p must be positive, got {load_balance_p}."
+            )
+
         self.vocab_size = vocab_size
-        self.hidden_size = embedding_width
-        self.intermediate_size = mlp_width
-        self.num_hidden_layers = num_decoder_layers
+        self.embedding_width = embedding_width
+        self.mlp_width = mlp_width
+        self.num_decoder_layers = num_decoder_layers
         self.num_sliding_window_heads = num_sliding_window_heads
         self.num_mosrah_heads = num_mosrah_heads
         self.num_selected_heads = num_selected_heads
@@ -154,13 +179,15 @@ class ShramConfig(PretrainedConfig):
         self.inference_sequence_length = inference_sequence_length
         self.alpha = alpha
         self.beta = beta
+        self.mosrah_overallocation_factor = mosrah_overallocation_factor
+        self.load_balance_p = load_balance_p
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             output_hidden_states=output_hidden_states,
-            **kwargs,
+            **kwargs
         )
 
         # Promote auto_map to an instance attribute so PretrainedConfig.to_dict()
@@ -175,4 +202,48 @@ class ShramConfig(PretrainedConfig):
         adjustments cancel and A_rope = 1. This is the default state.
         """
         return self.inference_sequence_length / self.training_sequence_length
+
+    @property
+    def mosrah_packed_length(self) -> int:
+        """Static packed time dimension T for expert packing.
+
+        The expected tokens per expert under perfectly balanced routing is
+        ``training_sequence_length * num_selected_heads / num_mosrah_heads``.
+        Multiplying by ``mosrah_overallocation_factor`` provides a buffer above
+        that baseline. The ceiling ensures T is always an integer >= 1.
+
+        All consumers of the packed buffer size must read this property rather
+        than deriving T independently.
+        """
+        return math.ceil(
+            self.training_sequence_length
+            * self.num_selected_heads
+            / self.num_mosrah_heads
+            * self.mosrah_overallocation_factor
+        )
+
+    @property
+    def mosrah_cache_length(self) -> int:
+        """Static per-(batch, head) slot capacity for the MoSRAH inference cache.
+
+        The expected tokens per expert over the full inference context under perfectly
+        balanced routing is ``inference_sequence_length * num_selected_heads /
+        num_mosrah_heads``. Multiplying by ``mosrah_overallocation_factor`` provides
+        a buffer above that baseline. The ceiling ensures the result is always an
+        integer >= 1.
+
+        Distinct from ``mosrah_packed_length``, which sizes the training packing buffer
+        using ``training_sequence_length``. This property uses
+        ``inference_sequence_length`` because the cache must hold the full accumulated
+        token history across the entire inference run.
+
+        All consumers of the MoSRAH cache buffer size must read this property rather
+        than deriving the capacity independently.
+        """
+        return math.ceil(
+            self.inference_sequence_length
+            * self.num_selected_heads
+            / self.num_mosrah_heads
+            * self.mosrah_overallocation_factor
+        )
 

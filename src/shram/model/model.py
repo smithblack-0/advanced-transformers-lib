@@ -58,9 +58,9 @@ class ShramModel(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [DecoderLayer(config) for _ in range(config.num_decoder_layers)]
         )
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.embedding_width, eps=config.rms_norm_eps)
 
     def num_mosrah_parameters(self) -> int:
         """Return the total number of trainable MoSRAH parameters across all decoder layers."""

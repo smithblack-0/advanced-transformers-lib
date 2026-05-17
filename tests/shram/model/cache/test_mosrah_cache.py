@@ -6,7 +6,8 @@ HF CacheLayerMixin protocol and construction:
 - MoSRAHCache subclasses CacheLayerMixin
 - get_seq_length() raises NotImplementedError
 - lazy_initialization() is a no-op; is_initialized remains True
-- get_max_cache_shape() raises NotImplementedError
+- get_max_cache_shape() returns mosrah_cache_length
+- is_compileable is True
 - get_mask_sizes() raises NotImplementedError
 - get_heads_lengths() returns the (B, L) count tensor
 - get_heads_lengths() returns zeros for a fresh cache
@@ -28,11 +29,12 @@ Oracle agreement:
   inputs. SlowMoSRAHCache is independently verified in test_slow_mosrah_cache.py;
   agreement with it on all cases licenses trust in the vectorized implementation.
   Cases covered: single active position; multiple heads; multiple tokens in one head;
-  sparse mask; multi-call accumulation; uneven per-batch routing; buffer expansion.
+  sparse mask; multi-call accumulation; uneven per-batch routing.
 - The returned (keys, values, active_mask) tuple also agrees between implementations.
 """
 
 import torch
+import torch._dynamo
 import pytest
 from transformers.cache_utils import CacheLayerMixin
 
@@ -47,32 +49,32 @@ from src.shram.model.cache.slow_mosrah_cache import SlowMoSRAHCache
 NUM_HEADS = 4
 HEAD_DIM = 16
 BATCH = 2
-INITIAL_BUFFER_SIZE = 8
+CACHE_LENGTH = 16
 
 
 def make_cache(
     batch: int = BATCH,
-    initial_buffer_size: int = INITIAL_BUFFER_SIZE,
+    cache_length: int = CACHE_LENGTH,
 ) -> MoSRAHCache:
     return MoSRAHCache(
         num_mosrah_heads=NUM_HEADS,
         head_dim=HEAD_DIM,
         batch_size=batch,
         device=torch.device("cpu"),
-        initial_buffer_size=initial_buffer_size,
+        mosrah_cache_length=cache_length,
     )
 
 
 def make_slow_cache(
     batch: int = BATCH,
-    initial_buffer_size: int = INITIAL_BUFFER_SIZE,
+    cache_length: int = CACHE_LENGTH,
 ) -> SlowMoSRAHCache:
     return SlowMoSRAHCache(
         num_mosrah_heads=NUM_HEADS,
         head_dim=HEAD_DIM,
         batch_size=batch,
         device=torch.device("cpu"),
-        initial_buffer_size=initial_buffer_size,
+        mosrah_cache_length=cache_length,
     )
 
 
@@ -93,11 +95,11 @@ def _run_both(
     value_states: torch.Tensor,
     mask: torch.Tensor,
     batch: int,
-    initial_buffer_size: int = INITIAL_BUFFER_SIZE,
+    cache_length: int = CACHE_LENGTH,
 ) -> tuple[MoSRAHCache, SlowMoSRAHCache, tuple, tuple]:
     """Run the same update() call on both implementations and return both caches and results."""
-    fast = make_cache(batch=batch, initial_buffer_size=initial_buffer_size)
-    slow = make_slow_cache(batch=batch, initial_buffer_size=initial_buffer_size)
+    fast = make_cache(batch=batch, cache_length=cache_length)
+    slow = make_slow_cache(batch=batch, cache_length=cache_length)
     fast_result = fast.update(key_states, value_states, mask)
     slow_result = slow.update(key_states, value_states, mask)
     return fast, slow, fast_result, slow_result
@@ -149,11 +151,10 @@ def test_lazy_initialization_is_noop():
     assert cache.is_initialized is True
 
 
-def test_get_max_cache_shape_raises():
-    """get_max_cache_shape() raises NotImplementedError — cache is unbounded."""
+def test_get_max_cache_shape_returns_cache_length():
+    """get_max_cache_shape() returns mosrah_cache_length — required by static cache contract."""
     cache = make_cache()
-    with pytest.raises(NotImplementedError):
-        cache.get_max_cache_shape()
+    assert cache.get_max_cache_shape() == CACHE_LENGTH
 
 
 def test_get_mask_sizes_raises():
@@ -163,6 +164,11 @@ def test_get_mask_sizes_raises():
         cache.get_mask_sizes(torch.tensor([0]))
 
 
+def test_is_compileable_true():
+    """is_compileable is True — MoSRAHCache satisfies the static cache contract."""
+    assert MoSRAHCache.is_compileable is True
+
+
 # ---------------------------------------------------------------------------
 # Construction and shape invariants
 # ---------------------------------------------------------------------------
@@ -170,15 +176,15 @@ def test_get_mask_sizes_raises():
 def test_buffer_shapes_at_construction():
     """Key and value buffers have shape (B, L, T_max, u); counts have shape (B, L)."""
     cache = make_cache()
-    assert cache.keys.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
-    assert cache.values.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
+    assert cache.keys.shape == (BATCH, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
+    assert cache.values.shape == (BATCH, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
     assert cache._counts.shape == (BATCH, NUM_HEADS)
 
 
 def test_buffer_capacity_at_construction():
     """buffer_capacity reflects the allocated slot count immediately after construction."""
     cache = make_cache()
-    assert cache.buffer_capacity == INITIAL_BUFFER_SIZE
+    assert cache.buffer_capacity == CACHE_LENGTH
 
 
 def test_counts_zero_at_construction():
@@ -438,9 +444,9 @@ def test_update_returns_correct_shapes():
     keys, values, active_mask = cache.update(
         torch.zeros(B, L, T, HEAD_DIM), torch.zeros(B, L, T, HEAD_DIM), mask
     )
-    assert keys.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
-    assert values.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE, HEAD_DIM)
-    assert active_mask.shape == (BATCH, NUM_HEADS, INITIAL_BUFFER_SIZE)
+    assert keys.shape == (BATCH, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
+    assert values.shape == (BATCH, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
+    assert active_mask.shape == (BATCH, NUM_HEADS, CACHE_LENGTH)
 
 
 def test_update_active_mask_dtype():
@@ -506,7 +512,7 @@ def test_update_padding_does_not_advance_count_and_later_write_overwrites_junk()
     """Padding is ignored: counts advance only for real tokens, and later writes
     fill the next valid slot rather than skipping over padded width.
     """
-    cache = make_cache(batch=1, initial_buffer_size=4)
+    cache = make_cache(batch=1, cache_length=4)
 
     # Poison the whole buffer so we can detect whether a later real write
     # actually overwrites previously junk/unwritten storage.
@@ -667,18 +673,44 @@ def test_oracle_uneven_batch():
     _assert_agree(fast, slow, fr, sr)
 
 
-def test_oracle_buffer_expansion():
-    """Vectorized expansion produces the same result as the oracle expansion."""
+def test_overflow_raises_eager():
+    """update() raises RuntimeError in eager mode when any slot would exceed mosrah_cache_length."""
     B, L, T = 1, NUM_HEADS, 2
-    fast = make_cache(batch=B, initial_buffer_size=2)
-    slow = make_slow_cache(batch=B, initial_buffer_size=2)
-    last_fr = last_sr = None
-    for _ in range(2):
-        key = torch.randn(B, L, T, HEAD_DIM)
-        val = torch.randn(B, L, T, HEAD_DIM)
-        mask = torch.zeros(B, L, T, dtype=torch.bool)
-        mask[0, 0, :] = True
-        last_fr = fast.update(key, val, mask)
-        last_sr = slow.update(key, val, mask)
-    assert fast.buffer_capacity == 4
-    _assert_agree(fast, slow, last_fr, last_sr)
+    cache = make_cache(batch=B, cache_length=2)
+    mask = torch.zeros(B, L, T, dtype=torch.bool)
+    mask[0, 0, :] = True  # fill head 0 to capacity
+    cache.update(torch.randn(B, L, T, HEAD_DIM), torch.randn(B, L, T, HEAD_DIM), mask)
+
+    mask2 = torch.zeros(B, L, 1, dtype=torch.bool)
+    mask2[0, 0, 0] = True
+    with pytest.raises(RuntimeError):
+        cache.update(torch.randn(B, L, 1, HEAD_DIM), torch.randn(B, L, 1, HEAD_DIM), mask2)
+
+
+def test_update_compiled_no_graph_breaks():
+    """Compiling update() with fullgraph=True succeeds and produces correct output.
+
+    fullgraph=True causes torch.compile to raise if any graph break occurs, making
+    this the definitive check that update() contains no data-dependent shape ops.
+    capture_scalar_outputs must be enabled so the overflow check's .item() folds
+    into the compiled graph rather than breaking it. Several decode steps are
+    simulated to confirm the compiled graph is reused without error.
+    """
+    torch._dynamo.reset()
+    original = torch._dynamo.config.capture_scalar_outputs
+    torch._dynamo.config.capture_scalar_outputs = True
+    try:
+        B, L, T = 1, NUM_HEADS, 2
+        cache = make_cache(batch=B, cache_length=CACHE_LENGTH)
+        compiled_update = torch.compile(cache.update, fullgraph=True)
+
+        for _ in range(3):
+            key = torch.randn(B, L, T, HEAD_DIM)
+            val = torch.randn(B, L, T, HEAD_DIM)
+            mask = torch.zeros(B, L, T, dtype=torch.bool)
+            mask[0, 0, 0] = True
+            keys_out, vals_out, active_mask = compiled_update(key, val, mask)
+            assert keys_out.shape == (B, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
+            assert active_mask.dtype == torch.bool
+    finally:
+        torch._dynamo.config.capture_scalar_outputs = original

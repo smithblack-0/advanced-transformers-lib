@@ -21,6 +21,7 @@ quantity HuggingFace generation reads through get_seq_length().
 import torch
 from transformers.cache_utils import CacheLayerMixin
 
+from ..configuration import ShramConfig
 from .mosrah_cache import MoSRAHCache
 from .sliding_window_cache import LocalSlidingWindowLayerCache
 
@@ -40,46 +41,36 @@ class ShramLayerCache(CacheLayerMixin):
     tracks the cumulative count of token positions processed across all update() calls.
 
     Args:
-        sliding_window: Number of tokens retained by the local sliding-window cache.
-        num_local_heads: Number of local attention heads.
-        local_head_dim: Per-head embedding width for the local path.
-        num_mosrah_heads: Total number of MoSRAH expert heads (L).
-        mosrah_head_dim: Bottlenecked head embedding width (u) for the MoSRAH path.
+        config: ShramConfig instance. All sub-cache dimensions and capacities are derived
+            from config so that a single source of truth governs every buffer size.
         batch_size: Number of sequences in the batch.
         device: Device on which to allocate cache tensors.
-        initial_buffer_size: Initial per-(batch, head) capacity for MoSRAHCache. Doubled
-            when any slot overflows. Defaults to 64 to avoid repeated reallocation during
-            prompt processing.
     """
 
-    is_compileable = False
+    is_compileable = True
     is_sliding = False
 
     def __init__(
         self,
-        sliding_window: int,
-        num_local_heads: int,
-        local_head_dim: int,
-        num_mosrah_heads: int,
-        mosrah_head_dim: int,
+        config: ShramConfig,
         batch_size: int,
         device: torch.device,
-        initial_buffer_size: int = 64,
     ) -> None:
         super().__init__()
+        self._inference_sequence_length = config.inference_sequence_length
         self.sliding_window_cache = LocalSlidingWindowLayerCache(
-            sliding_window=sliding_window,
-            num_heads=num_local_heads,
-            head_dim=local_head_dim,
+            sliding_window=config.window_size,
+            num_heads=config.num_sliding_window_heads,
+            head_dim=config.head_dim,
             batch_size=batch_size,
             device=device,
         )
         self.mosrah_cache = MoSRAHCache(
-            num_mosrah_heads=num_mosrah_heads,
-            head_dim=mosrah_head_dim,
+            num_mosrah_heads=config.num_mosrah_heads,
+            head_dim=config.head_dim,
             batch_size=batch_size,
             device=device,
-            initial_buffer_size=initial_buffer_size,
+            mosrah_cache_length=config.mosrah_cache_length,
         )
 
     # ---------------------------------------------------------------------------
@@ -208,26 +199,23 @@ class ShramLayerCache(CacheLayerMixin):
         )
 
     def get_max_cache_shape(self) -> int:  # type: ignore[override]
-        """Not supported — the composite cache has no single maximum shape.
+        """Return the maximum sequence length this layer cache can serve.
 
-        The sliding-window cache is bounded by sliding_window; the MoSRAH cache is
-        unbounded. No truthful scalar maximum represents the composite.
+        The authoritative upper bound is ``config.inference_sequence_length``, which
+        governs the full accumulated token history the model is configured to handle.
+        HuggingFace's static-cache machinery reads this value to determine whether the
+        cache is compileable and to size generation loops.
         """
-        raise NotImplementedError(
-            "ShramLayerCache has no single maximum cache shape. "
-            "Query sliding_window_cache or mosrah_cache directly."
-        )
+        return self._inference_sequence_length
 
     def get_mask_sizes(  # type: ignore[override]
         self,
         cache_position: torch.Tensor,
     ) -> tuple[int, int]:
-        """Not supported — ShramLayerCache does not participate in HF mask construction.
+        """Return the KV dimensions for HuggingFace causal mask construction.
 
-        The two sub-caches have different mask semantics and their respective attention
-        paths handle masking directly.
+        Returns (inference_sequence_length, 0): the full static cache capacity as
+        kv_length and zero offset. HuggingFace reads these values to size the causal
+        attention mask when is_compileable is True.
         """
-        raise NotImplementedError(
-            "ShramLayerCache does not support get_mask_sizes(). "
-            "Query sliding_window_cache or mosrah_cache directly."
-        )
+        return self._inference_sequence_length, 0

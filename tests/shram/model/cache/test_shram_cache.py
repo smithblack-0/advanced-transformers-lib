@@ -1,22 +1,23 @@
-"""Tests for ShramCache — Unit 6.C / Unit 14.D.
+"""Tests for ShramCache — Unit 6.C / Unit 14.D / Unit 19.G.4.
 
 Invariants verified in this file:
 
 HF Cache protocol and construction:
 - ShramCache subclasses Cache
+- is_compileable is True
 - ShramCache owns exactly one ShramLayerCache per decoder layer
 - All owned layer caches are ShramLayerCache instances
 - is_initialized is True immediately after construction
 - update() raises NotImplementedError — no composite update interface
-- get_seq_length() raises NotImplementedError — no scalar sequence length available
+- get_seq_length() delegates to layer 0's local path — cumulative token count
 - crop() raises NotImplementedError
 - max_batch_size raises NotImplementedError
-- max_cache_len raises NotImplementedError
+- max_cache_len returns config.inference_sequence_length
 
 Composite behaviors:
 - reset() clears all layer caches through the ShramCache boundary
 - reorder_cache() permutes all layer caches consistently through the ShramCache boundary
-- len(cache) == num_hidden_layers
+- len(cache) == num_decoder_layers
 """
 
 import torch
@@ -25,6 +26,7 @@ from transformers.cache_utils import Cache
 
 from src.shram.model.cache.shram_cache import ShramCache
 from src.shram.model.cache.shram_layer_cache import ShramLayerCache
+from src.shram.model.configuration import ShramConfig
 
 
 # ---------------------------------------------------------------------------
@@ -33,33 +35,40 @@ from src.shram.model.cache.shram_layer_cache import ShramLayerCache
 
 NUM_LAYERS = 3
 SLIDING_WINDOW = 16
-NUM_MOSRAH_HEADS = 4
-MOSRAH_HEAD_DIM = 8
-BATCH = 2
-INITIAL_BUFFER_SIZE = 8
-
 LOCAL_HEADS = 3
-LOCAL_HEAD_DIM = 8
+NUM_MOSRAH_HEADS = 4
+NUM_SELECTED_HEADS = 2
+HEAD_DIM = 8
+TRAINING_SEQ_LEN = 64
+INFERENCE_SEQ_LEN = 64
+BATCH = 2
+
+
+def make_config(num_layers: int = NUM_LAYERS) -> ShramConfig:
+    return ShramConfig(
+        num_decoder_layers=num_layers,
+        window_size=SLIDING_WINDOW,
+        num_sliding_window_heads=LOCAL_HEADS,
+        num_mosrah_heads=NUM_MOSRAH_HEADS,
+        num_selected_heads=NUM_SELECTED_HEADS,
+        head_dim=HEAD_DIM,
+        training_sequence_length=TRAINING_SEQ_LEN,
+        inference_sequence_length=INFERENCE_SEQ_LEN,
+    )
 
 
 def make_cache(num_layers: int = NUM_LAYERS, batch: int = BATCH) -> ShramCache:
     return ShramCache(
-        num_hidden_layers=num_layers,
-        sliding_window=SLIDING_WINDOW,
-        num_local_heads=LOCAL_HEADS,
-        local_head_dim=LOCAL_HEAD_DIM,
-        num_mosrah_heads=NUM_MOSRAH_HEADS,
-        mosrah_head_dim=MOSRAH_HEAD_DIM,
+        config=make_config(num_layers=num_layers),
         batch_size=batch,
         device=torch.device("cpu"),
-        initial_buffer_size=INITIAL_BUFFER_SIZE,
     )
 
 
 def sw_update(layer_cache: ShramLayerCache, batch: int, num_tokens: int) -> None:
     """Drive a layer's sliding_window_cache.update() with all-active random data."""
-    k = torch.randn(batch, LOCAL_HEADS, num_tokens, LOCAL_HEAD_DIM)
-    v = torch.randn(batch, LOCAL_HEADS, num_tokens, LOCAL_HEAD_DIM)
+    k = torch.randn(batch, LOCAL_HEADS, num_tokens, HEAD_DIM)
+    v = torch.randn(batch, LOCAL_HEADS, num_tokens, HEAD_DIM)
     mask = torch.ones(batch, num_tokens, dtype=torch.bool)
     positions = torch.arange(num_tokens, dtype=torch.long).unsqueeze(0).expand(batch, -1)
     layer_cache.sliding_window_cache.update(k, v, mask, positions)
@@ -67,7 +76,7 @@ def sw_update(layer_cache: ShramLayerCache, batch: int, num_tokens: int) -> None
 
 def mosrah_update(layer_cache: ShramLayerCache, batch: int, num_tokens: int) -> None:
     """Drive a layer's mosrah_cache.update() with all-active mask."""
-    B, L, T, u = batch, NUM_MOSRAH_HEADS, num_tokens, MOSRAH_HEAD_DIM
+    B, L, T, u = batch, NUM_MOSRAH_HEADS, num_tokens, HEAD_DIM
     k = torch.randn(B, L, T, u)
     v = torch.randn(B, L, T, u)
     mask = torch.ones(B, L, T, dtype=torch.bool)
@@ -81,6 +90,11 @@ def mosrah_update(layer_cache: ShramLayerCache, batch: int, num_tokens: int) -> 
 def test_shram_cache_is_cache_subclass():
     """ShramCache satisfies the HuggingFace top-level Cache role."""
     assert issubclass(ShramCache, Cache)
+
+
+def test_is_compileable_true():
+    """is_compileable is True — ShramCache participates in the static cache contract."""
+    assert ShramCache.is_compileable is True
 
 
 def test_update_raises():
@@ -124,11 +138,10 @@ def test_max_batch_size_raises():
         _ = cache.max_batch_size
 
 
-def test_max_cache_len_raises():
-    """max_cache_len raises NotImplementedError — composite has no single maximum."""
+def test_max_cache_len_returns_inference_sequence_length():
+    """max_cache_len returns config.inference_sequence_length via layers[0].get_max_cache_shape()."""
     cache = make_cache()
-    with pytest.raises(NotImplementedError):
-        _ = cache.max_cache_len
+    assert cache.max_cache_len == INFERENCE_SEQ_LEN
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +149,7 @@ def test_max_cache_len_raises():
 # ---------------------------------------------------------------------------
 
 def test_len_equals_num_layers():
-    """len(cache) == num_hidden_layers."""
+    """len(cache) == num_decoder_layers."""
     cache = make_cache(num_layers=5)
     assert len(cache) == 5
 

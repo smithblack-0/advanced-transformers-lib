@@ -38,14 +38,14 @@ class BottleneckedEnsembleAttention(nn.Module):
 
     Args:
         config: SHRAM config. Must expose `hidden_size`, `num_mosrah_heads`,
-            `head_dim`, `mosrah_rope_theta`, `training_sequence_length`,
-            `inference_sequence_length`, `alpha`, and `beta`.
+            `head_dim`, `mosrah_rope_theta`, `inference_sequence_length`,
+            `scale`, `alpha`, and `beta`.
     """
 
     def __init__(self, config: ShramConfig) -> None:
         super().__init__()
 
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.embedding_width
         self.num_heads = config.num_mosrah_heads
         self.head_dim = config.head_dim
 
@@ -68,11 +68,22 @@ class BottleneckedEnsembleAttention(nn.Module):
         # BEA uses the YaRN-capable RoPE path. The caller supplies the position tensor;
         # this unit only consumes it. In training modes, dilation will be 1.0 and so
         # no yarn dilation occurs.
+        #
+        # The required table size depends on position semantics:
+        #   main_sequence    — positions are original token positions, bounded by
+        #                      inference_sequence_length.
+        #   semantic_sequence — positions are local per-expert slot indices, bounded
+        #                       by mosrah_packed_length.
+        maximum_rope_length = (
+            config.mosrah_packed_length
+            if config.rope_mode == "semantic_sequence"
+            else config.inference_sequence_length
+        )
         self.rope = RotaryEmbedding(
             mode="yarn",
             head_dim=self.head_dim,
             theta=config.mosrah_rope_theta,
-            initial_seq_length=config.training_sequence_length,
+            maximum_sequence_length=maximum_rope_length,
             dilation=config.scale,
             alpha=config.alpha,
             beta=config.beta,

@@ -17,14 +17,14 @@ from src.shram.model.configuration import ShramConfig
 def small_config(**kwargs) -> ShramConfig:
     """Return a config with small dimensions suitable for testing."""
     defaults = dict(
-        hidden_size=512,
+        embedding_width=512,
         num_sliding_window_heads=16,
         num_mosrah_heads=16,
         num_selected_heads=16,
         head_dim=16,
         window_size=128,
-        intermediate_size=1024,
-        num_hidden_layers=4,
+        mlp_width=1024,
+        num_decoder_layers=4,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
@@ -64,9 +64,9 @@ class TestParameterStorage:
         config = small_config(vocab_size=50000)
         assert config.vocab_size == 50000
 
-    def test_num_hidden_layers_stored(self):
-        config = small_config(num_hidden_layers=16)
-        assert config.num_hidden_layers == 16
+    def test_num_decoder_layers_stored(self):
+        config = small_config(num_decoder_layers=16)
+        assert config.num_decoder_layers == 16
 
     def test_num_sliding_window_heads_stored(self):
         config = small_config(num_sliding_window_heads=8)
@@ -289,13 +289,14 @@ class TestSerialisation:
             window_size=64,
             rope_mode="semantic_sequence",
             head_dim=16,
+            mosrah_overallocation_factor=1.3,
         )
         restored = ShramConfig.from_dict(original.to_dict())
 
         assert restored.vocab_size == original.vocab_size
-        assert restored.hidden_size == original.hidden_size
-        assert restored.intermediate_size == original.intermediate_size
-        assert restored.num_hidden_layers == original.num_hidden_layers
+        assert restored.embedding_width == original.embedding_width
+        assert restored.mlp_width == original.mlp_width
+        assert restored.num_decoder_layers == original.num_decoder_layers
         assert restored.num_sliding_window_heads == original.num_sliding_window_heads
         assert restored.num_mosrah_heads == original.num_mosrah_heads
         assert restored.num_selected_heads == original.num_selected_heads
@@ -313,3 +314,51 @@ class TestSerialisation:
         assert restored.use_cache == original.use_cache
         assert restored.output_hidden_states == original.output_hidden_states
         assert restored.tie_word_embeddings == original.tie_word_embeddings
+        assert restored.mosrah_overallocation_factor == original.mosrah_overallocation_factor
+
+
+# ---------------------------------------------------------------------------
+# mosrah_overallocation_factor and mosrah_packed_length
+# ---------------------------------------------------------------------------
+
+class TestMosrahPackedLength:
+    def test_overallocation_factor_default(self):
+        """mosrah_overallocation_factor must default to 2.0."""
+        config = ShramConfig()
+        assert config.mosrah_overallocation_factor == 2.0
+
+    def test_overallocation_factor_stored(self):
+        config = small_config(mosrah_overallocation_factor=1.2)
+        assert config.mosrah_overallocation_factor == 1.2
+
+    def test_overallocation_factor_exactly_one_raises(self):
+        """Values <= 1.0 must raise — a factor of exactly 1.0 provides no overflow margin."""
+        with pytest.raises(ValueError, match="mosrah_overallocation_factor"):
+            small_config(mosrah_overallocation_factor=1.0)
+
+    def test_overallocation_factor_less_than_one_raises(self):
+        with pytest.raises(ValueError, match="mosrah_overallocation_factor"):
+            small_config(mosrah_overallocation_factor=0.5)
+
+    def test_mosrah_packed_length_correct(self):
+        """mosrah_packed_length must equal ceil(N * K / L * factor)."""
+        import math
+        config = small_config(
+            training_sequence_length=1024,
+            num_selected_heads=8,
+            num_mosrah_heads=16,
+            mosrah_overallocation_factor=1.1,
+        )
+        expected = math.ceil(1024 * 8 / 16 * 1.1)
+        assert config.mosrah_packed_length == expected
+
+    def test_mosrah_packed_length_is_not_stored(self):
+        """mosrah_packed_length must be a computed property, not a stored field."""
+        config = small_config()
+        assert "mosrah_packed_length" not in config.to_dict()
+
+    def test_overallocation_factor_roundtrip(self):
+        """mosrah_overallocation_factor must survive to_dict/from_dict roundtrip."""
+        config = small_config(mosrah_overallocation_factor=1.25)
+        restored = ShramConfig.from_dict(config.to_dict())
+        assert restored.mosrah_overallocation_factor == 1.25

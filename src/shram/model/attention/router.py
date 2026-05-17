@@ -57,10 +57,11 @@ class MoSRAHRouter(nn.Module):
         super().__init__()
         self.num_mosrah_heads = config.num_mosrah_heads
         self.num_selected_heads = config.num_selected_heads
+        self.load_balance_p = config.load_balance_p
 
         # W_r: routing projection, no bias (paper specifies xW_r, no additional term).
         self.routing_projection = nn.Linear(
-            config.hidden_size, config.num_mosrah_heads, bias=False
+            config.embedding_width, config.num_mosrah_heads, bias=False
         )
 
         # b: learned per-head bias for load balancing. Initialized to zero so that all
@@ -117,25 +118,31 @@ class MoSRAHRouter(nn.Module):
         gathered = routing_scores.gather(dim=-1, index=selected_heads)   # V, (B, N, K)
         routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)    # P, (B, N, K)
 
-        # Routing frequency f_l: fraction of active (batch, token, head_slot) triples
-        # assigned to each head. Dead tokens are excluded by zeroing their rows in the
-        # assignment mask before reduction. Normalization uses the active assignment
-        # count so frequencies remain properly scaled regardless of how many tokens
-        # are live in this chunk.
+        # Per-item routing frequencies f_{b,l}: for each batch item b and head l, what
+        # fraction of that item's active K assignments over all tokens go to head l.
+        # Dead tokens are excluded before reduction. Normalization is per batch item so
+        # each item's frequencies sum to 1 independently of other items in the batch.
         assignment_mask = torch.zeros(B, N, L, device=x.device, dtype=x.dtype)
         assignment_mask.scatter_(-1, selected_heads, 1.0)
         active_assignments = assignment_mask * active_mask.unsqueeze(-1)
-        num_active_assignments = active_mask.sum() * K
-        routing_freqs = active_assignments.sum(dim=(0, 1)) / num_active_assignments  # f, (L,)
+        per_item_counts = active_assignments.sum(dim=1)             # (B, L)
+        per_item_total = active_mask.sum(dim=1, keepdim=True) * K   # (B, 1)
+        per_item_freqs = per_item_counts / per_item_total            # (B, L)
+
+        # p-mean of per_item_freqs over the batch dimension produces routing_freqs (L,).
+        # p-mean weights aggregation toward the worst-case batch item relative to
+        # arithmetic mean, making the load balance signal sensitive to per-item spikes
+        # that cause packing overflow.
+        p = self.load_balance_p
+        routing_freqs = (per_item_freqs ** p).mean(dim=0) ** (1.0 / p)  # (L,)
 
         # Load balance loss via custom autograd. expert_bias is an input so PyTorch
         # registers it as a graph node; the custom backward writes the DeepSeek-style
         # correction gradient to expert_bias.grad for the optimizer to consume.
         load_balance_loss = LoadBalanceLoss.apply(self.expert_bias, routing_freqs)
 
-        # MaxVio is a detached monitoring scalar derived from routing_freqs. It must
-        # not contribute gradients under any circumstance, so it is detached at the
-        # point of computation rather than left to callers to detach.
+        # MaxVio is a detached monitoring scalar following the paper's formula
+        # L · max_l(f_l − 1/L) applied to routing_freqs. Must not contribute gradients.
         max_vio = self._compute_max_vio(routing_freqs, L)
 
         return selected_heads, routing_probs, load_balance_loss, max_vio
@@ -145,15 +152,16 @@ class MoSRAHRouter(nn.Module):
         """Compute the MaxVio routing-imbalance scalar.
 
         MaxVio = L · max_l(f_l − 1/L), where f_l is the realised routing frequency of
-        head l and 1/L is the perfectly balanced target. A value of zero indicates
-        perfect balance; a value of 1 means the most overloaded head received exactly
-        double its fair share.
+        head l and 1/L is the perfectly balanced target. Follows the paper's definition
+        (Wang et al.) applied to routing_freqs. A value of zero indicates perfect
+        balance; a value of 0.5 means the most overloaded head received 50% more routed
+        tokens than ideal.
 
         The result is detached from the autograd graph — MaxVio is a monitoring scalar
         and must never contribute gradients to any parameter.
 
         Args:
-            routing_freqs: Per-head routing frequencies of shape (L,). Sums to 1.
+            routing_freqs: Per-head routing frequencies of shape (L,).
             num_heads: Total number of MoSRAH heads L.
 
         Returns:

@@ -61,12 +61,13 @@ class MoSRAHCache(CacheLayerMixin):
         batch_size: Number of sequences in the batch. Determines the first dimension
             of all storage tensors.
         device: Device on which to allocate all tensors. Should match the model device.
-        initial_buffer_size: Initial sequence capacity per (batch, head) slot. Doubled
-            when any slot overflows. Defaults to 64 to avoid repeated reallocation
-            during prompt processing.
+        mosrah_cache_length: Static sequence capacity per (batch, head) slot. Equal to
+            config.mosrah_cache_length. The buffer never grows; if any slot would exceed
+            this capacity, update() raises in both eager and compiled modes. Increase
+            mosrah_overallocation_factor in ShramConfig to resolve an overflow.
     """
 
-    is_compileable = False
+    is_compileable = True
     is_sliding = False
 
     def __init__(
@@ -75,22 +76,23 @@ class MoSRAHCache(CacheLayerMixin):
         head_dim: int,
         batch_size: int,
         device: torch.device,
-        initial_buffer_size: int = 64,
+        mosrah_cache_length: int,
     ) -> None:
         super().__init__()
         self.num_mosrah_heads = num_mosrah_heads
         self.head_dim = head_dim
         self.batch_size = batch_size
         self.device = device
+        self.mosrah_cache_length = mosrah_cache_length
 
         # Allocate primary storage into the mixin-standard self.keys / self.values so
         # that inherited methods (offload, prefetch) operate on real tensors. _counts
         # tracks valid occupancy per (batch, head) slot.
         self.keys: torch.Tensor = torch.zeros(
-            batch_size, num_mosrah_heads, initial_buffer_size, head_dim, device=device
+            batch_size, num_mosrah_heads, mosrah_cache_length, head_dim, device=device
         )
         self.values: torch.Tensor = torch.zeros(
-            batch_size, num_mosrah_heads, initial_buffer_size, head_dim, device=device
+            batch_size, num_mosrah_heads, mosrah_cache_length, head_dim, device=device
         )
         self._counts: torch.Tensor = torch.zeros(
             batch_size, num_mosrah_heads, dtype=torch.long, device=device
@@ -107,8 +109,8 @@ class MoSRAHCache(CacheLayerMixin):
     def buffer_capacity(self) -> int:
         """Current number of slots allocated per (batch, head) pair.
 
-        Derived directly from self.keys rather than tracked separately, so it is
-        always consistent with the actual buffer after expansion.
+        Equal to mosrah_cache_length as supplied at construction. Derived from
+        self.keys so it remains consistent with the actual buffer shape.
         """
         return self.keys.shape[2]
 
@@ -129,10 +131,11 @@ class MoSRAHCache(CacheLayerMixin):
         active_mask is (B, L, T) bool with True marking real tokens. Only active
         positions are written; inactive positions are ignored.
 
-        Uses a cumsum construction to derive the absolute buffer position for each
-        active token without any Python loops. For a given (batch, head) slot,
-        positions are assigned in the order tokens appear along the T dimension,
-        preserving causal ordering.
+        Uses a fixed-shape destination mask constructed from per-slot write intervals
+        to transfer active tokens into the buffer without any data-dependent shape
+        operations. Active tokens are left-justified within each packed slot by the
+        packing machinery, so the destination positions are a contiguous range
+        starting at the current slot count — no cumsum or torch.where needed.
 
         Returns the full accumulated (keys, values, active_mask) across the cached
         sparse sequence. The returned active_mask is True exactly for slots t <
@@ -150,35 +153,36 @@ class MoSRAHCache(CacheLayerMixin):
 
         Returns:
             Tuple of (keys, values, active_mask):
-              keys: (B, L, T, u) float — full key buffer including junk slots.
-              values: (B, L, T, u) float — full value buffer including junk slots.
-              active_mask: (B, L, T) bool — True iff slot (b, l, t) has been written.
+              keys: (B, L, mosrah_cache_length, u) float — full key buffer including junk slots.
+              values: (B, L, mosrah_cache_length, u) float — full value buffer including junk slots.
+              active_mask: (B, L, mosrah_cache_length) bool — True iff slot t has been written.
         """
         incoming_delta = active_mask.long().sum(dim=2)  # (B, L)
 
-        if (self._counts + incoming_delta).max().item() > self.buffer_capacity:
-            self._expand()
+        post_counts = self._counts + incoming_delta
+        self._check_no_overflow(post_counts.max(), self.mosrah_cache_length)
 
-        # Cumulative count of active positions along T for each (b, l) slot. Entry
-        # [b, l, t] is the 1-based rank of position t among all active positions in
-        # that slot. Subtract 1 for a zero-based within-slot index. Inactive positions
-        # produce a negative value, which is excluded by the mask gate below.
-        within_slot = active_mask.long().cumsum(dim=2) - 1  # (B, L, T)
-
-        # Add the pre-update count to get the absolute buffer position for each
-        # active token.
-        abs_pos = within_slot + self._counts.unsqueeze(-1)  # (B, L, T)
-
-        # Scatter key and value vectors at all active positions.
-        b_idx, l_idx, t_idx = torch.where(active_mask)
-        self.keys[b_idx, l_idx, abs_pos[b_idx, l_idx, t_idx]] = (
-            key_states[b_idx, l_idx, t_idx]
+        # Build a fixed-shape destination mask in cache space. Active tokens within
+        # each (b, l) slot are left-justified by the packing machinery, so they occupy
+        # positions 0..s-1 in their packed slot. The corresponding cache positions are
+        # write_start[b,l]..write_start[b,l]+write_count[b,l]-1. Broadcasting a
+        # time arange against these per-slot intervals selects exactly the target
+        # positions without any data-dependent shape query.
+        write_start = self._counts.unsqueeze(-1)    # cache position where new tokens begin
+        write_count = incoming_delta.unsqueeze(-1)  # number of new tokens arriving per slot
+        time_arange = torch.arange(
+            self.mosrah_cache_length, device=active_mask.device
         )
-        self.values[b_idx, l_idx, abs_pos[b_idx, l_idx, t_idx]] = (
-            value_states[b_idx, l_idx, t_idx]
-        )
+        dest_mask = (time_arange >= write_start) & (time_arange < write_start + write_count)
+        # dest_mask: (B, L, mosrah_cache_length)
 
-        self._counts += incoming_delta
+        # Transfer key and value vectors. Left-justification guarantees that
+        # dest_mask and active_mask have equal True counts per (b, l) slot, so the
+        # boolean-mask transfer is correct without any explicit count verification.
+        self.keys[dest_mask] = key_states[active_mask]
+        self.values[dest_mask] = value_states[active_mask]
+
+        self._counts = post_counts
 
         return self.keys, self.values, self._make_active_mask()
 
@@ -303,10 +307,13 @@ class MoSRAHCache(CacheLayerMixin):
         )
 
     def get_max_cache_shape(self) -> int:  # type: ignore[override]
-        """Not supported — MoSRAHCache is dynamic and unbounded."""
-        raise NotImplementedError(
-            "MoSRAHCache is unbounded; get_max_cache_shape() is not supported."
-        )
+        """Return the static per-(batch, head) slot capacity of this cache.
+
+        Equal to mosrah_cache_length as supplied at construction, which is derived
+        from config.mosrah_cache_length. Required by the HuggingFace static cache
+        contract; generation machinery uses this to size attention masks.
+        """
+        return self.mosrah_cache_length
 
     def get_mask_sizes(  # type: ignore[override]
         self,
@@ -335,25 +342,26 @@ class MoSRAHCache(CacheLayerMixin):
             < self._counts.unsqueeze(-1)
         )
 
-    def _expand(self) -> None:
-        """Double the buffer capacity, preserving existing data.
+    @staticmethod
+    def _check_no_overflow(max_count: torch.Tensor, capacity: int) -> None:
+        """Raise if any (batch, head) slot would exceed the static buffer capacity.
 
-        Called by update() when an incoming batch of tokens would cause any
-        (batch, head) slot to exceed the current buffer capacity. All existing
-        key and value data is copied into the low half of the new buffer; the
-        high half is zero-initialised and will be filled by subsequent writes.
-        After reassignment, buffer_capacity reflects the new size automatically.
+        Uses the 19.F.1 pattern: branches on whether the graph is being compiled.
+        In compiled mode, `.item()` folds into the graph when capture_scalar_outputs=True
+        and `torch._check` issues a compile-time assertion. In eager mode, a plain
+        RuntimeError is raised with a descriptive message.
+
+        Args:
+            max_count: Scalar tensor — the maximum post-update count across all slots.
+            capacity: The static buffer capacity (mosrah_cache_length).
         """
-        old_cap = self.buffer_capacity
-        new_cap = old_cap * 2
-        dev = self.keys.device
-        new_keys = torch.zeros(
-            self.batch_size, self.num_mosrah_heads, new_cap, self.head_dim, device=dev
-        )
-        new_values = torch.zeros(
-            self.batch_size, self.num_mosrah_heads, new_cap, self.head_dim, device=dev
-        )
-        new_keys[:, :, :old_cap, :] = self.keys
-        new_values[:, :, :old_cap, :] = self.values
-        self.keys = new_keys
-        self.values = new_values
+        if torch.compiler.is_compiling():
+            torch._check(max_count.item() <= capacity)
+        else:
+            if max_count.item() > capacity:
+                raise RuntimeError(
+                    f"MoSRAHCache overflow: a (batch, head) slot would reach "
+                    f"{max_count.item()} tokens but the static buffer capacity is "
+                    f"{capacity}. Increase mosrah_overallocation_factor in ShramConfig."
+                )
+

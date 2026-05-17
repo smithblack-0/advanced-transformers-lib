@@ -20,9 +20,9 @@ from src.shram.model.decoder_layer import DecoderLayer
 def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
         vocab_size=128,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=2,
+        embedding_width=8,
+        mlp_width=16,
+        num_decoder_layers=2,
         num_sliding_window_heads=2,
         num_mosrah_heads=5,
         num_selected_heads=2,
@@ -63,7 +63,7 @@ def make_input(
     x = torch.randn(
         batch,
         seq,
-        config.hidden_size,
+        config.embedding_width,
         generator=random_generator,
     )
     position_ids = torch.arange(seq, dtype=torch.long).unsqueeze(0).expand(batch, -1)
@@ -74,17 +74,11 @@ def make_input(
 def make_layer_cache(
     config: ShramConfig,
     batch_size: int,
-    initial_buffer_size: int = 8,
 ) -> ShramLayerCache:
     return ShramLayerCache(
-        sliding_window=config.window_size,
-        num_local_heads=config.num_sliding_window_heads,
-        local_head_dim=config.head_dim,
-        num_mosrah_heads=config.num_mosrah_heads,
-        mosrah_head_dim=config.head_dim,
+        config=config,
         batch_size=batch_size,
         device=torch.device("cpu"),
-        initial_buffer_size=initial_buffer_size,
     )
 
 
@@ -223,7 +217,6 @@ class TestRuntimeSmoke:
         layer_cache = make_layer_cache(
             config,
             batch_size=1,
-            initial_buffer_size=8,
         )
 
         prefix_output, prefix_load_balance_loss, _ = layer(

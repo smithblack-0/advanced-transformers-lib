@@ -39,7 +39,7 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         device: Device on which to allocate cache storage.
     """
 
-    is_compileable = False
+    is_compileable = True
     is_sliding = True
 
     def __init__(
