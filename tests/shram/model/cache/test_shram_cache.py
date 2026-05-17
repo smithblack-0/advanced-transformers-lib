@@ -17,7 +17,7 @@ HF Cache protocol and construction:
 Composite behaviors:
 - reset() clears all layer caches through the ShramCache boundary
 - reorder_cache() permutes all layer caches consistently through the ShramCache boundary
-- len(cache) == num_hidden_layers
+- len(cache) == num_decoder_layers
 """
 
 import torch
@@ -149,7 +149,7 @@ def test_max_cache_len_returns_inference_sequence_length():
 # ---------------------------------------------------------------------------
 
 def test_len_equals_num_layers():
-    """len(cache) == num_hidden_layers."""
+    """len(cache) == num_decoder_layers."""
     cache = make_cache(num_layers=5)
     assert len(cache) == 5
 
