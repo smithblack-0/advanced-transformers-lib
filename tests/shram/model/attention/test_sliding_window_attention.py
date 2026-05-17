@@ -29,9 +29,9 @@ from src.shram.model.cache.sliding_window_cache import LocalSlidingWindowLayerCa
 def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
         vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
+        embedding_width=64,
+        mlp_width=128,
+        num_decoder_layers=2,
         num_sliding_window_heads=4,
         num_mosrah_heads=4,
         num_selected_heads=4,
@@ -52,9 +52,9 @@ def small_config(**kwargs) -> ShramConfig:
 def synthetic_config(**kwargs) -> ShramConfig:
     defaults = dict(
         vocab_size=32,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
+        embedding_width=8,
+        mlp_width=16,
+        num_decoder_layers=1,
         num_sliding_window_heads=1,
         num_mosrah_heads=1,
         num_selected_heads=1,
@@ -77,7 +77,7 @@ def make_input(
     batch: int = 2,
     seq: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    x = torch.randn(batch, seq, config.hidden_size)
+    x = torch.randn(batch, seq, config.embedding_width)
     position_ids = torch.arange(seq).unsqueeze(0).expand(batch, -1)
     active_mask = torch.ones(batch, seq, dtype=torch.bool)
     return x, position_ids, active_mask
@@ -100,11 +100,11 @@ def make_cache(
 def synthetic_tokens(
     values: list[list[float]],
     *,
-    hidden_size: int,
+    embedding_width: int,
 ) -> torch.Tensor:
     """Build small hand-written token sequences with repeated channel values."""
     base = torch.tensor(values, dtype=torch.float32).unsqueeze(-1)
-    return base.repeat(1, 1, hidden_size)
+    return base.repeat(1, 1, embedding_width)
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +114,7 @@ def synthetic_tokens(
 
 class TestShape:
     def test_output_shape(self):
-        """(B, N, hidden_size) -> (B, N, hidden_size)."""
+        """(B, N, embedding_width) -> (B, N, embedding_width)."""
         config = small_config()
         attn = SlidingWindowAttention(config)
         x, position_ids, active_mask = make_input(config)
@@ -240,7 +240,7 @@ class TestMaskedContinuationSemantics:
 
         x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]],
-            hidden_size=config.hidden_size,
+            embedding_width=config.embedding_width,
         )
         position_ids = torch.arange(7).unsqueeze(0)
         # Gap at position 2; positions 3-6 are active and within the absolute window
@@ -269,7 +269,7 @@ class TestMaskedContinuationSemantics:
 
         x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]],
-            hidden_size=config.hidden_size,
+            embedding_width=config.embedding_width,
         )
         position_ids = torch.arange(7).unsqueeze(0)
         active_mask = torch.tensor(
@@ -296,7 +296,7 @@ class TestMaskedContinuationSemantics:
 
         x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0]],
-            hidden_size=config.hidden_size,
+            embedding_width=config.embedding_width,
         )
         position_ids = torch.arange(4).unsqueeze(0)
         active_mask = torch.tensor([[True, False, True, True]], dtype=torch.bool)
@@ -346,8 +346,8 @@ class TestSlidingWindowCache:
         out_3 = attn(x[:, 3:4, :], position_ids[:, 3:4], active_mask[:, 3:4], cache=cache)
         out_4 = attn(x[:, 4:5, :], position_ids[:, 4:5], active_mask[:, 4:5], cache=cache)
 
-        assert out_3.shape == (1, 1, config.hidden_size)
-        assert out_4.shape == (1, 1, config.hidden_size)
+        assert out_3.shape == (1, 1, config.embedding_width)
+        assert out_4.shape == (1, 1, config.embedding_width)
 
     def test_cached_generation_matches_full_forward(self):
         """Cached all-live generation must match the corresponding full forward pass."""
@@ -377,12 +377,12 @@ class TestSlidingWindowCache:
 
         prefill_x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0]],
-            hidden_size=config.hidden_size,
+            embedding_width=config.embedding_width,
         )
         prefill_pos = torch.arange(4).unsqueeze(0)
         prefill_mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
 
-        next_x = synthetic_tokens([[5.0]], hidden_size=config.hidden_size)
+        next_x = synthetic_tokens([[5.0]], embedding_width=config.embedding_width)
         next_pos = torch.tensor([[4]])
         next_mask = torch.tensor([[True]], dtype=torch.bool)
 
@@ -416,12 +416,12 @@ class TestSlidingWindowCache:
 
         prefill_x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0]],
-            hidden_size=config.hidden_size,
+            embedding_width=config.embedding_width,
         )
         prefill_pos = torch.arange(4).unsqueeze(0)
         prefill_mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
 
-        next_x = synthetic_tokens([[5.0]], hidden_size=config.hidden_size)
+        next_x = synthetic_tokens([[5.0]], embedding_width=config.embedding_width)
         next_pos = torch.tensor([[4]])
         next_mask = torch.tensor([[True]], dtype=torch.bool)
 

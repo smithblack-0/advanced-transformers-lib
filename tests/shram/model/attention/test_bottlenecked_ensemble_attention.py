@@ -26,9 +26,9 @@ from src.shram.model.cache.mosrah_cache import MoSRAHCache
 def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
         vocab_size=128,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=2,
+        embedding_width=16,
+        mlp_width=32,
+        num_decoder_layers=2,
         num_sliding_window_heads=2,
         num_mosrah_heads=2,
         num_selected_heads=4,
@@ -56,7 +56,7 @@ def make_inputs(
         batch,
         config.num_mosrah_heads,
         packed_length,
-        config.hidden_size,
+        config.embedding_width,
     )
     position_ids = torch.arange(packed_length).view(1, 1, packed_length).expand(
         batch,
@@ -92,7 +92,7 @@ def gather_current_rows_from_full(
 def make_fuzz_causality_bea() -> tuple[BottleneckedEnsembleAttention, ShramConfig]:
     """Construct one real random BEA instance for black-box causality fuzzing."""
     config = small_config(
-        hidden_size=8,
+        embedding_width=8,
         num_mosrah_heads=1,
         head_dim=4,
         training_sequence_length=16,
@@ -182,7 +182,7 @@ class TestShape:
         out = bea(packed_embeddings, position_ids, active_mask)
 
         assert out.shape[:3] == packed_embeddings.shape[:3]
-        assert out.shape[-1] == config.hidden_size
+        assert out.shape[-1] == config.embedding_width
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +199,7 @@ class TestPaperFormulaAnchor:
         equations for QK^T / sqrt(u), softmax, V, and O.
         """
         config = small_config(
-            hidden_size=2,
+            embedding_width=2,
             num_mosrah_heads=1,
             head_dim=2,
             training_sequence_length=8,
@@ -315,7 +315,7 @@ class TestRopeBehavior:
         that scale=1 reaches at position 2.
         """
         config_a = small_config(
-            hidden_size=2,
+            embedding_width=2,
             num_mosrah_heads=1,
             head_dim=2,
             training_sequence_length=16,
@@ -324,7 +324,7 @@ class TestRopeBehavior:
             beta=10 ** 9 + 1,
         )
         config_b = small_config(
-            hidden_size=2,
+            embedding_width=2,
             num_mosrah_heads=1,
             head_dim=2,
             training_sequence_length=16,
@@ -376,7 +376,7 @@ class TestRopeBehavior:
 class TestCausality:
     def test_future_active_tokens_do_not_affect_past_active_outputs(self):
         """Changing future packed tokens must not change earlier active outputs."""
-        config = small_config(hidden_size=8, num_mosrah_heads=2, head_dim=4)
+        config = small_config(embedding_width=8, num_mosrah_heads=2, head_dim=4)
         bea = BottleneckedEnsembleAttention(config)
         bea.eval()
         torch.manual_seed(3)
@@ -403,7 +403,7 @@ class TestPaddingBehavior:
         K and V projections are zeroed so perturbing inactive packed rows can only change
         Q for those inactive rows. Active outputs must remain unchanged.
         """
-        config = small_config(hidden_size=8, num_mosrah_heads=2, head_dim=4)
+        config = small_config(embedding_width=8, num_mosrah_heads=2, head_dim=4)
         bea = BottleneckedEnsembleAttention(config)
 
         with torch.no_grad():
@@ -434,7 +434,7 @@ class TestPaddingBehavior:
         packed rows cannot change the active queries. The only remaining possible effect is
         through inactive K/V rows. Active outputs must stay unchanged.
         """
-        config = small_config(hidden_size=8, num_mosrah_heads=2, head_dim=4)
+        config = small_config(embedding_width=8, num_mosrah_heads=2, head_dim=4)
         bea = BottleneckedEnsembleAttention(config)
 
         with torch.no_grad():
@@ -464,7 +464,7 @@ class TestPaddingBehavior:
         We rewrite only inactive packed rows, rerun BEA, and compare only active output rows.
         Inactive output rows are allowed to contain junk because unpacking removes them later.
         """
-        config = small_config(hidden_size=8, num_mosrah_heads=2, head_dim=4)
+        config = small_config(embedding_width=8, num_mosrah_heads=2, head_dim=4)
         bea = BottleneckedEnsembleAttention(config)
 
         packed_embeddings, position_ids, _ = make_inputs(config, batch=1, packed_length=4)
@@ -491,7 +491,7 @@ class TestPaddingBehavior:
         Active outputs must remain unchanged if BEA is correctly ignoring inactive cached slots.
         """
         config = small_config(
-            hidden_size=2,
+            embedding_width=2,
             num_mosrah_heads=1,
             head_dim=2,
             training_sequence_length=8,
@@ -547,7 +547,7 @@ class TestCacheBoundary:
     ):
         """The cache boundary should receive K̃ and raw V, not raw K."""
         config = small_config(
-            hidden_size=4,
+            embedding_width=4,
             num_mosrah_heads=1,
             head_dim=4,
             training_sequence_length=8,
@@ -587,7 +587,7 @@ class TestCacheBoundary:
     def test_cached_execution_uses_accumulated_state_returned_by_cache(self):
         """BEA should attend against the accumulated state returned by cache.update()."""
         config = small_config(
-            hidden_size=2,
+            embedding_width=2,
             num_mosrah_heads=1,
             head_dim=2,
             training_sequence_length=8,
@@ -639,7 +639,7 @@ class TestCacheBoundary:
     ):
         """Without a cache, BEA should pass current-step K̃ and raw V directly to the backend."""
         config = small_config(
-            hidden_size=4,
+            embedding_width=4,
             num_mosrah_heads=1,
             head_dim=4,
             training_sequence_length=8,
@@ -685,7 +685,7 @@ class TestCachedCausality:
     def test_cached_and_uncached_match_under_ragged_cached_prefixes(self):
         """Cached BEA should match one-shot BEA when heads have different prefix lengths."""
         config = small_config(
-            hidden_size=2,
+            embedding_width=2,
             num_mosrah_heads=2,
             head_dim=2,
             training_sequence_length=8,
@@ -829,7 +829,7 @@ class TestCausalityFuzz:
                     1,
                     config.num_mosrah_heads,
                     packed_length,
-                    config.hidden_size,
+                    config.embedding_width,
                 )
 
                 baseline_output = bea(
@@ -841,7 +841,7 @@ class TestCausalityFuzz:
 
                 for source_index in range(packed_length):
                     perturbed_embeddings = packed_embeddings.clone()
-                    perturbation = perturbation_scale * torch.randn(config.hidden_size)
+                    perturbation = perturbation_scale * torch.randn(config.embedding_width)
                     perturbed_embeddings[0, 0, source_index] += perturbation
 
                     perturbed_output = bea(
@@ -917,13 +917,13 @@ class TestCausalityFuzz:
                     1,
                     config.num_mosrah_heads,
                     prefix_length,
-                    config.hidden_size,
+                    config.embedding_width,
                 )
                 current_embeddings = torch.randn(
                     1,
                     config.num_mosrah_heads,
                     current_length,
-                    config.hidden_size,
+                    config.embedding_width,
                 )
 
                 baseline_cache = MoSRAHCache(
@@ -949,7 +949,7 @@ class TestCausalityFuzz:
                 for logical_source_index in range(total_source_length):
                     perturbed_prefix_embeddings = prefix_embeddings.clone()
                     perturbed_current_embeddings = current_embeddings.clone()
-                    perturbation = perturbation_scale * torch.randn(config.hidden_size)
+                    perturbation = perturbation_scale * torch.randn(config.embedding_width)
 
                     if logical_source_index < prefix_length:
                         perturbed_prefix_embeddings[0, 0, logical_source_index] += perturbation

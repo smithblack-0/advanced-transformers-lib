@@ -22,9 +22,9 @@ def small_config(**overrides) -> ShramConfig:
     """Construct a small SHRAM config for fast backbone tests."""
     config_kwargs = dict(
         vocab_size=128,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=3,
+        embedding_width=8,
+        mlp_width=16,
+        num_decoder_layers=3,
         num_sliding_window_heads=2,
         num_mosrah_heads=5,
         num_selected_heads=2,
@@ -57,7 +57,7 @@ def make_model(
 def random_embeds(
     batch_size: int,
     sequence_length: int,
-    hidden_size: int,
+    embedding_width: int,
     seed: int = 0,
 ) -> torch.Tensor:
     """Construct deterministic random pre-embedded inputs."""
@@ -66,7 +66,7 @@ def random_embeds(
     return torch.randn(
         batch_size,
         sequence_length,
-        hidden_size,
+        embedding_width,
         generator=random_generator,
     )
 
@@ -106,7 +106,7 @@ class TestOutputContract:
         config = small_config()
         model = make_model(config, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=1)
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=1)
         out = model(inputs_embeds, position_ids(1, 4), torch.ones(1, 4, dtype=torch.bool))
 
         assert type(out) is dict
@@ -123,10 +123,10 @@ class TestOutputContract:
         config = small_config()
         model = make_model(config, seed=0)
 
-        inputs_embeds = random_embeds(2, 5, config.hidden_size, seed=2)
+        inputs_embeds = random_embeds(2, 5, config.embedding_width, seed=2)
         out = model(inputs_embeds, position_ids(2, 5), torch.ones(2, 5, dtype=torch.bool))
 
-        assert out["last_hidden_state"].shape == (2, 5, config.hidden_size)
+        assert out["last_hidden_state"].shape == (2, 5, config.embedding_width)
         assert out["load_balance_loss"].ndim == 0
         assert out["max_vio"].ndim == 0
         assert torch.isfinite(out["last_hidden_state"]).all()
@@ -145,7 +145,7 @@ class TestHiddenStates:
         config = small_config()
         model = make_model(config, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=3)
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=3)
         out = model(
             inputs_embeds,
             position_ids(1, 4),
@@ -160,7 +160,7 @@ class TestHiddenStates:
         config = small_config()
         model = make_model(config, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=4)
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=4)
         out = model(
             inputs_embeds,
             position_ids(1, 4),
@@ -170,11 +170,11 @@ class TestHiddenStates:
 
         hidden_states = out["hidden_states"]
 
-        assert len(hidden_states) == config.num_hidden_layers + 1
+        assert len(hidden_states) == config.num_decoder_layers + 1
         torch.testing.assert_close(hidden_states[0], inputs_embeds)
 
         for hidden_state in hidden_states:
-            assert hidden_state.shape == (1, 4, config.hidden_size)
+            assert hidden_state.shape == (1, 4, config.embedding_width)
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +187,7 @@ class TestCacheBoundary:
         config = small_config()
         model = make_model(config, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=5)
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=5)
         out = model(
             inputs_embeds,
             position_ids(1, 4),
@@ -202,7 +202,7 @@ class TestCacheBoundary:
         config = small_config()
         model = make_model(config, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.hidden_size, seed=6)
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=6)
         cache = make_cache(config, batch_size=1)
 
         out = model(

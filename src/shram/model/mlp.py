@@ -36,9 +36,9 @@ class SwiGLUMLP(nn.Module):
 
     def __init__(self, config: PretrainedConfig) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj   = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(config.embedding_width, config.mlp_width, bias=False)
+        self.up_proj   = nn.Linear(config.embedding_width, config.mlp_width, bias=False)
+        self.down_proj = nn.Linear(config.mlp_width, config.embedding_width, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the SwiGLU feed-forward transformation.

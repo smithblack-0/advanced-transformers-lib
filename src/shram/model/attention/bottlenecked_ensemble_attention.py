@@ -45,7 +45,7 @@ class BottleneckedEnsembleAttention(nn.Module):
     def __init__(self, config: ShramConfig) -> None:
         super().__init__()
 
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.embedding_width
         self.num_heads = config.num_mosrah_heads
         self.head_dim = config.head_dim
 

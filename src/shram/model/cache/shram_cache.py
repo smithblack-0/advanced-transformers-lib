@@ -58,7 +58,7 @@ class ShramCache(Cache):
                 batch_size=batch_size,
                 device=device,
             )
-            for _ in range(config.num_hidden_layers)
+            for _ in range(config.num_decoder_layers)
         ]
         super().__init__(layers=layers)
 

@@ -23,9 +23,9 @@ def make_config(**overrides) -> ShramConfig:
     """Construct a small SHRAM config for hybrid-layer integration tests."""
     config_kwargs = dict(
         vocab_size=128,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
+        embedding_width=8,
+        mlp_width=16,
+        num_decoder_layers=1,
         num_sliding_window_heads=2,
         num_mosrah_heads=5,
         num_selected_heads=2,
@@ -449,7 +449,7 @@ class TestConfigurationResponse:
             hidden_states = torch.randn(
                 1,
                 total_length,
-                main_sequence_config.hidden_size,
+                main_sequence_config.embedding_width,
                 generator=random_generator,
             )
             position_ids = torch.arange(total_length, dtype=torch.long).unsqueeze(0)

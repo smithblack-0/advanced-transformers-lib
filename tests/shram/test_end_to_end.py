@@ -29,9 +29,9 @@ from src.shram.model.huggingface import ShramForCausalLM
 def small_config(**kwargs) -> ShramConfig:
     defaults = dict(
         vocab_size=256,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
+        embedding_width=64,
+        mlp_width=128,
+        num_decoder_layers=2,
         num_sliding_window_heads=4,
         num_mosrah_heads=4,
         num_selected_heads=4,
@@ -39,9 +39,6 @@ def small_config(**kwargs) -> ShramConfig:
         window_size=8,
         rope_mode="main_sequence",
         training_sequence_length=32,
-        bos_token_id=1,
-        eos_token_id=2,
-        pad_token_id=0,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
@@ -130,10 +127,15 @@ class TestIntegrationCompilable:
 
     def test_compile_uncached_forward(self):
         """torch.compile must succeed on the uncached (training) forward path."""
-        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.capture_scalar_outputs = False
+        torch._dynamo.config.capture_dynamic_output_shape_ops = False
         m = ShramForCausalLM(small_config())
-        compiled = torch.compile(m, fullgraph=False, dynamic=True)
         ids = torch.randint(0, 256, (1, 4))
+        compiled = torch.compile(m, fullgraph=False, dynamic=False)
+        explain = torch._dynamo.explain(compiled, ids, use_cache=False)
+        print(explain)
+
+
         compiled(ids, use_cache=False)
 
 
