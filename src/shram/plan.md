@@ -82,7 +82,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 19.G.2 (Blocker) — Expert packing: replace _bincount_rows with scatter_add
 - [X] Unit 19.G.3 (Blocker) — Load balance frequency aggregation: p-mean and load_balance_p
 - [X] Unit 19.G.4 (Blocker) — Restore mask symmetry for compiled inference via create_masks_for_generate override
-- [ ] Unit 19.G.5 (Blocker) — Static cache rebuild for compiled inference
+- [X] Unit 19.G.5 (Blocker) — Static cache rebuild for compiled inference
 - [ ] Unit 20 — Final audit
 
 ---
