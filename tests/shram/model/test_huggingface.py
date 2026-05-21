@@ -545,7 +545,6 @@ class TestSaveLoadAndAutoClass:
         """All parameter values must survive a save_pretrained / from_pretrained round-trip."""
         model.save_pretrained(tmp_path)
         loaded = ShramForCausalLM.from_pretrained(tmp_path)
-
         for (name, p1), (_, p2) in zip(
             model.named_parameters(),
             loaded.named_parameters(),

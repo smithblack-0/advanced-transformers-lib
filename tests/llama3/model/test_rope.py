@@ -171,16 +171,15 @@ class TestConfigurationSensitivity:
 
     def test_unsupported_rope_type_raises(self):
         """Unsupported rope types must raise NotImplementedError at construction time."""
-        config = small_config(
-            hidden_size=64,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            rope_scaling={"rope_type": "longrope", "factor": 4.0,
-                          "original_max_position_embeddings": 512},
-        )
-        with pytest.raises(NotImplementedError, match="longrope"):
-            RotaryEmbedding(config)
 
+        with pytest.raises(KeyError, match="longrope"):
+            config = small_config(
+                hidden_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                rope_scaling={"rope_type": "longrope", "factor": 4.0,
+                              "original_max_position_embeddings": 512},
+            )
 
 # ---------------------------------------------------------------------------
 # Lazy cache extension
