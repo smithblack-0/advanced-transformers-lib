@@ -202,30 +202,22 @@ class Llama3ForCausalLM(PreTrainedModel, GenerationMixin):
 
         causal_mask = None
         if use_cache:
-            # cache_position is GenerationMixin's responsibility. If it is absent,
-            # positions are unknown and any mask or RoPE encoding we produce would be
-            # silently wrong — potentially corrupting a checkpoint. Crash immediately.
-            if cache_position is None:
-                raise ValueError(
-                    "cache_position must be provided when use_cache=True. "
-                    "GenerationMixin supplies this automatically during generate(). "
-                    "If calling forward() directly with use_cache=True, pass cache_position explicitly."
-                )
+            # Derive absolute query positions from cache occupancy. cache_len is the
+            # number of tokens already stored; query positions are cache_len..cache_len+seq_len-1.
+            # cache_position is accepted in the signature for HuggingFace contract
+            # compatibility but is not used — get_seq_length() is the authoritative source.
+            cache_len = past_key_values.get_seq_length()
+            q_positions = torch.arange(cache_len, cache_len + seq_len, device=inputs_embeds.device)
 
-            # Derive position_ids for RoPE from cache_position when not provided.
-            # This is a valid computation: cache_position is the authoritative source
-            # of absolute sequence positions, and position_ids is its batch-expanded form.
             if position_ids is None:
-                position_ids = cache_position.unsqueeze(0).expand(batch, -1)
+                position_ids = q_positions.unsqueeze(0).expand(batch, -1)
 
-            # Build the causal attention mask. For each query at absolute position p,
-            # it may attend to all keys at positions 0..p. k_len is the full sequence
-            # length after this step: one past the last query position.
-            k_len = int(cache_position[-1].item()) + 1
-            k_positions = torch.arange(k_len, device=inputs_embeds.device)
+            # Build the causal attention mask. Each query at position p may attend to
+            # all keys at positions 0..p. k_len covers the full sequence after this step.
+            k_positions = torch.arange(cache_len + seq_len, device=inputs_embeds.device)
             # mask[q, k] = True when key position k is within the causal horizon of query q.
             # Shape: (1, 1, seq_len, k_len) — broadcast over batch and head dimensions.
-            causal_mask = (k_positions[None, :] <= cache_position[:, None]).unsqueeze(0).unsqueeze(0)
+            causal_mask = (k_positions[None, :] <= q_positions[:, None]).unsqueeze(0).unsqueeze(0)
 
         backbone_out = self.model(
             inputs_embeds,

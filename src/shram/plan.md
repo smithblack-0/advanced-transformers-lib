@@ -83,7 +83,9 @@ is being achieved, one verified unit at a time.
 - [X] Unit 19.G.3 (Blocker) — Load balance frequency aggregation: p-mean and load_balance_p
 - [X] Unit 19.G.4 (Blocker) — Restore mask symmetry for compiled inference via create_masks_for_generate override
 - [X] Unit 19.G.5 (Blocker) — Static cache rebuild for compiled inference
-- [ ] Unit 20 — Final audit
+- [ ] Unit 20.A (Blocker) — Release pipeline: dev repository staging and E2E test gate
+- [ ] Unit 20.B — stage_for_hub.py: inject explicit import block into staged huggingface.py
+- [ ] Unit 21 — Final audit
 
 ---
 
@@ -2508,7 +2510,80 @@ Compiled inference requires all cache operations to execute within the compiled 
 
 ---
 
-### Unit 20— Final Audit
+### Unit 20.A (Blocker) — Release pipeline: dev repository staging and E2E test gate
+
+**Responsibility:** Restructure the release pipeline so that publication is gated on E2E tests passing against a staging Hub repository, and configure the test suite to exclude E2E tests from normal runs while making them target-configurable.
+
+**Context of Correctness:**
+
+Attempts to repair an issue has revealed a publication deadlock. In order for publication of new versions to happen tests must pass. However, certain end-to-end tests will fail until a new version is published. This forms a deadlock that must be resolved while continuing to optimize for correctness.
+
+For the end-to-end tests to be run they must be pointed at a huggingface repository from which to load; we now know there are verifiable differences between remote and local repository loading systems. However, the repositories do not work well with config-only models; such models cannot be versioned or put in separate folders. As such, any upload is inherently destructive without rollback.
+
+While it would in theory be possible to use the git nature of huggingface model repositories to roll back any damage automatically, alternatives that keep test artifacts out of the production space are preferable. As such, the best case solution is the integration of test repositories into the testing stream, which can be uploaded to and tested against, before uploading to the production repositories themselves.
+
+**Invariants:**
+- A staging Hub repository exists for each model (llama3, shram) as an intermediate publication target, distinct from the production repository
+- The release pipeline publishes to the staging repository first, runs E2E network tests against it, and only publishes to the production repository if those tests pass
+- The GitHub release draft is only promoted to published after production publication succeeds
+- E2E network tests are excluded from the normal test suite by default via `addopts` in `pytest.ini`
+- E2E network tests accept a `--hub` argument accepting `dev` or `main`, defaulting to `main`, which configures the target repository
+- The production Hub repository is never written to unless E2E tests against the staging repository have passed
+- A one-minute delay is introduced before post-upload tests run to allow Hub propagation
+
+**Tests**
+- Modify such that `pytest tests/shram/` with no flags does not execute any network-marked tests
+- Modify such that `pytest tests/shram/ -m network --hub=dev` runs network tests against the staging directory
+- Modify such that `pytest tests/shram/ -m network --hub=main` runs network tests against the production repository.
+
+**Audit**
+- Verify `pytest tests/shram/` with no flags does not execute any network-marked tests
+- Verify `pytest tests/shram/ -m network --hub=dev` runs network tests against the staging repository
+- Verify `pytest tests/shram/ -m network --hub=main` runs network tests against the production repository
+- Workflow behavior is verified by running a release through the pipeline and observing job sequencing
+
+**Preliminary Implementation Strategy:**
+- Create staging Hub repositories: `smithblack-0/SHRAM-dev` and `smithblack-0/LLAMA3-dev`
+- Register `@pytest.mark.network` and add `addopts = -m "not network"` to `pytest.ini`
+- Add `--hub` option to `conftest.py` via `pytest_addoption`; expose as a fixture replacing the hardcoded `HUB_REPO` constant in `test_end_to_end.py`
+- Restructure `shram.yml` and `llama3.yml` to four jobs: `test` (no network marks), `upload_dev`, `post_test` (network, `--hub=dev`, one minute sleep), `upload_main` (conditional on post_test passing)
+- Add `publish_release` job calling `gh release edit --draft=false` after `upload_main` succeeds
+- Change orchestrator trigger from `release: types: [published]` to `release: types: [created]`; developers create releases as drafts
+
+**Note:** During implementation, `cache_position` was found to no longer be passed by `GenerationMixin` in the current transformers version. Fixed `Llama3ForCausalLM.forward()` to derive position and mask from `past_key_values.get_seq_length()` instead. `cache_position` remains in the signature for contract compatibility.
+
+---
+
+### Unit 20.B — stage_for_hub.py: inject explicit import block into staged huggingface.py
+
+**Responsibility:** Extend the staging system to inject an explicit import block into the staged `huggingface.py` that references all other staged Python modules, so that local `from_pretrained` dependency resolution succeeds.
+
+**Context of Correctness:**
+
+Real world testing has revealed an issue. It is not in fact possible to load our model through AutoModel with a from_pretrained predicate on a local disk. Further investigation has lead to the understanding that while remote fetches recursively resolve all dependencies into the huggingface cache, local loads do not. As such, only the files that are directly imported in huggingface.py are being transferred into the cache, causing a crash when the system tries to load it. This is found in get_cached_module_file.
+
+While this issue can, in theory, be corrected by directly registering the model, this bypasses the premise of isolation the test harness was designed under. Instead, stage_for_hub can be tweaked in a minor way to insert a new block after the main docstring that imports every file which has been built. This process then ensures those files will be captured and imported instead.
+
+**Invariants:**
+- The staged `huggingface.py` contains import statements referencing every other Python module present in the staging output
+- The injection occurs in the staged output only; no source file under `src/shram/model/` is modified by staging
+- The staged content of all other files is unchanged from what the current implementation produces
+- `AutoModelForCausalLM.from_pretrained(path, local_files_only=True, trust_remote_code=True)` succeeds on a checkpoint saved via `save_pretrained`
+- The `stage(source_dir, dest_dir)` public interface is unchanged
+
+**Tests:**
+- Stage a known source directory; verify the staged `huggingface.py` contains an import statement for every other `.py` file present in the staging output
+- Verify `TestE2ESaveLoad.test_model_save_load_roundtrip` passes
+- Verify all existing `stage_for_hub.py` tests continue to pass
+
+**Preliminary Implementation Strategy:**
+- During the `stage()` loop, collect the flat names of all staged `.py` files
+- After all files are written, post-process the staged `huggingface.py`: parse with libcst, locate the module docstring, insert `from . import <flat_name>` statements immediately after it for every staged file other than `huggingface` itself, write back
+- The relative single-dot import form matches the existing rewritten import style and is the form `check_imports` recognizes
+
+---
+
+### Unit 21 — Final Audit
 
 **What:** Review every audit note in plan.md and, if not overridden, ensure compliance. Crosscheck with papers/main.tex and verify whether or not paper is still complaint.
 

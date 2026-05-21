@@ -4,20 +4,24 @@ on:
   pull_request:
     branches: [master]
   release:
-    types: [published]
+    types: [created, edited]
 
 jobs:
   llama3:
+    if: github.event_name == 'pull_request' || github.event.release.draft == true
     uses: ./.github/workflows/llama3.yml
     with:
       run_upload: ${{ github.event_name == 'release' }}
     secrets:
       LLAMA3_HF_TOKEN: ${{ secrets.LLAMA3_HF_TOKEN }}
+      LLAMA3_DEV_HF_TOKEN: ${{ secrets.LLAMA3_DEV_HF_TOKEN }}
 
   shram:
+    if: github.event_name == 'pull_request' || github.event.release.draft == true
     uses: ./.github/workflows/shram.yml
     with:
       run_upload: ${{ github.event_name == 'release' }}
     secrets:
       SHRAM_HF_TOKEN: ${{ secrets.SHRAM_HF_TOKEN }}
+      SHRAM_DEV_HF_TOKEN: ${{ secrets.SHRAM_DEV_HF_TOKEN }}
 

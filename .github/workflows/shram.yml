@@ -9,9 +9,11 @@ on:
     secrets:
       SHRAM_HF_TOKEN:
         required: false
+      SHRAM_DEV_HF_TOKEN:
+        required: false
 
 jobs:
-  test:
+  integration:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,11 +22,11 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install -r src/shram/requirements-dev.txt && pip install -e src/shram/[dev]
-      - name: Run tests
+      - name: Run integration tests
         run: pytest tests/shram/
 
-  upload:
-    needs: test
+  upload_dev:
+    needs: integration
     if: inputs.run_upload
     runs-on: ubuntu-latest
     steps:
@@ -34,7 +36,48 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install -e src/shram/
-      - name: Upload to Hub
+      - name: Upload to dev Hub
+        env:
+          SHRAM_HF_TOKEN: ${{ secrets.SHRAM_DEV_HF_TOKEN }}
+        run: python -m shram.upload_to_hub
+
+  e2e_staging:
+    needs: upload_dev
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r src/shram/requirements-dev.txt && pip install -e src/shram/[dev]
+      - name: Wait for Hub propagation
+        run: sleep 60
+      - name: Run E2E tests against dev repository
+        run: pytest tests/shram/ -m network --hub=dev
+
+  upload_main:
+    needs: e2e_staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e src/shram/
+      - name: Upload to production repository
         env:
           SHRAM_HF_TOKEN: ${{ secrets.SHRAM_HF_TOKEN }}
         run: python -m shram.upload_to_hub
+
+  publish_release:
+    needs: upload_main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Promote draft release to published
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit ${{ github.event.release.tag_name }} --draft=false --repo ${{ github.repository }}

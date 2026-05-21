@@ -123,18 +123,27 @@ class TestIntegrationTrainable:
 
 
 # ---------------------------------------------------------------------------
-# Hub constant (Unit 10)
+# Hub constants (Unit 10)
 # ---------------------------------------------------------------------------
 
-HUB_REPO = "smithblack-0/llama3_baseline"
+HUB_REPOS = {
+    "main": "smithblack-0/llama3_baseline",
+    "dev": "smithblack-0/llama3_baseline_dev",
+}
 
 
 # ---------------------------------------------------------------------------
-# Shared Hub fixture (Unit 10)
+# Shared Hub fixtures (Unit 10)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def hub_config():
+def hub_repo(request):
+    """Resolve the Hub repository name for the current --hub target."""
+    return HUB_REPOS[request.config.getoption("--hub")]
+
+
+@pytest.fixture(scope="module")
+def hub_config(hub_repo):
     """Download config from Hub once per module to avoid repeated network calls.
 
     Module scope is correct here: the config object is read-only and safe to share
@@ -149,7 +158,7 @@ def hub_config():
     fixture to succeed via the local fallback even when the Hub is missing auto_map,
     producing false-positive network tests.
     """
-    config = AutoConfig.from_pretrained(HUB_REPO, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(hub_repo, trust_remote_code=True)
     module = type(config).__module__
     assert "transformers_modules" in module, (
         f"hub_config loaded a locally-registered class ({module}) instead of Hub "

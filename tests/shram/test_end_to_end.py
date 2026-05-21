@@ -177,15 +177,24 @@ class TestIntegrationCompilable:
 # Hub constants
 # ---------------------------------------------------------------------------
 
-HUB_REPO = "smithblack-0/SHRAM"
+HUB_REPOS = {
+    "main": "smithblack-0/SHRAM",
+    "dev": "smithblack-0/SHRAM-dev",
+}
 
 
 # ---------------------------------------------------------------------------
-# Shared Hub fixture
+# Shared Hub fixtures
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def hub_config():
+def hub_repo(request):
+    """Resolve the Hub repository name for the current --hub target."""
+    return HUB_REPOS[request.config.getoption("--hub")]
+
+
+@pytest.fixture(scope="module")
+def hub_config(hub_repo):
     """Download config from Hub once per module to avoid repeated network calls.
 
     After loading, asserts the config class was imported from HuggingFace's
@@ -195,7 +204,7 @@ def hub_config():
     missing auto_map, producing false-positive network tests.
     """
     config = AutoConfig.from_pretrained(
-        HUB_REPO,
+        hub_repo,
         trust_remote_code=True,
         force_download=True,
     )
@@ -233,14 +242,14 @@ class TestE2ELoadable:
 class TestE2ETokenizer:
     """The tokenizer must load from the Hub subfolder."""
 
-    def test_tokenizer_loads(self):
+    def test_tokenizer_loads(self, hub_repo):
         """AutoTokenizer.from_pretrained must succeed for the Hub repo."""
-        tokenizer = AutoTokenizer.from_pretrained(HUB_REPO)
+        tokenizer = AutoTokenizer.from_pretrained(hub_repo)
         assert tokenizer is not None
 
-    def test_tokenizer_encodes_and_decodes(self):
+    def test_tokenizer_encodes_and_decodes(self, hub_repo):
         """Tokenizer must round-trip a simple string."""
-        tokenizer = AutoTokenizer.from_pretrained(HUB_REPO)
+        tokenizer = AutoTokenizer.from_pretrained(hub_repo)
         text = "Hello world"
         ids = tokenizer.encode(text)
         decoded = tokenizer.decode(ids, skip_special_tokens=True)
@@ -270,6 +279,51 @@ class TestE2EGeneratable:
         ids = torch.randint(0, model.config.vocab_size, (1, 4))
         out = model.generate(ids, max_new_tokens=5)
         assert (out >= 0).all() and (out < model.config.vocab_size).all()
+
+
+# ---------------------------------------------------------------------------
+# End-to-End — Save/Load roundtrip via AutoClass
+# ---------------------------------------------------------------------------
+
+@pytest.mark.network
+class TestE2ESaveLoad:
+    """Hub-loaded model and tokenizer must survive a save/load roundtrip via AutoClass.
+
+    These tests specifically exercise AutoModelForCausalLM.from_pretrained and
+    AutoTokenizer.from_pretrained with local_files_only=True — the untested path
+    that exercises auto_map remote-code resolution against a locally saved checkpoint.
+    The existing local save/load tests in test_huggingface.py use direct class
+    instantiation and do not cover this path.
+    """
+
+    def test_model_save_load_roundtrip(self, hub_config, tmp_path) -> None:
+        """All parameter values must survive Hub → save_pretrained → AutoModel.from_pretrained."""
+        model = AutoModelForCausalLM.from_config(hub_config, trust_remote_code=True)
+        model.save_pretrained(tmp_path)
+
+        loaded = AutoModelForCausalLM.from_pretrained(
+            tmp_path,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+
+        for (name, p1), (_, p2) in zip(
+            model.named_parameters(),
+            loaded.named_parameters(),
+        ):
+            torch.testing.assert_close(p1, p2, msg=f"Mismatch in {name}")
+
+    def test_tokenizer_save_load_roundtrip(self, hub_repo, tmp_path) -> None:
+        """Tokenizer must survive Hub → save_pretrained → AutoTokenizer.from_pretrained."""
+        tokenizer = AutoTokenizer.from_pretrained(hub_repo)
+        tokenizer.save_pretrained(tmp_path)
+
+        loaded = AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
+
+        text = "Hello world"
+        ids_original = tokenizer.encode(text)
+        ids_loaded = loaded.encode(text)
+        assert ids_original == ids_loaded
 
 
 # ---------------------------------------------------------------------------
