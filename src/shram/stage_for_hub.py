@@ -249,6 +249,84 @@ def _rewrite_imports(
 
 
 # ---------------------------------------------------------------------------
+# Manifest injection
+# ---------------------------------------------------------------------------
+
+def _find_docstring_end(lines: list[str]) -> int:
+    """Return the line index immediately after the closing triple-quote of the module docstring.
+
+    Args:
+        lines: Source file split into lines (no line endings).
+
+    Returns:
+        Index of the first line after the closing triple-quote.
+
+    Raises:
+        ValueError: If no module docstring is found or it is not closed.
+    """
+    if not lines or not lines[0].startswith('"""'):
+        raise ValueError("No module docstring found at start of file.")
+
+    # Docstring opens and closes on the same line.
+    if lines[0].count('"""') >= 2:
+        return 1
+
+    for i, line in enumerate(lines[1:], start=1):
+        if '"""' in line:
+            return i + 1
+
+    raise ValueError("Module docstring is not closed.")
+
+
+def _build_manifest(flat_names: list[str]) -> str:
+    """Build the manifest import block for staged huggingface.py.
+
+    The manifest ensures HuggingFace's check_imports resolves all staged modules
+    from the single entry point. Without it, local from_pretrained only fetches
+    direct imports and misses second-level dependencies, causing local loading to
+    fail.
+
+    Args:
+        flat_names: Flat module names to include (excluding 'huggingface'), in any order.
+
+    Returns:
+        The manifest block as a string with a leading and trailing blank line.
+    """
+    lines = [
+        "",
+        "### manifest",
+        "# HuggingFace's check_imports only resolves one level of imports from the",
+        "# entry point file. Without the imports below, any module not directly",
+        "# imported here would be missing when loading from a local path via",
+        "# from_pretrained. These imports are intentionally non-functional (aliased",
+        "# to _ ) to make clear they exist solely for dependency resolution.",
+        "#### imports",
+    ]
+    for name in sorted(flat_names):
+        lines.append(f"from . import {name} as _")
+    lines.append("# end manifest")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _inject_manifest(source: str, flat_names: list[str]) -> str:
+    """Inject the manifest import block into source immediately after the module docstring.
+
+    Args:
+        source: Python source code of the staged huggingface.py.
+        flat_names: All flat module names present in the staging output, excluding 'huggingface'.
+
+    Returns:
+        Modified source with the manifest block injected after the module docstring.
+    """
+    lines = source.splitlines()
+    insert_index = _find_docstring_end(lines)
+    manifest_lines = _build_manifest(flat_names).splitlines()
+    result = lines[:insert_index] + manifest_lines + lines[insert_index:]
+    return "\n".join(result) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Staging
 # ---------------------------------------------------------------------------
 
@@ -273,6 +351,8 @@ def stage(
         abs_package: Absolute import prefix that maps to source_dir root.
             Defaults to "src.shram.model".
     """
+    flat_names: list[str] = []
+
     for src_path in sorted(source_dir.rglob("*")):
         if not src_path.is_file():
             continue
@@ -294,5 +374,11 @@ def stage(
             source = src_path.read_text(encoding="utf-8")
             rewritten = _rewrite_imports(source, source_dir, rel, abs_package)
             dst_path.write_text(rewritten, encoding="utf-8")
+            if flat_name != "huggingface":
+                flat_names.append(flat_name)
         else:
             shutil.copy2(src_path, dst_path)
+
+    hf_path = dest_dir / "huggingface.py"
+    injected = _inject_manifest(hf_path.read_text(encoding="utf-8"), flat_names)
+    hf_path.write_text(injected, encoding="utf-8")
