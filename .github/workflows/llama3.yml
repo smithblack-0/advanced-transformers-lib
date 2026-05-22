@@ -39,7 +39,7 @@ jobs:
       - name: Upload to dev Hub
         env:
           LLAMA3_HF_TOKEN: ${{ secrets.LLAMA3_DEV_HF_TOKEN }}
-        run: python -m llama3.upload_to_hub
+        run: python -m llama3.upload_to_hub dev
 
   e2e_staging:
     needs: upload_dev
@@ -69,7 +69,7 @@ jobs:
       - name: Upload to production repository
         env:
           LLAMA3_HF_TOKEN: ${{ secrets.LLAMA3_HF_TOKEN }}
-        run: python -m llama3.upload_to_hub
+        run: python -m llama3.upload_to_hub main
 
   publish_release:
     needs: upload_main

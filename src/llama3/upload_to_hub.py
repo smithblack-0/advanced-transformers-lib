@@ -1,11 +1,14 @@
 """Publish the Llama 3 architecture and tokenizer to HuggingFace Hub.
 
-Run as a module from the repository root:
+Invoked by the GitHub Actions release pipeline. Requires a target environment
+argument: "dev" uploads to the staging repository, "main" uploads to production.
 
-    python -m src.llama3.upload_to_hub
+    python -m llama3.upload_to_hub dev
+    python -m llama3.upload_to_hub main
 
 The script reads a HuggingFace write-access token from the LLAMA3_HF_TOKEN
-environment variable. The token is passed directly to the API and never stored anywhere.
+environment variable. Tokens are stored as GitHub secrets and are only available
+within the release pipeline — manual invocation is not supported.
 
 What is uploaded: every file in src/llama3/model/ -- Python source, config.json,
 tokenizer files, and README.md (architecture card). This folder is the exact Hub root.
@@ -14,6 +17,7 @@ What is never uploaded: weights. No weight files exist in src/llama3/model/,
 making accidental upload structurally impossible.
 """
 
+import sys
 import os
 import tempfile
 from pathlib import Path
@@ -26,7 +30,10 @@ from .tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
 
-REPO_ID = "smithblack-0/llama3_baseline"
+REPOS = {
+    "dev": "smithblack-0/llama3_baseline_dev",
+    "main": "smithblack-0/llama3_baseline",
+}
 MODEL_DIR = Path(__file__).parent / "model"
 _CARD_TEMPLATE = Path(__file__).parent / "model_card.md"
 
@@ -78,7 +85,7 @@ def _render_card(config: Llama3Config, repo_id: str) -> str:
     return template.format(repo_id=repo_id, config_table=config_table)
 
 
-def upload(repo_id: str = REPO_ID) -> None:
+def upload(repo_id: str) -> None:
     """Prepare and publish the architecture and tokenizer to the Hub.
 
     Reads the HuggingFace write token from the LLAMA3_HF_TOKEN environment
@@ -89,12 +96,11 @@ def upload(repo_id: str = REPO_ID) -> None:
     4. Stage model files into a temporary flat directory
     5. Upload the staging directory to the Hub repository root
 
-    If REPO_ID is None, exits immediately with an informative message.
     The repository must already exist on HuggingFace Hub before running.
-    See src/llama3/documentation.md for setup instructions.
+    See src/llama3/documentation.md for the release pipeline instructions.
 
     Args:
-        repo_id: Target Hub repository in 'namespace/name' format, or None to skip.
+        repo_id: Target Hub repository in 'namespace/name' format.
     """
     if repo_id is None:
         print("REPO_ID is not set. Skipping upload.")
@@ -137,4 +143,7 @@ def upload(repo_id: str = REPO_ID) -> None:
 
 
 if __name__ == "__main__":
-    upload()
+    if len(sys.argv) != 2 or sys.argv[1] not in REPOS:
+        print(f"Usage: python -m llama3.upload_to_hub [dev|main]", file=sys.stderr)
+        sys.exit(1)
+    upload(REPOS[sys.argv[1]])
