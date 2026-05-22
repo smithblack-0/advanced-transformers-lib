@@ -1,6 +1,29 @@
 # advanced-transformers-lib -- Llama 3 Baseline: Developer Guide
 
-## Uploading the Architecture to HuggingFace Hub
+## Automated Release Pipeline
+
+The preferred way to publish is through the GitHub Actions release pipeline. It enforces the invariant that the production Hub repository is never written unless E2E tests have passed against a staging repository first.
+
+**How to trigger a release:**
+
+1. On GitHub, go to Releases and create a new release against `master`.
+2. Set it as a **Pre-release** (check the "This is a pre-release" checkbox).
+3. Publish it immediately — do not save as draft.
+
+Publishing a prerelease triggers the pipeline:
+1. Integration tests run against the current code.
+2. If tests pass, the architecture is uploaded to the staging Hub repository (`smithblack-0/llama3_baseline_dev`).
+3. E2E network tests run against the staging repository.
+4. If E2E tests pass, the architecture is uploaded to the production Hub repository (`smithblack-0/llama3_baseline`).
+5. The prerelease is automatically promoted to a full release.
+
+The prerelease state is intentional and honest — it signals that the pipeline is in progress. Promotion to a full release is the signal that everything passed.
+
+**If the pipeline fails:** the prerelease remains in prerelease state. Inspect the failing job in the Actions tab, fix the issue, delete the failed release, and create a new prerelease to re-run.
+
+---
+
+## Uploading the Architecture to HuggingFace Hub (manual)
 
 ### Steps
 
