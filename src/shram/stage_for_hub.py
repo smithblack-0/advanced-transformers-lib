@@ -27,6 +27,12 @@ from typing import Optional
 
 import libcst as cst
 
+# Files excluded from Hub staging by stem. Add entries here for any source file
+# that must not be uploaded (e.g. test oracles, local development utilities).
+_STAGING_IGNORE = (
+    "slow_mosrah_cache",
+)
+
 
 # ---------------------------------------------------------------------------
 # Naming
@@ -344,6 +350,7 @@ def stage(
     Files excluded from staging:
     - __pycache__ directories and .pyc files
     - __init__.py files inside subdirectories
+    - files whose stem appears in _STAGING_IGNORE (e.g. test oracles)
 
     Args:
         source_dir: Source model directory (e.g. src/shram/model/).
@@ -362,6 +369,8 @@ def stage(
         if any(part == "__pycache__" for part in rel.parts):
             continue
         if src_path.suffix == ".pyc":
+            continue
+        if src_path.stem in _STAGING_IGNORE:
             continue
 
         flat_name = compute_flat_name(rel)
