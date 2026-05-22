@@ -10,6 +10,8 @@ jobs:
   llama3:
     if: github.event_name == 'pull_request' || github.event.release.draft == true
     uses: ./.github/workflows/llama3.yml
+    permissions:
+      contents: write
     with:
       run_upload: ${{ github.event_name == 'release' }}
     secrets:
@@ -19,6 +21,8 @@ jobs:
   shram:
     if: github.event_name == 'pull_request' || github.event.release.draft == true
     uses: ./.github/workflows/shram.yml
+    permissions:
+      contents: write
     with:
       run_upload: ${{ github.event_name == 'release' }}
     secrets:
