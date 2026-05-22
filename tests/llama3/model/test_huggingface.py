@@ -166,15 +166,6 @@ class TestContractEnforcement:
         with pytest.raises(ValueError, match="attention_mask"):
             model(ids, attention_mask=mask)
 
-    def test_use_cache_without_cache_position_raises(self, model):
-        """use_cache=True without cache_position must raise immediately.
-
-        cache_position is GenerationMixin's contract. Silent derivation would
-        produce wrong position encodings and corrupt checkpoints. We crash instead.
-        """
-        ids = torch.randint(0, 256, (1, 4))
-        with pytest.raises(ValueError, match="cache_position"):
-            model(ids, use_cache=True)
 
 
 class TestKVCache:

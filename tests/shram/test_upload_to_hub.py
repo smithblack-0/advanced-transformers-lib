@@ -13,7 +13,14 @@ from pathlib import Path
 import pytest
 
 from src.shram.model.configuration import ShramConfig
-from src.shram.stage_for_hub import _rewrite_imports, compute_flat_name, stage
+from src.shram.stage_for_hub import (
+    _build_manifest,
+    _find_docstring_end,
+    _inject_manifest,
+    _rewrite_imports,
+    compute_flat_name,
+    stage,
+)
 from src.shram.upload_to_hub import _render_card, _render_config_table, upload
 
 MODEL_DIR = Path(__file__).parent.parent.parent / "src" / "shram" / "model"
@@ -182,6 +189,96 @@ class TestRewriteImports:
 
 
 # ---------------------------------------------------------------------------
+# _find_docstring_end
+# ---------------------------------------------------------------------------
+
+class TestFindDocstringEnd:
+    def test_multiline_docstring(self):
+        """Returned index must point to the line after the closing triple-quote."""
+        source = '"""Line one.\n\nLine two.\n"""\nx = 1\n'
+        lines = source.splitlines()
+        idx = _find_docstring_end(lines)
+        assert '"""' in lines[idx - 1]
+        assert lines[idx] == "x = 1"
+
+    def test_single_line_docstring(self):
+        """Single-line docstring: returned index must point to the line after it."""
+        source = '"""Short."""\nx = 1\n'
+        lines = source.splitlines()
+        idx = _find_docstring_end(lines)
+        assert '"""' in lines[idx - 1]
+        assert lines[idx] == "x = 1"
+
+    def test_no_docstring_raises(self):
+        """Source with no leading triple-quote raises ValueError."""
+        source = "x = 1\n"
+        lines = source.splitlines()
+        with pytest.raises(ValueError):
+            _find_docstring_end(lines)
+
+    def test_unclosed_docstring_raises(self):
+        """Source with an opened but never closed docstring raises ValueError."""
+        source = '"""Never closed\nx = 1\n'
+        lines = source.splitlines()
+        with pytest.raises(ValueError):
+            _find_docstring_end(lines)
+
+
+# ---------------------------------------------------------------------------
+# _build_manifest
+# ---------------------------------------------------------------------------
+
+class TestBuildManifest:
+    def test_contains_all_names(self):
+        """Every supplied name must appear as a manifest import line."""
+        names = ["configuration", "__cache__shram_cache"]
+        result = _build_manifest(names)
+        assert "from . import configuration as _" in result
+        assert "from . import __cache__shram_cache as _" in result
+
+    def test_names_sorted(self):
+        """Import lines must appear in alphabetical order."""
+        names = ["z_module", "a_module"]
+        result = _build_manifest(names)
+        assert result.index("a_module") < result.index("z_module")
+
+    def test_manifest_markers_present(self):
+        """Output must contain opening and closing manifest markers."""
+        result = _build_manifest(["foo"])
+        assert "### manifest" in result
+        assert "# end manifest" in result
+
+
+# ---------------------------------------------------------------------------
+# _inject_manifest
+# ---------------------------------------------------------------------------
+
+class TestInjectManifest:
+    def test_manifest_follows_docstring(self):
+        """Manifest block must appear after the docstring and before the rest of the file."""
+        source = '"""Docstring."""\nimport torch\n'
+        result = _inject_manifest(source, ["configuration"])
+        docstring_pos = result.index('"""Docstring."""')
+        manifest_pos = result.index("### manifest")
+        import_pos = result.index("import torch")
+        assert docstring_pos < manifest_pos < import_pos
+
+    def test_import_line_present(self):
+        """Each supplied name must appear as an import line in the output."""
+        source = '"""Docstring."""\nimport torch\n'
+        result = _inject_manifest(source, ["configuration"])
+        assert "from . import configuration as _" in result
+
+    def test_original_content_preserved(self):
+        """Content after the docstring must be preserved unchanged."""
+        source = '"""Docstring."""\nimport torch\nx = 1\n'
+        result = _inject_manifest(source, ["foo"])
+        assert "import torch" in result
+        assert "x = 1" in result
+        assert '"""Docstring."""' in result
+
+
+# ---------------------------------------------------------------------------
 # stage
 # ---------------------------------------------------------------------------
 
@@ -214,6 +311,20 @@ class TestStage:
             staged_files = [p.name for p in Path(tmp).iterdir()]
             init_files = [f for f in staged_files if f == "__init__.py"]
             assert len(init_files) <= 1
+
+    def test_manifest_injected(self):
+        """Staged huggingface.py must contain a manifest import for every other staged .py module."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stage(MODEL_DIR, Path(tmp))
+            hf_source = (Path(tmp) / "huggingface.py").read_text(encoding="utf-8")
+            staged_names = [
+                p.stem for p in Path(tmp).iterdir()
+                if p.suffix == ".py" and p.stem != "huggingface"
+            ]
+            for name in staged_names:
+                assert f"from . import {name} as _" in hf_source, (
+                    f"Manifest missing import for staged module: {name}"
+                )
 
     def test_staged_files_importable(self):
         """Staged huggingface module must be importable and expose ShramForCausalLM.
