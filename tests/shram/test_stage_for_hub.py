@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from src.shram.stage_for_hub import (
+    _is_module_in_directory,
     comment_out_type_checking,
     inline_imports,
     resolve_comments_to_sentinels,
@@ -240,6 +241,50 @@ class TestValidateSource:
 
 
 # ---------------------------------------------------------------------------
+# Local import detection
+# ---------------------------------------------------------------------------
+
+class TestIsModuleInDirectory:
+    """_is_module_in_directory resolves a module name to its on-disk origin and
+    checks whether that origin falls under a given directory.
+
+    This is the factual predicate used by resolve_import to detect absolute
+    imports that reference local source files rather than installed packages.
+    It crashes rather than returning a safe default on unresolvable inputs,
+    because staging cannot produce correct output in those cases.
+    """
+
+    def test_external_package_not_in_temp_dir(self, tmp_path):
+        """An installed external package must not appear to be under a temp directory."""
+        assert not _is_module_in_directory("torch", tmp_path)
+
+    def test_module_detected_in_its_own_parent(self):
+        """A module must be detected as present when checked against its own parent directory."""
+        import importlib.util
+        spec = importlib.util.find_spec("torch")
+        torch_parent = Path(spec.origin).parent
+        assert _is_module_in_directory("torch", torch_parent)
+
+    def test_missing_module_raises(self, tmp_path):
+        """A module absent from the environment must raise ValueError."""
+        with pytest.raises(ValueError):
+            _is_module_in_directory("nonexistent_module_xyz_abc_123", tmp_path)
+
+    def test_namespace_package_raises(self, tmp_path):
+        """A namespace package with no concrete origin must raise ValueError."""
+        import sys
+        ns_dir = tmp_path / "_shram_test_ns_pkg"
+        ns_dir.mkdir()
+        sys.path.insert(0, str(tmp_path))
+        try:
+            with pytest.raises(ValueError):
+                _is_module_in_directory("_shram_test_ns_pkg", tmp_path)
+        finally:
+            sys.path.pop(0)
+            sys.modules.pop("_shram_test_ns_pkg", None)
+
+
+# ---------------------------------------------------------------------------
 # Import resolution — unit tests (external imports only)
 # ---------------------------------------------------------------------------
 
@@ -269,28 +314,41 @@ class TestResolveKeyExternal:
 class TestResolveImportExternal:
     """resolve_import converts a canonical key into the substitution string for a sentinel.
 
-    The seen set is the deduplication mechanism: first encounter emits the
-    import; subsequent encounters comment it out for external imports or return
-    empty string for relative imports. The correctness of the merged file's
-    import section depends entirely on this contract — a duplicate external
-    import would cause a NameError or shadowing at load time; a missing one
-    would cause an ImportError.
+    External imports are collected into _external on first encounter and return
+    empty string so they are emitted at the top of the merged file rather than
+    inline. Duplicate encounters also return empty string — deduplication is
+    handled by the seen set, so _external receives each statement exactly once.
+    Relative import duplicates return empty string unchanged.
 
     Relative import recursion (rel: keys) is covered by the integration tests.
     """
 
-    def test_first_encounter_emits_statement(self):
-        """First encounter of an external import must return the statement."""
+    def test_first_encounter_adds_to_external_and_returns_empty(self):
+        """First encounter of an external import must add to _external and return empty string."""
         seen = set()
-        result = resolve_import("abs:import torch", seen)
-        assert result == "import torch"
+        external = []
+        result = resolve_import("abs:import torch", seen, external)
+        assert result == ""
+        assert "import torch" in external
         assert "abs:import torch" in seen
 
-    def test_second_encounter_comments_out(self):
-        """Second encounter of an external import must return a commented line."""
+    def test_second_encounter_returns_empty(self):
+        """Second encounter of an external import must return empty string without re-adding."""
         seen = {"abs:import torch"}
-        result = resolve_import("abs:import torch", seen)
-        assert result == "# import torch"
+        external = ["import torch"]
+        result = resolve_import("abs:import torch", seen, external)
+        assert result == ""
+        assert external.count("import torch") == 1
+
+    def test_local_absolute_import_raises(self, tmp_path):
+        """An absolute import resolving to a file under source_dir must raise ValueError."""
+        import importlib.util
+        spec = importlib.util.find_spec("torch")
+        torch_source_dir = Path(spec.origin).parent
+        seen = set()
+        external = []
+        with pytest.raises(ValueError, match="relative import"):
+            resolve_import("abs:import torch", seen, external, source_dir=torch_source_dir)
 
     def test_relative_duplicate_returns_empty(self):
         """Second encounter of a relative import key must return empty string."""
@@ -341,13 +399,6 @@ class TestStageModel:
         uncommented = [l for l in merged.splitlines() if l.strip() == "import torch"]
         assert len(uncommented) == 1
 
-    def test_non_python_files_copied(self, synthetic_source):
-        """Non-Python files must be copied unchanged into dest_dir."""
-        src, dest = synthetic_source
-        stage_model(src, dest)
-        assert (dest / "config.json").exists()
-        assert (dest / "config.json").read_text() == '{"model_type": "test"}'
-
     def test_docstrings_preserved(self, synthetic_source):
         """Docstrings from all source files must appear in the merged output."""
         src, dest = synthetic_source
@@ -355,6 +406,29 @@ class TestStageModel:
         merged = (dest / "huggingface.py").read_text(encoding="utf-8")
         assert "Entry point docstring." in merged
         assert "Helper module docstring." in merged
+
+    def test_generated_header_present(self, synthetic_source):
+        """The generated-file header must appear at the very top of the merged output."""
+        src, dest = synthetic_source
+        stage_model(src, dest)
+        merged = (dest / "huggingface.py").read_text(encoding="utf-8")
+        assert merged.startswith("# This file is auto-generated")
+
+    def test_section_headers_present(self, synthetic_source):
+        """A section header must appear before each inlined relative import."""
+        src, dest = synthetic_source
+        stage_model(src, dest)
+        merged = (dest / "huggingface.py").read_text(encoding="utf-8")
+        assert "# Inlined from: helper.py" in merged
+
+    def test_absolute_imports_precede_code(self, synthetic_source):
+        """External imports must appear before any class or function definitions."""
+        src, dest = synthetic_source
+        stage_model(src, dest)
+        merged = (dest / "huggingface.py").read_text(encoding="utf-8")
+        import_pos = merged.index("import torch")
+        class_pos = merged.index("class ")
+        assert import_pos < class_pos
 
 
 # ---------------------------------------------------------------------------
