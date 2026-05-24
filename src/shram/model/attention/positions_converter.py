@@ -12,8 +12,8 @@ This layer computes the packed position tensor P consumed by BEA.
 import torch
 from torch import nn
 
-from src.shram.model.configuration import ShramConfig
-from src.shram.model.cache.mosrah_cache import MoSRAHCache
+from ..configuration import ShramConfig
+from ..cache.mosrah_cache import MoSRAHCache
 
 
 class SparseMoSRAHPositions(nn.Module):

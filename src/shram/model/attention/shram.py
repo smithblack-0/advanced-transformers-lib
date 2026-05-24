@@ -14,10 +14,10 @@ sparse-path load-balance loss must remain visible to the caller.
 import torch
 from torch import nn
 
-from src.shram.model.cache.shram_layer_cache import ShramLayerCache
-from src.shram.model.configuration import ShramConfig
-from src.shram.model.attention.sliding_window_attention import SlidingWindowAttention
-from src.shram.model.attention.mosrah import MoSRAHLayer
+from ..cache.shram_layer_cache import ShramLayerCache
+from ..configuration import ShramConfig
+from .sliding_window_attention import SlidingWindowAttention
+from .mosrah import MoSRAHLayer
 
 
 class SHRAMHybridLayer(nn.Module):

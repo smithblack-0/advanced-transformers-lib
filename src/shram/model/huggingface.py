@@ -71,7 +71,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
     base_model_prefix = "model"
     _no_split_modules = ["DecoderLayer"]
     supports_gradient_checkpointing = True
-
+    _supports_assign_param_buffer = False
     def __init__(self, config: ShramConfig) -> None:
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.embedding_width)
