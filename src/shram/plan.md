@@ -84,7 +84,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 19.G.4 (Blocker) — Restore mask symmetry for compiled inference via create_masks_for_generate override
 - [X] Unit 19.G.5 (Blocker) — Static cache rebuild for compiled inference
 - [ ] Unit 20.A (Blocker) — Release pipeline: dev repository staging and E2E test gate
-- [ ] Unit 20.B — stage_for_hub.py: inject explicit import block into staged huggingface.py
+- [X] Unit 20.B — stage_for_hub.py: inject explicit import block into staged huggingface.py
 - [ ] Unit 21 — Final audit
 
 ---
@@ -2554,32 +2554,37 @@ While it would in theory be possible to use the git nature of huggingface model 
 
 ---
 
-### Unit 20.B — stage_for_hub.py: inject explicit import block into staged huggingface.py
+### Unit 20.B — stage_for_hub.py: single-file inline staging
 
-**Responsibility:** Extend the staging system to inject an explicit import block into the staged `huggingface.py` that references all other staged Python modules, so that local `from_pretrained` dependency resolution succeeds.
+**Responsibility:** Replace the staging system with one that produces a single merged `huggingface.py` containing all model Python code, satisfying HuggingFace's single-model-file loading contract.
 
 **Context of Correctness:**
 
 Real world testing has revealed an issue. It is not in fact possible to load our model through AutoModel with a from_pretrained predicate on a local disk. Further investigation has lead to the understanding that while remote fetches recursively resolve all dependencies into the huggingface cache, local loads do not. As such, only the files that are directly imported in huggingface.py are being transferred into the cache, causing a crash when the system tries to load it. This is found in get_cached_module_file.
 
-While this issue can, in theory, be corrected by directly registering the model, this bypasses the premise of isolation the test harness was designed under. Instead, stage_for_hub can be tweaked in a minor way to insert a new block after the main docstring that imports every file which has been built. This process then ensures those files will be captured and imported instead.
+While this issue can, in theory, be corrected by directly registering the model, this bypasses the premise of isolation the test harness was designed under. No minor tweak of huggingface will fix the issue. Instead, flattening the model down to one file will fix the issue. We resolve the model to a single huggingface.py file instead. 
 
 **Invariants:**
-- The staged `huggingface.py` contains import statements referencing every other Python module present in the staging output
-- The injection occurs in the staged output only; no source file under `src/shram/model/` is modified by staging
-- The staged content of all other files is unchanged from what the current implementation produces
-- `AutoModelForCausalLM.from_pretrained(path, local_files_only=True, trust_remote_code=True)` succeeds on a checkpoint saved via `save_pretrained`
-- The `stage(source_dir, dest_dir)` public interface is unchanged
+- `stage(source_dir, dest_dir)` stages by looking into source directory and moving a staged version into destination directory.
+- The staging output contains exactly one Python model-containing file: `huggingface.py`
+- That file contains all model Python code reachable from `source_dir/huggingface.py` via relative imports, inlined in dependency order
+- No relative imports appear anywhere in the merged `huggingface.py`
+- External imports appear exactly once; duplicate occurrences are commented out with `# `
+- All docstrings and comments from source files are preserved verbatim in the merged output
+- No source file under `source_dir` is modified by staging; all writes go to `dest_dir` only
+- Other relevant files present in `source_dir` are copied into `dest_dir` unchanged
+- `AutoModelForCausalLM.from_pretrained(path, local_files_only=True, trust_remote_code=True)` succeeds on a directory produced by `stage()`
 
 **Tests:**
-- Stage a known source directory; verify the staged `huggingface.py` contains an import statement for every other `.py` file present in the staging output
-- Verify `TestE2ESaveLoad.test_model_save_load_roundtrip` passes
-- Verify all existing `stage_for_hub.py` tests continue to pass
+- Stage a known source directory; verify the output contains exactly one `.py` file named `huggingface.py`
+- Verify no relative import statements remain in the merged file
+- Verify `test_model_save_load_roundtrip` passes against a staged directory
+- Verify non-Python files are present in the staging output unchanged
+- Verify docstrings and comments from source files are present in the merged output
 
 **Preliminary Implementation Strategy:**
-- During the `stage()` loop, collect the flat names of all staged `.py` files
-- After all files are written, post-process the staged `huggingface.py`: parse with libcst, locate the module docstring, insert `from . import <flat_name>` statements immediately after it for every staged file other than `huggingface` itself, write back
-- The relative single-dot import form matches the existing rewritten import style and is the form `check_imports` recognizes
+
+Adapt the algorithm from [python-import-inliner](https://github.com/dobrakmato/python-import-inliner). Maintain `inlined` (set of already-processed file paths) and `seen_imports` (set of already-emitted external import lines). `inline_file(file, base, out)` iterates lines: relative imports are resolved and recursively inlined if not yet seen, otherwise commented out; external `import x` lines are emitted once then commented on recurrence; all other lines emit as-is. `stage()` calls `inline_file` starting from `source_dir / "huggingface.py"`, writes the result to `dest_dir / "huggingface.py"`, then copies non-Python files with `shutil.copy2`.
 
 ---
 

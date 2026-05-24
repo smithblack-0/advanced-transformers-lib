@@ -16,16 +16,16 @@ In particular, this path must preserve three architectural distinctions:
 import torch
 from torch import nn
 
-from src.shram.model.cache.mosrah_cache import MoSRAHCache
-from src.shram.model.configuration import ShramConfig
-from src.shram.model.attention.bottlenecked_ensemble_attention import BottleneckedEnsembleAttention
-from src.shram.model.attention.expert_packing import (
+from ..cache.mosrah_cache import MoSRAHCache
+from ..configuration import ShramConfig
+from .bottlenecked_ensemble_attention import BottleneckedEnsembleAttention
+from .expert_packing import (
     pack_experts,
     setup_packing,
     unpack_experts,
 )
-from src.shram.model.attention.router import MoSRAHRouter
-from src.shram.model.attention.positions_converter import SparseMoSRAHPositions
+from .router import MoSRAHRouter
+from .positions_converter import SparseMoSRAHPositions
 
 
 class MoSRAHLayer(nn.Module):

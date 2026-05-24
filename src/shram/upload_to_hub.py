@@ -20,13 +20,14 @@ making accidental upload structurally impossible.
 
 import sys
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
 from huggingface_hub import upload_folder
 
 from .model.configuration import ShramConfig
-from .stage_for_hub import stage
+from .stage_for_hub import stage_model
 from .tokenizer import prepare_tokenizer
 
 # --- Configuration -----------------------------------------------------------
@@ -96,16 +97,45 @@ def _render_card(config: ShramConfig, repo_id: str) -> str:
     return template.format(repo_id=repo_id, config_table=config_table)
 
 
+def stage(
+    source_dir: Path,
+    dest_dir: Path,
+    repo_id: str,
+    config: ShramConfig = ShramConfig(),
+) -> None:
+    """Prepare a complete Hub-ready staging directory from a model source directory.
+
+    Refreshes tokenizer files, writes config.json and README.md into dest_dir,
+    then inlines all model Python code into a single dest_dir/huggingface.py
+    and copies all non-Python files alongside it. The result is a directory
+    from which AutoModelForCausalLM.from_pretrained with local_files_only=True
+    succeeds.
+
+    Args:
+        source_dir: Source model directory (e.g. src/shram/model/).
+        dest_dir: Destination staging directory; must already exist.
+        repo_id: Hub repository identifier, used to render the architecture card.
+        config: ShramConfig providing defaults; overridable for testing.
+    """
+    print("Step 1/3 -- Refreshing tokenizer...")
+    prepare_tokenizer(dest_dir)
+
+    print("Step 2/3 -- Writing config.json and README.md...")
+    config.save_pretrained(dest_dir)
+    card = _render_card(config, repo_id)
+    (dest_dir / "README.md").write_text(card, encoding="utf-8")
+
+    print("Step 3/3 -- Inlining model source and copying configuration...")
+    shutil.copy2(source_dir / "configuration.py", dest_dir / "configuration.py")
+    stage_model(source_dir, dest_dir)
+
+
 def upload(repo_id: str) -> None:
     """Prepare and publish the architecture and tokenizer to the Hub.
 
     Reads the HuggingFace write token from the SHRAM_HF_TOKEN environment
-    variable, then runs five steps:
-    1. Refresh tokenizer files in model/ via prepare_tokenizer()
-    2. Write config.json to model/ from ShramConfig defaults
-    3. Render and write README.md (architecture card) to model/
-    4. Stage model files into a temporary flat directory
-    5. Upload the staging directory to the Hub repository root
+    variable, stages the model into a temporary directory, then uploads it
+    to the Hub repository root.
 
     The repository must already exist on HuggingFace Hub before running.
     See src/shram/documentation.md for the release pipeline instructions.
@@ -121,24 +151,11 @@ def upload(repo_id: str) -> None:
     if token is None:
         raise EnvironmentError("SHRAM_HF_TOKEN environment variable is not set.")
 
-    print("Step 1/4 -- Refreshing tokenizer...")
-    prepare_tokenizer()
-
-    config = ShramConfig()
-
-    print("Step 2/4 -- Writing config.json...")
-    config.save_pretrained(MODEL_DIR)
-
-    print("Step 3/4 -- Rendering architecture card...")
-    card = _render_card(config, repo_id)
-    (MODEL_DIR / "README.md").write_text(card, encoding="utf-8")
-
-    print("Step 4/5 -- Staging model files...")
     with tempfile.TemporaryDirectory() as tmp_dir:
         staging_dir = Path(tmp_dir)
-        stage(MODEL_DIR, staging_dir)
+        stage(MODEL_DIR, staging_dir, repo_id)
 
-        print(f"Step 5/5 -- Uploading to {repo_id}...")
+        print(f"Uploading to {repo_id}...")
         upload_folder(
             repo_id=repo_id,
             folder_path=staging_dir,

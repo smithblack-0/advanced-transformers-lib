@@ -551,6 +551,32 @@ class TestSaveLoadAndAutoClass:
         ):
             torch.testing.assert_close(p1, p2, msg=f"Mismatch in {name}")
 
+    def test_rope_tables_rebuilt_for_new_inference_length(self, tmp_path) -> None:
+        """Rope cos/sin tables must reflect the loaded config's inference_sequence_length.
+
+        HuggingFace's fast-init path (init_empty_weights) could silently copy stale
+        rope tables back into place after __init__ rebuilds them. This test catches
+        that regression by saving with one inference_sequence_length and loading with
+        a different one, then asserting both rope instances were built to the new length.
+        """
+        original_length = 32
+        new_length = 64
+
+        model = ShramForCausalLM(small_config(inference_sequence_length=original_length))
+        model.save_pretrained(tmp_path)
+
+        loaded = ShramForCausalLM.from_pretrained(tmp_path, inference_sequence_length=new_length)
+
+        local_rope = loaded.model.layers[0].attention.local_attention.rope
+        bea_rope = loaded.model.layers[0].attention.sparse_attention.bea.rope
+
+        assert local_rope._cos_cached.shape[0] == new_length, (
+            f"Local rope table has length {local_rope._cos_cached.shape[0]}, expected {new_length}"
+        )
+        assert bea_rope._cos_cached.shape[0] == new_length, (
+            f"BEA rope table has length {bea_rope._cos_cached.shape[0]}, expected {new_length}"
+        )
+
     def test_auto_model_from_config(self) -> None:
         """AutoModelForCausalLM.from_config must return a ShramForCausalLM when registered."""
         AutoModelForCausalLM.register(ShramConfig, ShramForCausalLM)

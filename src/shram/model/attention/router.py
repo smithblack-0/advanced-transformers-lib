@@ -32,8 +32,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.shram.model.configuration import ShramConfig
-from src.shram.model.attention.load_balance_loss import LoadBalanceLoss
+from ..configuration import ShramConfig
+from .load_balance_loss import LoadBalanceLoss
 
 
 class MoSRAHRouter(nn.Module):

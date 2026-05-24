@@ -37,7 +37,6 @@ import math
 import torch
 import torch.nn as nn
 
-
 # ---------------------------------------------------------------------------
 # Rotation helper
 # ---------------------------------------------------------------------------
@@ -119,6 +118,7 @@ class RotaryEmbedding(nn.Module):
         self._validate_yarn_params(mode, dilation, alpha, beta)
         self.mode = mode
         self._maximum_sequence_length = maximum_sequence_length
+        device = torch.device("cpu") if device is None else device
 
         # Compute per-dimension rotation frequencies θ_d (default) or θ_d' (yarn).
         # d_index ranges over 0, 2, 4, ..., head_dim-2 — one index per dimension pair,
@@ -160,12 +160,10 @@ class RotaryEmbedding(nn.Module):
         else:
             self._freq_key = ("yarn", head_dim, theta, maximum_sequence_length, dilation, alpha, beta)
 
-        # rotation_freqs is a non-persistent buffer so it moves with the model across
-        # devices via .to() / .cuda() without appearing in saved checkpoints.
-        # It is stored per-instance rather than in the shared cache because it is
-        # small (head_dim/2 floats) — negligible cost compared to the cos/sin tables
-        # it is used to build. The meaningful sharing win is on those tables.
-        self.register_buffer("rotation_freqs", rotation_freqs, persistent=False)
+        # rotation_freqs is a plain instance attribute, not a registered buffer.
+        # This keeps it out of the state dict and prevents HuggingFace's fast-init
+        # path from turning it into a meta tensor, which would break _build_cache.
+        self.rotation_freqs = rotation_freqs
 
         # Cache tensors are plain instance attributes (not registered buffers) so that
         # sharing across identically-parametrised instances survives .to() calls.
@@ -176,8 +174,7 @@ class RotaryEmbedding(nn.Module):
 
         # Build the table at construction time. Forward rebuilds only on dtype or
         # device change. If no device is specified, build on CPU as the default.
-        build_device = device if device is not None else torch.device("cpu")
-        self._build_cache(device=build_device, dtype=torch.float32)
+        self._build_cache(device=device, dtype=torch.float32)
 
     # ---------------------------------------------------------------------------
     # Validation helpers
