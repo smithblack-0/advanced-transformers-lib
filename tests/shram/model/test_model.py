@@ -47,33 +47,37 @@ def small_config(**overrides) -> ShramConfig:
 
 def make_model(
     config: ShramConfig,
+    device: torch.device,
     seed: int = 0,
 ) -> ShramModel:
     """Construct a deterministically initialized ShramModel."""
     torch.manual_seed(seed)
-    return ShramModel(config).eval()
+    return ShramModel(config).eval().to(device)
 
 
 def random_embeds(
     batch_size: int,
     sequence_length: int,
     embedding_width: int,
+    device: torch.device,
     seed: int = 0,
 ) -> torch.Tensor:
     """Construct deterministic random pre-embedded inputs."""
-    random_generator = torch.Generator(device="cpu")
+    random_generator = torch.Generator(device=str(device))
     random_generator.manual_seed(seed)
     return torch.randn(
         batch_size,
         sequence_length,
         embedding_width,
         generator=random_generator,
+        device=device,
     )
 
 
 def position_ids(
     batch_size: int,
     sequence_length: int,
+    device: torch.device,
     offset: int = 0,
 ) -> torch.Tensor:
     """Construct authoritative absolute position ids."""
@@ -81,18 +85,20 @@ def position_ids(
         offset,
         offset + sequence_length,
         dtype=torch.long,
+        device=device,
     ).unsqueeze(0).expand(batch_size, -1)
 
 
 def make_cache(
     config: ShramConfig,
     batch_size: int,
+    device: torch.device,
 ) -> ShramCache:
     """Construct a real top-level ShramCache."""
     return ShramCache(
         config=config,
         batch_size=batch_size,
-        device=torch.device("cpu"),
+        device=device,
     )
 
 
@@ -101,13 +107,13 @@ def make_cache(
 # ---------------------------------------------------------------------------
 
 class TestOutputContract:
-    def test_forward_returns_expected_output_dict_keys(self):
+    def test_forward_returns_expected_output_dict_keys(self, device):
         """ShramModel should expose the preserved output keys plus load_balance_loss and max_vio."""
         config = small_config()
-        model = make_model(config, seed=0)
+        model = make_model(config, device, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=1)
-        out = model(inputs_embeds, position_ids(1, 4), torch.ones(1, 4, dtype=torch.bool))
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, device, seed=1)
+        out = model(inputs_embeds, position_ids(1, 4, device), torch.ones(1, 4, dtype=torch.bool, device=device))
 
         assert type(out) is dict
         assert set(out.keys()) == {
@@ -118,13 +124,13 @@ class TestOutputContract:
             "max_vio",
         }
 
-    def test_last_hidden_state_shape_and_load_balance_loss_scalar_are_valid(self):
+    def test_last_hidden_state_shape_and_load_balance_loss_scalar_are_valid(self, device):
         """Real forward should preserve shape and return finite scalar auxiliary losses."""
         config = small_config()
-        model = make_model(config, seed=0)
+        model = make_model(config, device, seed=0)
 
-        inputs_embeds = random_embeds(2, 5, config.embedding_width, seed=2)
-        out = model(inputs_embeds, position_ids(2, 5), torch.ones(2, 5, dtype=torch.bool))
+        inputs_embeds = random_embeds(2, 5, config.embedding_width, device, seed=2)
+        out = model(inputs_embeds, position_ids(2, 5, device), torch.ones(2, 5, dtype=torch.bool, device=device))
 
         assert out["last_hidden_state"].shape == (2, 5, config.embedding_width)
         assert out["load_balance_loss"].ndim == 0
@@ -140,31 +146,31 @@ class TestOutputContract:
 # ---------------------------------------------------------------------------
 
 class TestHiddenStates:
-    def test_output_hidden_states_false_returns_none(self):
+    def test_output_hidden_states_false_returns_none(self, device):
         """The hidden_states field should remain None unless explicitly requested."""
         config = small_config()
-        model = make_model(config, seed=0)
+        model = make_model(config, device, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=3)
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, device, seed=3)
         out = model(
             inputs_embeds,
-            position_ids(1, 4),
-            torch.ones(1, 4, dtype=torch.bool),
+            position_ids(1, 4, device),
+            torch.ones(1, 4, dtype=torch.bool, device=device),
             output_hidden_states=False,
         )
 
         assert out["hidden_states"] is None
 
-    def test_output_hidden_states_true_returns_inputs_plus_one_entry_per_layer(self):
+    def test_output_hidden_states_true_returns_inputs_plus_one_entry_per_layer(self, device):
         """The hidden_states tuple should preserve the backbone's existing count semantics."""
         config = small_config()
-        model = make_model(config, seed=0)
+        model = make_model(config, device, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=4)
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, device, seed=4)
         out = model(
             inputs_embeds,
-            position_ids(1, 4),
-            torch.ones(1, 4, dtype=torch.bool),
+            position_ids(1, 4, device),
+            torch.ones(1, 4, dtype=torch.bool, device=device),
             output_hidden_states=True,
         )
 
@@ -182,33 +188,33 @@ class TestHiddenStates:
 # ---------------------------------------------------------------------------
 
 class TestCacheBoundary:
-    def test_without_cache_returns_none_for_past_key_values(self):
+    def test_without_cache_returns_none_for_past_key_values(self, device):
         """The no-cache backbone contract should remain unchanged."""
         config = small_config()
-        model = make_model(config, seed=0)
+        model = make_model(config, device, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=5)
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, device, seed=5)
         out = model(
             inputs_embeds,
-            position_ids(1, 4),
-            torch.ones(1, 4, dtype=torch.bool),
+            position_ids(1, 4, device),
+            torch.ones(1, 4, dtype=torch.bool, device=device),
             cache=None,
         )
 
         assert out["past_key_values"] is None
 
-    def test_with_cache_returns_same_top_level_shram_cache_object(self):
+    def test_with_cache_returns_same_top_level_shram_cache_object(self, device):
         """ShramModel should return the same top-level cache object it was given."""
         config = small_config()
-        model = make_model(config, seed=0)
+        model = make_model(config, device, seed=0)
 
-        inputs_embeds = random_embeds(1, 4, config.embedding_width, seed=6)
-        cache = make_cache(config, batch_size=1)
+        inputs_embeds = random_embeds(1, 4, config.embedding_width, device, seed=6)
+        cache = make_cache(config, batch_size=1, device=device)
 
         out = model(
             inputs_embeds,
-            position_ids(1, 4),
-            torch.ones(1, 4, dtype=torch.bool),
+            position_ids(1, 4, device),
+            torch.ones(1, 4, dtype=torch.bool, device=device),
             cache=cache,
         )
 

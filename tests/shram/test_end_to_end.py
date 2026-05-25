@@ -45,8 +45,8 @@ def small_config(**kwargs) -> ShramConfig:
 
 
 @pytest.fixture
-def model():
-    return ShramForCausalLM(small_config()).eval()
+def model(device):
+    return ShramForCausalLM(small_config()).eval().to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -54,21 +54,27 @@ def model():
 # ---------------------------------------------------------------------------
 
 class TestIntegrationGeneratable:
-    def test_output_shape(self, model):
+    def test_output_shape(self, model, device):
         """generate() must return (batch, input_len + max_new_tokens)."""
-        ids = torch.randint(0, 256, (1, 4))
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.reset()
+        ids = torch.randint(0, 256, (1, 4), device=device)
         out = model.generate(ids, max_new_tokens=5)
         assert out.shape == (1, 9)
 
-    def test_valid_token_ids(self, model):
+    def test_valid_token_ids(self, model, device):
         """All generated token IDs must be in [0, vocab_size)."""
-        ids = torch.randint(0, 256, (1, 4))
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.reset()
+        ids = torch.randint(0, 256, (1, 4), device=device)
         out = model.generate(ids, max_new_tokens=5)
         assert (out >= 0).all() and (out < model.config.vocab_size).all()
 
-    def test_determinism(self, model):
+    def test_determinism(self, model, device):
         """Greedy decoding must be deterministic: identical input produces identical output."""
-        ids = torch.randint(0, 256, (1, 4))
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.reset()
+        ids = torch.randint(0, 256, (1, 4), device=device)
         out1 = model.generate(ids, max_new_tokens=5)
         out2 = model.generate(ids, max_new_tokens=5)
         assert torch.equal(out1, out2)
@@ -79,7 +85,7 @@ class TestIntegrationGeneratable:
 # ---------------------------------------------------------------------------
 
 class TestIntegrationBeamSearch:
-    def test_cached_matches_uncached(self, model):
+    def test_cached_matches_uncached(self, model, device):
         """Beam search with use_cache=True must produce identical output to use_cache=False.
 
         With use_cache=False the model recomputes all key/values at every step —
@@ -88,7 +94,7 @@ class TestIntegrationBeamSearch:
         reorder_cache causes the model to attend to incorrect history and produce
         different tokens, making the mismatch detectable here.
         """
-        ids = torch.randint(0, 256, (1, 4))
+        ids = torch.randint(0, 256, (1, 4), device=device)
         out_cached = model.generate(ids, max_new_tokens=5, num_beams=2, use_cache=True)
         out_uncached = model.generate(ids, max_new_tokens=5, num_beams=2, use_cache=False)
         assert torch.equal(out_cached, out_uncached)
@@ -99,17 +105,17 @@ class TestIntegrationBeamSearch:
 # ---------------------------------------------------------------------------
 
 class TestIntegrationTrainable:
-    def test_loss_backward_runs(self):
+    def test_loss_backward_runs(self, device):
         """loss.backward() must complete without error on the full assembled model."""
-        m = ShramForCausalLM(small_config()).train()
-        ids = torch.randint(0, 256, (1, 4))
+        m = ShramForCausalLM(small_config()).train().to(device)
+        ids = torch.randint(0, 256, (1, 4), device=device)
         out = m(ids, labels=ids, use_cache=False)
         out.loss.backward()
 
-    def test_all_params_have_gradients(self):
+    def test_all_params_have_gradients(self, device):
         """Every trainable parameter must receive a gradient after backward()."""
-        m = ShramForCausalLM(small_config()).train()
-        ids = torch.randint(0, 256, (1, 4))
+        m = ShramForCausalLM(small_config()).train().to(device)
+        ids = torch.randint(0, 256, (1, 4), device=device)
         out = m(ids, labels=ids, use_cache=False)
         out.loss.backward()
         for name, param in m.named_parameters():
@@ -144,6 +150,34 @@ class TestIntegrationCompilable:
         m(ids, use_cache=False)
         compiled = torch.compile(m, fullgraph=False, dynamic=False)
         compiled(ids, use_cache=False)
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "Compiled inference requires CUDA; CPU compilation is not supported "
+            "for the cached inference path. "
+            "See https://github.com/pytorch/pytorch/issues/148752"
+        ),
+    )
+    def test_compiled_and_uncompiled_generate_produce_identical_output(self):
+        """Compiled and uncompiled generate() must produce identical token sequences.
+
+        Runs greedy decoding from the same input twice — once without compilation
+        and once with CompileConfig — and asserts the outputs are identical. Any
+        divergence indicates the compiled path is producing different attention or
+        routing behaviour than the eager path.
+        """
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.reset()
+
+        m = ShramForCausalLM(small_config()).cuda().eval()
+        ids = torch.randint(0, 256, (1, 4)).cuda()
+        compile_config = CompileConfig(fullgraph=False, dynamic=True)
+
+        out_eager = m.generate(ids, max_new_tokens=10, disable_compile=True)
+        torch._dynamo.reset()
+        out_compiled = m.generate(ids, max_new_tokens=10, compile_config=compile_config)
+        assert torch.equal(out_eager, out_compiled)
+
     @pytest.mark.skipif(
         not torch.cuda.is_available(),
         reason=(
@@ -265,18 +299,18 @@ class TestE2EGeneratable:
     """A Hub-loaded model must produce valid token sequences via generate()."""
 
     @pytest.fixture
-    def model(self, hub_config):
-        return AutoModelForCausalLM.from_config(hub_config, trust_remote_code=True).eval()
+    def model(self, hub_config, device):
+        return AutoModelForCausalLM.from_config(hub_config, trust_remote_code=True).eval().to(device)
 
-    def test_output_shape(self, model):
+    def test_output_shape(self, model, device):
         """generate() must return (batch, input_len + max_new_tokens)."""
-        ids = torch.randint(0, model.config.vocab_size, (1, 4))
+        ids = torch.randint(0, model.config.vocab_size, (1, 4), device=device)
         out = model.generate(ids, max_new_tokens=5)
         assert out.shape == (1, 9)
 
-    def test_valid_token_ids(self, model):
+    def test_valid_token_ids(self, model, device):
         """All generated token IDs must be in [0, vocab_size)."""
-        ids = torch.randint(0, model.config.vocab_size, (1, 4))
+        ids = torch.randint(0, model.config.vocab_size, (1, 4), device=device)
         out = model.generate(ids, max_new_tokens=5)
         assert (out >= 0).all() and (out < model.config.vocab_size).all()
 
@@ -335,18 +369,18 @@ class TestE2ETrainable:
     """A Hub-loaded model must support a complete training step."""
 
     @pytest.fixture
-    def model(self, hub_config):
-        return AutoModelForCausalLM.from_config(hub_config, trust_remote_code=True).train()
+    def model(self, hub_config, device):
+        return AutoModelForCausalLM.from_config(hub_config, trust_remote_code=True).train().to(device)
 
-    def test_loss_backward_runs(self, model):
+    def test_loss_backward_runs(self, model, device):
         """loss.backward() must complete without error on a Hub-loaded model."""
-        ids = torch.randint(0, model.config.vocab_size, (1, 4))
+        ids = torch.randint(0, model.config.vocab_size, (1, 4), device=device)
         out = model(ids, labels=ids, use_cache=False)
         out.loss.backward()
 
-    def test_all_params_have_gradients(self, model):
+    def test_all_params_have_gradients(self, model, device):
         """Every trainable parameter must receive a gradient after backward()."""
-        ids = torch.randint(0, model.config.vocab_size, (1, 4))
+        ids = torch.randint(0, model.config.vocab_size, (1, 4), device=device)
         out = model(ids, labels=ids, use_cache=False)
         out.loss.backward()
         for name, param in model.named_parameters():

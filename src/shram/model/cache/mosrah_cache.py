@@ -181,8 +181,7 @@ class MoSRAHCache(CacheLayerMixin):
         # boolean-mask transfer is correct without any explicit count verification.
         self.keys[dest_mask] = key_states[active_mask]
         self.values[dest_mask] = value_states[active_mask]
-
-        self._counts = post_counts
+        self._counts[:] = post_counts[:]
 
         return self.keys, self.values, self._make_active_mask()
 
