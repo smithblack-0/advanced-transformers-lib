@@ -83,9 +83,13 @@ is being achieved, one verified unit at a time.
 - [X] Unit 19.G.3 (Blocker) — Load balance frequency aggregation: p-mean and load_balance_p
 - [X] Unit 19.G.4 (Blocker) — Restore mask symmetry for compiled inference via create_masks_for_generate override
 - [X] Unit 19.G.5 (Blocker) — Static cache rebuild for compiled inference
-- [ ] Unit 20.A (Blocker) — Release pipeline: dev repository staging and E2E test gate
+- [X] Unit 20.A (Blocker) — Release pipeline: dev repository staging and E2E test gate
 - [X] Unit 20.B — stage_for_hub.py: inject explicit import block into staged huggingface.py
-- [ ] Unit 21 — Final audit
+- [ ] Unit 21 — Capacity issues
+- [ ] Unit 21.A — huggingface initialization fix
+- [ ] Unit 21.B — training capacity fix.
+- [ ] Unit 22.A — Investigating inference compile errors
+- [ ] Unit 23 — Final audit
 
 ---
 
@@ -2588,7 +2592,56 @@ Adapt the algorithm from [python-import-inliner](https://github.com/dobrakmato/p
 
 ---
 
-### Unit 21 — Final Audit
+### Unit 21 
+
+**Responsibility*
+
+Fix capacity issues that are causing training overflows
+
+**Context of Correctnesss**
+
+Between huggingface and the current load balancing strategy there is a problem. Initialization and usage of models during training are currently regularly exceed the capacity of limits of the MoSRAH formulation; during initialization in particular capacity is not evenly distributed in a manner such that over double the capacity is sometimes needed. This should not have happened, as the initialization mechanism using xavior uniform should have maintained variance within an acceptable region
+
+Further investigation has revealed huggingface manually overrides any initialization originally introduced, ensuring that the even capacity usage we were going to rely on does not in fact exist. Capacity limits are, bluntly, an issue again, as is the breakage of sane initialization assumptions and consequent possible training instability.
+
+### Unit 21.A — huggingface initialization fix
+
+**Responsibility**
+
+Modify initialization to be robust against huggingface trickery to maintain variance assumptions used for sane routing assignment.
+
+**Context of Correctness**
+
+Originally, it was presumed variance would remain approximately the same as the input sequence due to the usage of xavier uniform initialization on linear layers. This would have allowed routing operations to be chosen with about the same variance regardless, and thus equally distribute routing. This assumption turns out to be wrong. 
+
+Applying skip-init, however, smooths the underlying variance issues which may make training difficult. It should also stabilize training in a variety of useful ways.
+
+**Invariants**
+
+- Skip init with value of zero is applied at all residual connections on the primary layers
+- Layers start with a trainable vector of zeros masking their residual contributions but allowing gradients to turn them on during training.
+
+**Audit**
+
+- Verify solution is installed. 
+
+**Preliminary implementation strategy**
+
+- It looks like decoder_layer.py is the attachment point.
+
+### Unit 21.B - Training capacity fix.
+
+[Deferred: Does stabilization fix it?]
+
+**Responsibility**
+
+Permanent enduring capacity fix by explicit capacity handling in the routing stage
+
+**Context of Correctness**
+
+
+
+### Unit 22 — Final Audit
 
 **What:** Review every audit note in plan.md and, if not overridden, ensure compliance. Crosscheck with papers/main.tex and verify whether or not paper is still complaint.
 
