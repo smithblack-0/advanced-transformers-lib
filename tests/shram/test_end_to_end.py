@@ -153,15 +153,6 @@ class TestIntegrationCompilable:
     @pytest.mark.skipif(
         not torch.cuda.is_available(),
         reason=(
-            "CPU compilation only works for the cached inference path under specific "
-            "conditions. Without _compile_all_devices=True, HuggingFace silently falls "
-            "back to eager on CPU rather than raising, producing a false pass. "
-            "See https://github.com/pytorch/pytorch/issues/148752"
-        ),
-    )
-    @pytest.mark.skipif(
-        not torch.cuda.is_available(),
-        reason=(
             "Compiled inference requires CUDA; CPU compilation is not supported "
             "for the cached inference path. "
             "See https://github.com/pytorch/pytorch/issues/148752"
@@ -187,6 +178,15 @@ class TestIntegrationCompilable:
         out_compiled = m.generate(ids, max_new_tokens=10, compile_config=compile_config)
         assert torch.equal(out_eager, out_compiled)
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "CPU compilation only works for the cached inference path under specific "
+            "conditions. Without _compile_all_devices=True, HuggingFace silently falls "
+            "back to eager on CPU rather than raising, producing a false pass. "
+            "See https://github.com/pytorch/pytorch/issues/148752"
+        ),
+    )
     def test_compile_cached_inference(self):
         """generate() with CompileConfig must complete on the cached inference path.
 
