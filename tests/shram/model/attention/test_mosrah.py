@@ -39,6 +39,7 @@ def make_config(rope_mode: str = "main_sequence") -> ShramConfig:
 
 
 def make_inputs(
+    device: torch.device,
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Construct a small model-space input, authoritative position tensor, and all-live active mask."""
@@ -51,19 +52,20 @@ def make_inputs(
         ]],
         dtype=torch.float32,
         requires_grad=requires_grad,
+        device=device,
     )
-    position_ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
-    active_mask = torch.ones(1, 4, dtype=torch.bool)
+    position_ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.long, device=device)
+    active_mask = torch.ones(1, 4, dtype=torch.bool, device=device)
     return hidden_states, position_ids, active_mask
 
 
-def make_cache(config: ShramConfig, batch_size: int) -> MoSRAHCache:
+def make_cache(config: ShramConfig, batch_size: int, device: torch.device) -> MoSRAHCache:
     """Construct a real layer-local MoSRAH cache for cached execution tests."""
     return MoSRAHCache(
         num_mosrah_heads=config.num_mosrah_heads,
         head_dim=config.head_dim,
         batch_size=batch_size,
-        device=torch.device("cpu"),
+        device=device,
         mosrah_cache_length=config.mosrah_cache_length,
     )
 
@@ -78,12 +80,12 @@ def make_cache(config: ShramConfig, batch_size: int) -> MoSRAHCache:
 
 class TestRealExecution:
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
-    def test_uncached_execution_runs_sanely_and_returns_the_external_contract(self, rope_mode):
+    def test_uncached_execution_runs_sanely_and_returns_the_external_contract(self, rope_mode, device):
         """The assembled uncached path should return model-space outputs and scalar loss."""
         torch.manual_seed(0)
         config = make_config(rope_mode=rope_mode)
-        layer = MoSRAHLayer(config)
-        hidden_states, position_ids, active_mask = make_inputs()
+        layer = MoSRAHLayer(config).to(device)
+        hidden_states, position_ids, active_mask = make_inputs(device)
 
         sparse_output, load_balance_loss, max_vio = layer(
             hidden_states=hidden_states,
@@ -101,13 +103,13 @@ class TestRealExecution:
         assert not max_vio.requires_grad
 
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
-    def test_cached_execution_accumulates_in_the_real_layer_local_cache(self, rope_mode):
+    def test_cached_execution_accumulates_in_the_real_layer_local_cache(self, rope_mode, device):
         """Repeated cached calls should grow the real sparse cache state."""
         torch.manual_seed(0)
         config = make_config(rope_mode=rope_mode)
-        layer = MoSRAHLayer(config)
+        layer = MoSRAHLayer(config).to(device)
 
-        hidden_states, position_ids, active_mask = make_inputs()
+        hidden_states, position_ids, active_mask = make_inputs(device)
         prefix_hidden_states = hidden_states[:, :2]
         prefix_position_ids = position_ids[:, :2]
         prefix_active_mask = active_mask[:, :2]
@@ -115,7 +117,7 @@ class TestRealExecution:
         current_position_ids = position_ids[:, 2:]
         current_active_mask = active_mask[:, 2:]
 
-        cache = make_cache(config, batch_size=hidden_states.shape[0])
+        cache = make_cache(config, batch_size=hidden_states.shape[0], device=device)
 
         prefix_output, prefix_load_balance_loss, _ = layer(
             hidden_states=prefix_hidden_states,
@@ -161,13 +163,14 @@ class TestRealExecution:
     def test_cached_current_chunk_matches_the_corresponding_suffix_of_full_uncached_execution(
         self,
         rope_mode,
+        device,
     ):
         """Cached prefix/current execution should match the suffix of a full uncached run."""
         torch.manual_seed(0)
         config = make_config(rope_mode=rope_mode)
-        layer = MoSRAHLayer(config)
+        layer = MoSRAHLayer(config).to(device)
 
-        hidden_states, position_ids, active_mask = make_inputs()
+        hidden_states, position_ids, active_mask = make_inputs(device)
         prefix_hidden_states = hidden_states[:, :2]
         prefix_position_ids = position_ids[:, :2]
         prefix_active_mask = active_mask[:, :2]
@@ -182,7 +185,7 @@ class TestRealExecution:
             cache=None,
         )
 
-        cache = make_cache(config, batch_size=hidden_states.shape[0])
+        cache = make_cache(config, batch_size=hidden_states.shape[0], device=device)
 
         _, prefix_load_balance_loss, _ = layer(
             hidden_states=prefix_hidden_states,
@@ -222,12 +225,12 @@ class TestRealExecution:
 # ---------------------------------------------------------------------------
 
 class TestGradientFlow:
-    def test_sparse_output_backward_reaches_the_real_output_path_but_not_expert_bias(self):
+    def test_sparse_output_backward_reaches_the_real_output_path_but_not_expert_bias(self, device):
         """Sparse-output gradients should flow through the assembled path without using biased scores."""
         torch.manual_seed(0)
         config = make_config("main_sequence")
-        layer = MoSRAHLayer(config)
-        hidden_states, position_ids, active_mask = make_inputs(requires_grad=True)
+        layer = MoSRAHLayer(config).to(device)
+        hidden_states, position_ids, active_mask = make_inputs(device, requires_grad=True)
 
         sparse_output, load_balance_loss, _ = layer(
             hidden_states=hidden_states,
@@ -256,12 +259,12 @@ class TestGradientFlow:
         expert_bias_grad = layer.router.expert_bias.grad
         assert expert_bias_grad is None or torch.all(expert_bias_grad == 0)
 
-    def test_load_balance_loss_backward_reaches_expert_bias_but_not_routing_projection(self):
+    def test_load_balance_loss_backward_reaches_expert_bias_but_not_routing_projection(self, device):
         """The assembled layer should expose the router's load-balance signal to training."""
         torch.manual_seed(0)
         config = make_config("main_sequence")
-        layer = MoSRAHLayer(config)
-        hidden_states, position_ids, active_mask = make_inputs(requires_grad=True)
+        layer = MoSRAHLayer(config).to(device)
+        hidden_states, position_ids, active_mask = make_inputs(device, requires_grad=True)
 
         sparse_output, load_balance_loss, _ = layer(
             hidden_states=hidden_states,

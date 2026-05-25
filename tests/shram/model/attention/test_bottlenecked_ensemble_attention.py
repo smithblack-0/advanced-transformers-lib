@@ -49,6 +49,7 @@ def small_config(**kwargs) -> ShramConfig:
 
 def make_inputs(
     config: ShramConfig,
+    device: torch.device,
     batch: int = 1,
     packed_length: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -57,8 +58,9 @@ def make_inputs(
         config.num_mosrah_heads,
         packed_length,
         config.embedding_width,
+        device=device,
     )
-    position_ids = torch.arange(packed_length).view(1, 1, packed_length).expand(
+    position_ids = torch.arange(packed_length, device=device).view(1, 1, packed_length).expand(
         batch,
         config.num_mosrah_heads,
         -1,
@@ -68,6 +70,7 @@ def make_inputs(
         config.num_mosrah_heads,
         packed_length,
         dtype=torch.bool,
+        device=device,
     )
     return packed_embeddings, position_ids, active_mask
 
@@ -89,7 +92,7 @@ def gather_current_rows_from_full(
 # Black-box fuzz causality helpers
 # ---------------------------------------------------------------------------
 
-def make_fuzz_causality_bea() -> tuple[BottleneckedEnsembleAttention, ShramConfig]:
+def make_fuzz_causality_bea(device: torch.device) -> tuple[BottleneckedEnsembleAttention, ShramConfig]:
     """Construct one real random BEA instance for black-box causality fuzzing."""
     config = small_config(
         embedding_width=8,
@@ -99,7 +102,7 @@ def make_fuzz_causality_bea() -> tuple[BottleneckedEnsembleAttention, ShramConfi
         inference_sequence_length=16,
     )
     torch.manual_seed(0)
-    bea = BottleneckedEnsembleAttention(config)
+    bea = BottleneckedEnsembleAttention(config).to(device)
     bea.eval()
     return bea, config
 
@@ -159,22 +162,23 @@ class SpyMoSRAHCache:
 # ---------------------------------------------------------------------------
 
 class TestShape:
-    def test_output_shape(self):
+    def test_output_shape(self, device):
         """(B, L, T, d) -> (B, L, T, d)."""
         config = small_config()
-        bea = BottleneckedEnsembleAttention(config)
-        packed_embeddings, position_ids, active_mask = make_inputs(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
+        packed_embeddings, position_ids, active_mask = make_inputs(config, device)
 
         out = bea(packed_embeddings, position_ids, active_mask)
 
         assert out.shape == packed_embeddings.shape
 
-    def test_accepts_packed_inputs_and_returns_packed_outputs(self):
+    def test_accepts_packed_inputs_and_returns_packed_outputs(self, device):
         """BEA should preserve the packed expert-choice tensor space."""
         config = small_config(num_mosrah_heads=3)
-        bea = BottleneckedEnsembleAttention(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
         packed_embeddings, position_ids, active_mask = make_inputs(
             config,
+            device,
             batch=2,
             packed_length=5,
         )
@@ -190,7 +194,7 @@ class TestShape:
 # ---------------------------------------------------------------------------
 
 class TestPaperFormulaAnchor:
-    def test_tiny_single_head_case_matches_manual_formula(self):
+    def test_tiny_single_head_case_matches_manual_formula(self, device):
         """A tiny hand-solvable BEA case should match the paper formula directly.
 
         This test exercises the *actual* BEA layer and actual fused path. The only
@@ -205,7 +209,7 @@ class TestPaperFormulaAnchor:
             training_sequence_length=8,
             inference_sequence_length=8,
         )
-        bea = BottleneckedEnsembleAttention(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
 
         with torch.no_grad():
             bea.q_proj.zero_()
@@ -213,14 +217,14 @@ class TestPaperFormulaAnchor:
             bea.v_proj.zero_()
             bea.o_proj.zero_()
 
-            bea.q_proj[0] = torch.eye(2)
-            bea.k_proj[0] = torch.eye(2)
-            bea.v_proj[0] = torch.eye(2)
-            bea.o_proj[0] = torch.eye(2)
+            bea.q_proj[0] = torch.eye(2, device=device)
+            bea.k_proj[0] = torch.eye(2, device=device)
+            bea.v_proj[0] = torch.eye(2, device=device)
+            bea.o_proj[0] = torch.eye(2, device=device)
 
-        packed_embeddings = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
-        position_ids = torch.zeros(1, 1, 2, dtype=torch.long)
-        active_mask = torch.tensor([[[True, True]]])
+        packed_embeddings = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]], device=device)
+        position_ids = torch.zeros(1, 1, 2, dtype=torch.long, device=device)
+        active_mask = torch.tensor([[[True, True]]], device=device)
 
         out = bea(packed_embeddings, position_ids, active_mask)
 
@@ -230,7 +234,7 @@ class TestPaperFormulaAnchor:
         denom = weight_10 + weight_11
         expected_second = torch.tensor([weight_10 / denom, weight_11 / denom])
 
-        expected = torch.tensor([[[[1.0, 0.0], expected_second.tolist()]]]).reshape(1, 1, 2, 2)
+        expected = torch.tensor([[[[1.0, 0.0], expected_second.tolist()]]]).reshape(1, 1, 2, 2).to(device)
         torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
 
 
@@ -239,15 +243,15 @@ class TestPaperFormulaAnchor:
 # ---------------------------------------------------------------------------
 
 class TestHeadIndependence:
-    def test_modifying_one_head_parameters_only_changes_that_head_output(self):
+    def test_modifying_one_head_parameters_only_changes_that_head_output(self, device):
         """Per-head parameters should be independent."""
         config = small_config(num_mosrah_heads=2)
         torch.manual_seed(0)
-        bea_a = BottleneckedEnsembleAttention(config)
+        bea_a = BottleneckedEnsembleAttention(config).to(device)
         torch.manual_seed(0)
-        bea_b = BottleneckedEnsembleAttention(config)
+        bea_b = BottleneckedEnsembleAttention(config).to(device)
 
-        packed_embeddings, position_ids, active_mask = make_inputs(config, batch=1, packed_length=4)
+        packed_embeddings, position_ids, active_mask = make_inputs(config, device, batch=1, packed_length=4)
 
         with torch.no_grad():
             bea_b.q_proj[0].add_(1.0)
@@ -267,15 +271,15 @@ class TestHeadIndependence:
 # ---------------------------------------------------------------------------
 
 class TestRopeBehavior:
-    def test_supplied_position_tensors_change_attention_behavior(self):
+    def test_supplied_position_tensors_change_attention_behavior(self, device):
         """Different supplied position tensors should change BEA outputs."""
         config = small_config()
         torch.manual_seed(1)
-        bea = BottleneckedEnsembleAttention(config)
-        packed_embeddings, _, active_mask = make_inputs(config, batch=1, packed_length=4)
+        bea = BottleneckedEnsembleAttention(config).to(device)
+        packed_embeddings, _, active_mask = make_inputs(config, device, batch=1, packed_length=4)
 
-        position_ids_a = torch.tensor([[[0, 1, 2, 3], [0, 1, 2, 3]]])
-        position_ids_b = torch.tensor([[[0, 2, 4, 6], [0, 2, 4, 6]]])
+        position_ids_a = torch.tensor([[[0, 1, 2, 3], [0, 1, 2, 3]]], device=device)
+        position_ids_b = torch.tensor([[[0, 2, 4, 6], [0, 2, 4, 6]]], device=device)
 
         out_a = bea(packed_embeddings, position_ids_a, active_mask)
         out_b = bea(packed_embeddings, position_ids_b, active_mask)
@@ -284,12 +288,13 @@ class TestRopeBehavior:
 
     def test_bea_passes_supplied_positions_through_to_rope_and_uses_yarn_mode(
         self,
+        device,
         monkeypatch: pytest.MonkeyPatch,
     ):
         """BEA should not internally compute positions or override the RoPE mode."""
         config = small_config(inference_sequence_length=64)
-        bea = BottleneckedEnsembleAttention(config)
-        packed_embeddings, position_ids, active_mask = make_inputs(config, batch=1, packed_length=3)
+        bea = BottleneckedEnsembleAttention(config).to(device)
+        packed_embeddings, position_ids, active_mask = make_inputs(config, device, batch=1, packed_length=3)
 
         seen_position_ids: list[torch.Tensor] = []
 
@@ -374,14 +379,14 @@ class TestRopeBehavior:
 # ---------------------------------------------------------------------------
 
 class TestCausality:
-    def test_future_active_tokens_do_not_affect_past_active_outputs(self):
+    def test_future_active_tokens_do_not_affect_past_active_outputs(self, device):
         """Changing future packed tokens must not change earlier active outputs."""
         config = small_config(embedding_width=8, num_mosrah_heads=2, head_dim=4)
-        bea = BottleneckedEnsembleAttention(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
         bea.eval()
         torch.manual_seed(3)
 
-        packed_embeddings, position_ids, active_mask = make_inputs(config, batch=1, packed_length=4)
+        packed_embeddings, position_ids, active_mask = make_inputs(config, device, batch=1, packed_length=4)
         out_a = bea(packed_embeddings, position_ids, active_mask)
 
         packed_embeddings_modified = packed_embeddings.clone()
@@ -396,7 +401,7 @@ class TestCausality:
 # ---------------------------------------------------------------------------
 
 class TestPaddingBehavior:
-    def test_inactive_query_rows_do_not_influence_active_outputs(self):
+    def test_inactive_query_rows_do_not_influence_active_outputs(self, device):
         """Changing inactive rows should not affect active outputs when only Q depends on them.
 
         BEA consumes one packed tensor for Q, K, and V. To isolate query-side inactivity,
@@ -404,15 +409,16 @@ class TestPaddingBehavior:
         Q for those inactive rows. Active outputs must remain unchanged.
         """
         config = small_config(embedding_width=8, num_mosrah_heads=2, head_dim=4)
-        bea = BottleneckedEnsembleAttention(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
 
         with torch.no_grad():
             bea.k_proj.zero_()
             bea.v_proj.zero_()
 
-        packed_embeddings, position_ids, _ = make_inputs(config, batch=1, packed_length=4)
+        packed_embeddings, position_ids, _ = make_inputs(config, device, batch=1, packed_length=4)
         active_mask = torch.tensor(
-            [[[True, True, False, False], [True, False, False, False]]]
+            [[[True, True, False, False], [True, False, False, False]]],
+            device=device,
         )
 
         out_a = bea(packed_embeddings, position_ids, active_mask)
@@ -427,7 +433,7 @@ class TestPaddingBehavior:
 
         torch.testing.assert_close(out_a[active_mask], out_b[active_mask])
 
-    def test_inactive_key_value_rows_do_not_influence_active_outputs(self):
+    def test_inactive_key_value_rows_do_not_influence_active_outputs(self, device):
         """Changing inactive rows should not affect active outputs when only K/V depend on them.
 
         To isolate key/value-side inactivity, Q projection is zeroed so perturbing inactive
@@ -435,14 +441,15 @@ class TestPaddingBehavior:
         through inactive K/V rows. Active outputs must stay unchanged.
         """
         config = small_config(embedding_width=8, num_mosrah_heads=2, head_dim=4)
-        bea = BottleneckedEnsembleAttention(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
 
         with torch.no_grad():
             bea.q_proj.zero_()
 
-        packed_embeddings, position_ids, _ = make_inputs(config, batch=1, packed_length=4)
+        packed_embeddings, position_ids, _ = make_inputs(config, device, batch=1, packed_length=4)
         active_mask = torch.tensor(
-            [[[True, True, False, False], [True, False, False, False]]]
+            [[[True, True, False, False], [True, False, False, False]]],
+            device=device,
         )
 
         out_a = bea(packed_embeddings, position_ids, active_mask)
@@ -457,7 +464,7 @@ class TestPaddingBehavior:
 
         torch.testing.assert_close(out_a[active_mask], out_b[active_mask])
 
-    def test_inactive_packed_rows_do_not_influence_active_outputs(self):
+    def test_inactive_packed_rows_do_not_influence_active_outputs(self, device):
         """Changing inactive packed rows should not affect active outputs in the full path.
 
         This is the combined end-to-end version of the two more targeted tests above.
@@ -465,11 +472,12 @@ class TestPaddingBehavior:
         Inactive output rows are allowed to contain junk because unpacking removes them later.
         """
         config = small_config(embedding_width=8, num_mosrah_heads=2, head_dim=4)
-        bea = BottleneckedEnsembleAttention(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
 
-        packed_embeddings, position_ids, _ = make_inputs(config, batch=1, packed_length=4)
+        packed_embeddings, position_ids, _ = make_inputs(config, device, batch=1, packed_length=4)
         active_mask = torch.tensor(
-            [[[True, True, False, False], [True, False, False, False]]]
+            [[[True, True, False, False], [True, False, False, False]]],
+            device=device,
         )
 
         out_a = bea(packed_embeddings, position_ids, active_mask)
@@ -483,7 +491,7 @@ class TestPaddingBehavior:
         out_b = bea(packed_embeddings_modified, position_ids, active_mask)
 
         torch.testing.assert_close(out_a[active_mask], out_b[active_mask])
-    def test_junk_cached_key_value_slots_do_not_influence_active_outputs(self):
+    def test_junk_cached_key_value_slots_do_not_influence_active_outputs(self, device):
         """Changing inactive cached tail slots should not affect active outputs.
 
         This is the cache-side version of the inactive-row tests above. The spy cache returns the
@@ -497,35 +505,35 @@ class TestPaddingBehavior:
             training_sequence_length=8,
             inference_sequence_length=8,
         )
-        bea = BottleneckedEnsembleAttention(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
 
         with torch.no_grad():
             bea.q_proj.zero_()
             bea.k_proj.zero_()
             bea.v_proj.zero_()
             bea.o_proj.zero_()
-            bea.q_proj[0] = torch.eye(2)
-            bea.k_proj[0] = torch.eye(2)
-            bea.v_proj[0] = torch.eye(2)
-            bea.o_proj[0] = torch.eye(2)
+            bea.q_proj[0] = torch.eye(2, device=device)
+            bea.k_proj[0] = torch.eye(2, device=device)
+            bea.v_proj[0] = torch.eye(2, device=device)
+            bea.o_proj[0] = torch.eye(2, device=device)
 
-        packed_embeddings = torch.tensor([[[[1.0, 0.0]]]])
-        position_ids = torch.zeros(1, 1, 1, dtype=torch.long)
-        active_mask = torch.tensor([[[True]]])
+        packed_embeddings = torch.tensor([[[[1.0, 0.0]]]], device=device)
+        position_ids = torch.zeros(1, 1, 1, dtype=torch.long, device=device)
+        active_mask = torch.tensor([[[True]]], device=device)
 
-        active_prefix_keys = torch.tensor([[[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]]])
-        active_prefix_values_a = torch.tensor([[[[10.0, 0.0], [0.0, 20.0], [999.0, 999.0]]]])
-        active_prefix_values_b = torch.tensor([[[[10.0, 0.0], [0.0, 20.0], [-999.0, -999.0]]]])
-        returned_active_mask = torch.tensor([[[True, True, False]]])
+        active_prefix_keys = torch.tensor([[[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]]], device=device)
+        active_prefix_values_a = torch.tensor([[[[10.0, 0.0], [0.0, 20.0], [999.0, 999.0]]]], device=device)
+        active_prefix_values_b = torch.tensor([[[[10.0, 0.0], [0.0, 20.0], [-999.0, -999.0]]]], device=device)
+        returned_active_mask = torch.tensor([[[True, True, False]]], device=device)
 
         cache_a = SpyMoSRAHCache(
-            num_tokens_processed=torch.tensor([[2]]),
+            num_tokens_processed=torch.tensor([[2]], device=device),
             returned_keys=active_prefix_keys,
             returned_values=active_prefix_values_a,
             returned_active_mask=returned_active_mask,
         )
         cache_b = SpyMoSRAHCache(
-            num_tokens_processed=torch.tensor([[2]]),
+            num_tokens_processed=torch.tensor([[2]], device=device),
             returned_keys=active_prefix_keys,
             returned_values=active_prefix_values_b,
             returned_active_mask=returned_active_mask,
@@ -584,7 +592,7 @@ class TestCacheBoundary:
         torch.testing.assert_close(spy_cache.seen_values, packed_embeddings)
         torch.testing.assert_close(spy_cache.seen_active_mask, active_mask)
 
-    def test_cached_execution_uses_accumulated_state_returned_by_cache(self):
+    def test_cached_execution_uses_accumulated_state_returned_by_cache(self, device):
         """BEA should attend against the accumulated state returned by cache.update()."""
         config = small_config(
             embedding_width=2,
@@ -593,7 +601,7 @@ class TestCacheBoundary:
             training_sequence_length=8,
             inference_sequence_length=8,
         )
-        bea = BottleneckedEnsembleAttention(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
 
         with torch.no_grad():
             bea.q_proj.zero_()
@@ -601,22 +609,22 @@ class TestCacheBoundary:
             bea.v_proj.zero_()
             bea.o_proj.zero_()
 
-            bea.q_proj[0] = torch.eye(2)
-            bea.k_proj[0] = torch.eye(2)
-            bea.v_proj[0] = torch.eye(2)
-            bea.o_proj[0] = torch.eye(2)
+            bea.q_proj[0] = torch.eye(2, device=device)
+            bea.k_proj[0] = torch.eye(2, device=device)
+            bea.v_proj[0] = torch.eye(2, device=device)
+            bea.o_proj[0] = torch.eye(2, device=device)
 
         # Zero positions keep RoPE as identity in this small behavioral case.
-        packed_embeddings = torch.tensor([[[[1.0, 0.0]]]])
-        position_ids = torch.zeros(1, 1, 1, dtype=torch.long)
-        active_mask = torch.tensor([[[True]]])
+        packed_embeddings = torch.tensor([[[[1.0, 0.0]]]], device=device)
+        position_ids = torch.zeros(1, 1, 1, dtype=torch.long, device=device)
+        active_mask = torch.tensor([[[True]]], device=device)
 
-        returned_keys = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
-        returned_values = torch.tensor([[[[10.0, 0.0], [0.0, 20.0]]]])
-        returned_active_mask = torch.tensor([[[True, True]]])
+        returned_keys = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]], device=device)
+        returned_values = torch.tensor([[[[10.0, 0.0], [0.0, 20.0]]]], device=device)
+        returned_active_mask = torch.tensor([[[True, True]]], device=device)
 
         spy_cache = SpyMoSRAHCache(
-            num_tokens_processed=torch.tensor([[1]]),
+            num_tokens_processed=torch.tensor([[1]], device=device),
             returned_keys=returned_keys,
             returned_values=returned_values,
             returned_active_mask=returned_active_mask,
@@ -629,7 +637,8 @@ class TestCacheBoundary:
         weight_1 = math.exp(0.0)
         denom = weight_0 + weight_1
         expected = torch.tensor(
-            [[[[10.0 * weight_0 / denom, 20.0 * weight_1 / denom]]]]
+            [[[[10.0 * weight_0 / denom, 20.0 * weight_1 / denom]]]],
+            device=device,
         )
 
         torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
@@ -682,7 +691,7 @@ class TestCacheBoundary:
 # ---------------------------------------------------------------------------
 
 class TestCachedCausality:
-    def test_cached_and_uncached_match_under_ragged_cached_prefixes(self):
+    def test_cached_and_uncached_match_under_ragged_cached_prefixes(self, device):
         """Cached BEA should match one-shot BEA when heads have different prefix lengths."""
         config = small_config(
             embedding_width=2,
@@ -691,7 +700,7 @@ class TestCachedCausality:
             training_sequence_length=8,
             inference_sequence_length=8,
         )
-        bea = BottleneckedEnsembleAttention(config)
+        bea = BottleneckedEnsembleAttention(config).to(device)
 
         with torch.no_grad():
             bea.q_proj.zero_()
@@ -699,38 +708,42 @@ class TestCachedCausality:
             bea.v_proj.zero_()
             bea.o_proj.zero_()
             for head_idx in range(config.num_mosrah_heads):
-                bea.q_proj[head_idx] = torch.eye(2)
-                bea.k_proj[head_idx] = torch.eye(2)
-                bea.v_proj[head_idx] = torch.eye(2)
-                bea.o_proj[head_idx] = torch.eye(2)
+                bea.q_proj[head_idx] = torch.eye(2, device=device)
+                bea.k_proj[head_idx] = torch.eye(2, device=device)
+                bea.v_proj[head_idx] = torch.eye(2, device=device)
+                bea.o_proj[head_idx] = torch.eye(2, device=device)
 
         prefix_embeddings = torch.tensor(
             [[
                 [[1.0, 0.0], [0.0, 1.0]],
                 [[1.0, 1.0], [9.0, 9.0]],
-            ]]
+            ]],
+            device=device,
         )
-        prefix_positions = torch.zeros(1, 2, 2, dtype=torch.long)
+        prefix_positions = torch.zeros(1, 2, 2, dtype=torch.long, device=device)
         prefix_active_mask = torch.tensor(
-            [[[True, True], [True, False]]]
+            [[[True, True], [True, False]]],
+            device=device,
         )
 
         current_embeddings = torch.tensor(
             [[
                 [[2.0, 0.0], [0.0, 2.0]],
                 [[2.0, 2.0], [3.0, 3.0]],
-            ]]
+            ]],
+            device=device,
         )
-        current_positions = torch.zeros(1, 2, 2, dtype=torch.long)
+        current_positions = torch.zeros(1, 2, 2, dtype=torch.long, device=device)
         current_active_mask = torch.tensor(
-            [[[True, True], [True, True]]]
+            [[[True, True], [True, True]]],
+            device=device,
         )
 
         cache = MoSRAHCache(
             num_mosrah_heads=config.num_mosrah_heads,
             head_dim=config.head_dim,
             batch_size=1,
-            device=torch.device("cpu"),
+            device=device,
             mosrah_cache_length=config.mosrah_cache_length,
         )
         _ = bea(prefix_embeddings, prefix_positions, prefix_active_mask, cache=cache)
@@ -747,11 +760,13 @@ class TestCachedCausality:
             [[
                 [[1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0]],
                 [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [0.0, 0.0]],
-            ]]
+            ]],
+            device=device,
         )
-        full_positions = torch.zeros(1, 2, 4, dtype=torch.long)
+        full_positions = torch.zeros(1, 2, 4, dtype=torch.long, device=device)
         full_active_mask = torch.tensor(
-            [[[True, True, True, True], [True, True, True, False]]]
+            [[[True, True, True, True], [True, True, True, False]]],
+            device=device,
         )
 
         out_full = bea(full_embeddings, full_positions, full_active_mask)
@@ -771,12 +786,13 @@ class TestCachedCausality:
 class TestBackendPath:
     def test_bea_routes_through_flex_attention(
         self,
+        device,
         monkeypatch: pytest.MonkeyPatch,
     ):
         """BEA should call the fused FlexAttention path."""
         config = small_config()
-        bea = BottleneckedEnsembleAttention(config)
-        packed_embeddings, position_ids, active_mask = make_inputs(config, batch=1, packed_length=3)
+        bea = BottleneckedEnsembleAttention(config).to(device)
+        packed_embeddings, position_ids, active_mask = make_inputs(config, device, batch=1, packed_length=3)
 
         seen = {"called": False}
 
@@ -802,11 +818,11 @@ class TestBackendPath:
 # ---------------------------------------------------------------------------
 
 class TestCausalityFuzz:
-    def test_uncached_fuzz_verifies_causal_reachability_and_future_blocking(self):
+    def test_uncached_fuzz_verifies_causal_reachability_and_future_blocking(self, device):
         """Across many random uncached inputs, legal edges should respond at least once,
         and illegal future edges should never respond.
         """
-        bea, config = make_fuzz_causality_bea()
+        bea, config = make_fuzz_causality_bea(device)
 
         packed_length = 5
         num_trials = 100
@@ -814,13 +830,13 @@ class TestCausalityFuzz:
         change_threshold = 1e-5
 
         expected_reachability = torch.tril(
-            torch.ones(packed_length, packed_length, dtype=torch.bool)
+            torch.ones(packed_length, packed_length, dtype=torch.bool, device=device)
         )
         ever_changed = torch.zeros_like(expected_reachability)
 
-        position_ids = torch.arange(packed_length, dtype=torch.long).view(1, 1, packed_length)
-        active_mask = torch.ones(1, 1, packed_length, dtype=torch.bool)
-        query_indices = torch.arange(packed_length)
+        position_ids = torch.arange(packed_length, dtype=torch.long, device=device).view(1, 1, packed_length)
+        active_mask = torch.ones(1, 1, packed_length, dtype=torch.bool, device=device)
+        query_indices = torch.arange(packed_length, device=device)
 
         with torch.no_grad():
             for trial_index in range(num_trials):
@@ -830,6 +846,7 @@ class TestCausalityFuzz:
                     config.num_mosrah_heads,
                     packed_length,
                     config.embedding_width,
+                    device=device,
                 )
 
                 baseline_output = bea(
@@ -841,7 +858,7 @@ class TestCausalityFuzz:
 
                 for source_index in range(packed_length):
                     perturbed_embeddings = packed_embeddings.clone()
-                    perturbation = perturbation_scale * torch.randn(config.embedding_width)
+                    perturbation = perturbation_scale * torch.randn(config.embedding_width, device=device)
                     perturbed_embeddings[0, 0, source_index] += perturbation
 
                     perturbed_output = bea(
@@ -874,11 +891,11 @@ class TestCausalityFuzz:
             f"missing_legal_responses={missing_legal_responses.int().tolist()}"
         )
 
-    def test_cached_fuzz_verifies_prefix_plus_local_causality(self):
+    def test_cached_fuzz_verifies_prefix_plus_local_causality(self, device):
         """Across many random cached runs, prefix sources should influence every current query,
         and current sources should influence only current queries at or after themselves.
         """
-        bea, config = make_fuzz_causality_bea()
+        bea, config = make_fuzz_causality_bea(device)
 
         prefix_length = 3
         current_length = 3
@@ -891,24 +908,26 @@ class TestCausalityFuzz:
             current_length,
             total_source_length,
             dtype=torch.bool,
+            device=device,
         )
         expected_reachability[:, :prefix_length] = True
         expected_reachability[:, prefix_length:] = torch.tril(
-            torch.ones(current_length, current_length, dtype=torch.bool)
+            torch.ones(current_length, current_length, dtype=torch.bool, device=device)
         )
 
         ever_changed = torch.zeros_like(expected_reachability)
 
-        prefix_position_ids = torch.arange(prefix_length, dtype=torch.long).view(1, 1, prefix_length)
+        prefix_position_ids = torch.arange(prefix_length, dtype=torch.long, device=device).view(1, 1, prefix_length)
         current_position_ids = torch.arange(
             prefix_length,
             prefix_length + current_length,
             dtype=torch.long,
+            device=device,
         ).view(1, 1, current_length)
 
-        prefix_active_mask = torch.ones(1, 1, prefix_length, dtype=torch.bool)
-        current_active_mask = torch.ones(1, 1, current_length, dtype=torch.bool)
-        current_query_indices = torch.arange(current_length)
+        prefix_active_mask = torch.ones(1, 1, prefix_length, dtype=torch.bool, device=device)
+        current_active_mask = torch.ones(1, 1, current_length, dtype=torch.bool, device=device)
+        current_query_indices = torch.arange(current_length, device=device)
 
         with torch.no_grad():
             for trial_index in range(num_trials):
@@ -918,19 +937,21 @@ class TestCausalityFuzz:
                     config.num_mosrah_heads,
                     prefix_length,
                     config.embedding_width,
+                    device=device,
                 )
                 current_embeddings = torch.randn(
                     1,
                     config.num_mosrah_heads,
                     current_length,
                     config.embedding_width,
+                    device=device,
                 )
 
                 baseline_cache = MoSRAHCache(
                     num_mosrah_heads=config.num_mosrah_heads,
                     head_dim=config.head_dim,
                     batch_size=1,
-                    device=torch.device("cpu"),
+                    device=device,
                     mosrah_cache_length=config.mosrah_cache_length,
                 )
                 _ = bea(
@@ -949,11 +970,11 @@ class TestCausalityFuzz:
                 for logical_source_index in range(total_source_length):
                     perturbed_prefix_embeddings = prefix_embeddings.clone()
                     perturbed_current_embeddings = current_embeddings.clone()
-                    perturbation = perturbation_scale * torch.randn(config.embedding_width)
+                    perturbation = perturbation_scale * torch.randn(config.embedding_width, device=device)
 
                     if logical_source_index < prefix_length:
                         perturbed_prefix_embeddings[0, 0, logical_source_index] += perturbation
-                        legal_queries = torch.ones(current_length, dtype=torch.bool)
+                        legal_queries = torch.ones(current_length, dtype=torch.bool, device=device)
                     else:
                         current_source_index = logical_source_index - prefix_length
                         perturbed_current_embeddings[0, 0, current_source_index] += perturbation
@@ -963,7 +984,7 @@ class TestCausalityFuzz:
                         num_mosrah_heads=config.num_mosrah_heads,
                         head_dim=config.head_dim,
                         batch_size=1,
-                        device=torch.device("cpu"),
+                        device=device,
                         mosrah_cache_length=config.mosrah_cache_length,
                     )
                     _ = bea(

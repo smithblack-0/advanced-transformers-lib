@@ -74,17 +74,19 @@ def synthetic_config(**kwargs) -> ShramConfig:
 
 def make_input(
     config: ShramConfig,
+    device: torch.device,
     batch: int = 2,
     seq: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    x = torch.randn(batch, seq, config.embedding_width)
-    position_ids = torch.arange(seq).unsqueeze(0).expand(batch, -1)
-    active_mask = torch.ones(batch, seq, dtype=torch.bool)
+    x = torch.randn(batch, seq, config.embedding_width, device=device)
+    position_ids = torch.arange(seq, device=device).unsqueeze(0).expand(batch, -1)
+    active_mask = torch.ones(batch, seq, dtype=torch.bool, device=device)
     return x, position_ids, active_mask
 
 
 def make_cache(
     config: ShramConfig,
+    device: torch.device,
     *,
     batch: int = 1,
 ) -> LocalSlidingWindowLayerCache:
@@ -93,7 +95,7 @@ def make_cache(
         num_heads=config.num_sliding_window_heads,
         head_dim=config.head_dim,
         batch_size=batch,
-        device=torch.device("cpu"),
+        device=device,
     )
 
 
@@ -101,9 +103,10 @@ def synthetic_tokens(
     values: list[list[float]],
     *,
     embedding_width: int,
+    device: torch.device,
 ) -> torch.Tensor:
     """Build small hand-written token sequences with repeated channel values."""
-    base = torch.tensor(values, dtype=torch.float32).unsqueeze(-1)
+    base = torch.tensor(values, dtype=torch.float32, device=device).unsqueeze(-1)
     return base.repeat(1, 1, embedding_width)
 
 
@@ -113,52 +116,52 @@ def synthetic_tokens(
 
 
 class TestShape:
-    def test_output_shape(self):
+    def test_output_shape(self, device):
         """(B, N, embedding_width) -> (B, N, embedding_width)."""
         config = small_config()
-        attn = SlidingWindowAttention(config)
-        x, position_ids, active_mask = make_input(config)
+        attn = SlidingWindowAttention(config).to(device)
+        x, position_ids, active_mask = make_input(config, device)
         out = attn(x, position_ids, active_mask)
         assert out.shape == x.shape
 
-    def test_output_dtype_matches_input(self):
+    def test_output_dtype_matches_input(self, device):
         """Output dtype should remain compatible with downstream SHRAM composition."""
         config = small_config()
-        attn = SlidingWindowAttention(config)
-        x, position_ids, active_mask = make_input(config)
+        attn = SlidingWindowAttention(config).to(device)
+        x, position_ids, active_mask = make_input(config, device)
         out = attn(x, position_ids, active_mask)
         assert out.dtype == x.dtype
 
-    def test_invalid_position_shape_raises(self):
+    def test_invalid_position_shape_raises(self, device):
         """The module should reject position_ids whose shape does not match (B, N)."""
         config = small_config()
-        attn = SlidingWindowAttention(config)
-        x, _, active_mask = make_input(config, batch=2, seq=5)
-        bad_position_ids = torch.arange(6).unsqueeze(0).expand(2, -1)
+        attn = SlidingWindowAttention(config).to(device)
+        x, _, active_mask = make_input(config, device, batch=2, seq=5)
+        bad_position_ids = torch.arange(6, device=device).unsqueeze(0).expand(2, -1)
 
         with pytest.raises(ValueError) as exc_info:
             attn(x, bad_position_ids, active_mask)
 
         assert "position_ids" in str(exc_info.value)
 
-    def test_invalid_active_mask_shape_raises(self):
+    def test_invalid_active_mask_shape_raises(self, device):
         """The module should reject active_mask whose shape does not match (B, N)."""
         config = small_config()
-        attn = SlidingWindowAttention(config)
-        x, position_ids, _ = make_input(config, batch=2, seq=5)
-        bad_active_mask = torch.ones(2, 6, dtype=torch.bool)
+        attn = SlidingWindowAttention(config).to(device)
+        x, position_ids, _ = make_input(config, device, batch=2, seq=5)
+        bad_active_mask = torch.ones(2, 6, dtype=torch.bool, device=device)
 
         with pytest.raises(ValueError) as exc_info:
             attn(x, position_ids, bad_active_mask)
 
         assert "active_mask" in str(exc_info.value)
 
-    def test_invalid_active_mask_dtype_raises(self):
+    def test_invalid_active_mask_dtype_raises(self, device):
         """The module should reject active_mask whose dtype is not torch.bool."""
         config = small_config()
-        attn = SlidingWindowAttention(config)
-        x, position_ids, _ = make_input(config, batch=2, seq=5)
-        bad_active_mask = torch.ones(2, 5, dtype=torch.long)
+        attn = SlidingWindowAttention(config).to(device)
+        x, position_ids, _ = make_input(config, device, batch=2, seq=5)
+        bad_active_mask = torch.ones(2, 5, dtype=torch.long, device=device)
 
         with pytest.raises(ValueError) as exc_info:
             attn(x, position_ids, bad_active_mask)
@@ -172,13 +175,13 @@ class TestShape:
 
 
 class TestLocalWindowBehavior:
-    def test_tokens_outside_local_window_do_not_affect_output(self):
+    def test_tokens_outside_local_window_do_not_affect_output(self, device):
         """Changing tokens older than the local window must not affect a late output."""
         config = small_config(window_size=3)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         torch.manual_seed(0)
-        x, position_ids, active_mask = make_input(config, batch=1, seq=6)
+        x, position_ids, active_mask = make_input(config, device, batch=1, seq=6)
         out_original = attn(x, position_ids, active_mask)
 
         # For the last token at position 5 with window_size=3, only positions 3, 4, 5
@@ -189,13 +192,13 @@ class TestLocalWindowBehavior:
 
         torch.testing.assert_close(out_original[:, 5:6, :], out_modified[:, 5:6, :])
 
-    def test_future_tokens_do_not_affect_past_outputs(self):
+    def test_future_tokens_do_not_affect_past_outputs(self, device):
         """Replacing future tokens must leave earlier outputs unchanged."""
         config = small_config(window_size=4)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         torch.manual_seed(1)
-        x, position_ids, active_mask = make_input(config, batch=1, seq=6)
+        x, position_ids, active_mask = make_input(config, device, batch=1, seq=6)
         out_original = attn(x, position_ids, active_mask)
 
         x_modified = x.clone()
@@ -204,13 +207,13 @@ class TestLocalWindowBehavior:
 
         torch.testing.assert_close(out_original[:, :4, :], out_modified[:, :4, :])
 
-    def test_causal_ordering_is_preserved_within_active_window(self):
+    def test_causal_ordering_is_preserved_within_active_window(self, device):
         """Token i must not attend to token j > i even when both are inside the active window."""
         config = small_config(window_size=4)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         torch.manual_seed(5)
-        x, position_ids, active_mask = make_input(config, batch=1, seq=5)
+        x, position_ids, active_mask = make_input(config, device, batch=1, seq=5)
         out_original = attn(x, position_ids, active_mask)
 
         x_modified = x.clone()
@@ -226,7 +229,7 @@ class TestLocalWindowBehavior:
 
 
 class TestMaskedContinuationSemantics:
-    def test_live_token_within_absolute_window_despite_inactive_gap_affects_output(self):
+    def test_live_token_within_absolute_window_despite_inactive_gap_affects_output(self, device):
         """A live token within the absolute window must affect output even across an inactive gap.
 
         With window_size=4 and a query at position 6, the absolute window covers
@@ -236,18 +239,20 @@ class TestMaskedContinuationSemantics:
         """
         torch.manual_seed(11)
         config = synthetic_config(window_size=4)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]],
             embedding_width=config.embedding_width,
+            device=device,
         )
-        position_ids = torch.arange(7).unsqueeze(0)
+        position_ids = torch.arange(7, device=device).unsqueeze(0)
         # Gap at position 2; positions 3-6 are active and within the absolute window
         # of the query at position 6 (distances 3, 2, 1, 0 — all < window_size=4).
         active_mask = torch.tensor(
             [[True, True, False, True, True, True, True]],
             dtype=torch.bool,
+            device=device,
         )
 
         out_original = attn(x, position_ids, active_mask)
@@ -261,20 +266,22 @@ class TestMaskedContinuationSemantics:
             out_modified[:, 6:7, :],
         )
 
-    def test_dead_current_chunk_token_does_not_affect_later_live_output(self):
+    def test_dead_current_chunk_token_does_not_affect_later_live_output(self, device):
         """A dead token in the current chunk must not affect a later live query."""
         torch.manual_seed(12)
         config = synthetic_config(window_size=4)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]],
             embedding_width=config.embedding_width,
+            device=device,
         )
-        position_ids = torch.arange(7).unsqueeze(0)
+        position_ids = torch.arange(7, device=device).unsqueeze(0)
         active_mask = torch.tensor(
             [[True, True, True, False, False, True, True]],
             dtype=torch.bool,
+            device=device,
         )
 
         out_original = attn(x, position_ids, active_mask)
@@ -288,18 +295,19 @@ class TestMaskedContinuationSemantics:
             out_modified[:, 6:7, :],
         )
 
-    def test_dead_query_row_does_not_respond_to_context_changes(self):
+    def test_dead_query_row_does_not_respond_to_context_changes(self, device):
         """A dead query row should be insensitive to context changes."""
         torch.manual_seed(13)
         config = synthetic_config(window_size=4)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0]],
             embedding_width=config.embedding_width,
+            device=device,
         )
-        position_ids = torch.arange(4).unsqueeze(0)
-        active_mask = torch.tensor([[True, False, True, True]], dtype=torch.bool)
+        position_ids = torch.arange(4, device=device).unsqueeze(0)
+        active_mask = torch.tensor([[True, False, True, True]], dtype=torch.bool, device=device)
 
         out_original = attn(x, position_ids, active_mask)
 
@@ -320,26 +328,26 @@ class TestMaskedContinuationSemantics:
 
 
 class TestSlidingWindowCache:
-    def test_forward_runs_with_real_local_cache(self):
+    def test_forward_runs_with_real_local_cache(self, device):
         """A forward pass with the real local cache should run and return sane output."""
         config = small_config(window_size=4)
-        attn = SlidingWindowAttention(config)
-        x, position_ids, active_mask = make_input(config, batch=2, seq=3)
-        cache = make_cache(config, batch=2)
+        attn = SlidingWindowAttention(config).to(device)
+        x, position_ids, active_mask = make_input(config, device, batch=2, seq=3)
+        cache = make_cache(config, device, batch=2)
 
         out = attn(x, position_ids, active_mask, cache=cache)
 
         assert out.shape == x.shape
         assert out.dtype == x.dtype
 
-    def test_repeated_cached_forward_runs_with_real_local_cache(self):
+    def test_repeated_cached_forward_runs_with_real_local_cache(self, device):
         """Repeated decode calls with the real cache should continue to run."""
         config = small_config(window_size=4)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         torch.manual_seed(2)
-        x, position_ids, active_mask = make_input(config, batch=1, seq=5)
-        cache = make_cache(config, batch=1)
+        x, position_ids, active_mask = make_input(config, device, batch=1, seq=5)
+        cache = make_cache(config, device, batch=1)
 
         attn(x[:, :2, :], position_ids[:, :2], active_mask[:, :2], cache=cache)
         attn(x[:, 2:3, :], position_ids[:, 2:3], active_mask[:, 2:3], cache=cache)
@@ -349,17 +357,17 @@ class TestSlidingWindowCache:
         assert out_3.shape == (1, 1, config.embedding_width)
         assert out_4.shape == (1, 1, config.embedding_width)
 
-    def test_cached_generation_matches_full_forward(self):
+    def test_cached_generation_matches_full_forward(self, device):
         """Cached all-live generation must match the corresponding full forward pass."""
         config = small_config(window_size=4)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         torch.manual_seed(3)
-        x, position_ids, active_mask = make_input(config, batch=1, seq=6)
+        x, position_ids, active_mask = make_input(config, device, batch=1, seq=6)
 
         out_full = attn(x, position_ids, active_mask)
 
-        cache = make_cache(config, batch=1)
+        cache = make_cache(config, device, batch=1)
         attn(x[:, :3, :], position_ids[:, :3], active_mask[:, :3], cache=cache)
         out_3 = attn(x[:, 3:4, :], position_ids[:, 3:4], active_mask[:, 3:4], cache=cache)
         out_4 = attn(x[:, 4:5, :], position_ids[:, 4:5], active_mask[:, 4:5], cache=cache)
@@ -369,25 +377,26 @@ class TestSlidingWindowCache:
         torch.testing.assert_close(out_4, out_full[:, 4:5, :])
         torch.testing.assert_close(out_5, out_full[:, 5:6, :])
 
-    def test_dead_cached_token_does_not_affect_later_live_output(self):
+    def test_dead_cached_token_does_not_affect_later_live_output(self, device):
         """A dead cached token must not affect a later live query."""
         torch.manual_seed(14)
         config = synthetic_config(window_size=4)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         prefill_x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0]],
             embedding_width=config.embedding_width,
+            device=device,
         )
-        prefill_pos = torch.arange(4).unsqueeze(0)
-        prefill_mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
+        prefill_pos = torch.arange(4, device=device).unsqueeze(0)
+        prefill_mask = torch.tensor([[True, True, False, False]], dtype=torch.bool, device=device)
 
-        next_x = synthetic_tokens([[5.0]], embedding_width=config.embedding_width)
-        next_pos = torch.tensor([[4]])
-        next_mask = torch.tensor([[True]], dtype=torch.bool)
+        next_x = synthetic_tokens([[5.0]], embedding_width=config.embedding_width, device=device)
+        next_pos = torch.tensor([[4]], device=device)
+        next_mask = torch.tensor([[True]], dtype=torch.bool, device=device)
 
-        cache_a = make_cache(config, batch=1)
-        cache_b = make_cache(config, batch=1)
+        cache_a = make_cache(config, device, batch=1)
+        cache_b = make_cache(config, device, batch=1)
 
         attn(prefill_x, prefill_pos, prefill_mask, cache=cache_a)
 
@@ -400,7 +409,7 @@ class TestSlidingWindowCache:
 
         torch.testing.assert_close(out_original, out_modified)
 
-    def test_live_cached_token_within_absolute_window_affects_later_live_output(self):
+    def test_live_cached_token_within_absolute_window_affects_later_live_output(self, device):
         """A live cached token within the absolute window must affect a later live query.
 
         After prefill at positions [0, 1, 2, 3] with mask [T, T, F, F], the retained
@@ -412,21 +421,22 @@ class TestSlidingWindowCache:
         """
         torch.manual_seed(15)
         config = synthetic_config(window_size=4)
-        attn = SlidingWindowAttention(config).eval()
+        attn = SlidingWindowAttention(config).to(device).eval()
 
         prefill_x = synthetic_tokens(
             [[1.0, 2.0, 3.0, 4.0]],
             embedding_width=config.embedding_width,
+            device=device,
         )
-        prefill_pos = torch.arange(4).unsqueeze(0)
-        prefill_mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
+        prefill_pos = torch.arange(4, device=device).unsqueeze(0)
+        prefill_mask = torch.tensor([[True, True, False, False]], dtype=torch.bool, device=device)
 
-        next_x = synthetic_tokens([[5.0]], embedding_width=config.embedding_width)
-        next_pos = torch.tensor([[4]])
-        next_mask = torch.tensor([[True]], dtype=torch.bool)
+        next_x = synthetic_tokens([[5.0]], embedding_width=config.embedding_width, device=device)
+        next_pos = torch.tensor([[4]], device=device)
+        next_mask = torch.tensor([[True]], dtype=torch.bool, device=device)
 
-        cache_a = make_cache(config, batch=1)
-        cache_b = make_cache(config, batch=1)
+        cache_a = make_cache(config, device, batch=1)
+        cache_b = make_cache(config, device, batch=1)
 
         attn(prefill_x, prefill_pos, prefill_mask, cache=cache_a)
 
@@ -456,7 +466,7 @@ class TestLocalRoPE:
         assert attn.rope.mode == "default"
         assert attn.rope.attention_scaling == 1.0
 
-    def test_local_behavior_does_not_change_when_yarn_fields_change_elsewhere(self):
+    def test_local_behavior_does_not_change_when_yarn_fields_change_elsewhere(self, device):
         """Changing non-local YaRN fields elsewhere in config must not affect local outputs."""
         base_config = small_config(
             local_rope_theta=10000.0,
@@ -476,11 +486,11 @@ class TestLocalRoPE:
         )
 
         torch.manual_seed(4)
-        attn_a = SlidingWindowAttention(base_config)
+        attn_a = SlidingWindowAttention(base_config).to(device)
         torch.manual_seed(4)
-        attn_b = SlidingWindowAttention(altered_config)
+        attn_b = SlidingWindowAttention(altered_config).to(device)
 
-        x, position_ids, active_mask = make_input(base_config, batch=1, seq=6)
+        x, position_ids, active_mask = make_input(base_config, device, batch=1, seq=6)
 
         out_a = attn_a(x, position_ids, active_mask)
         out_b = attn_b(x, position_ids, active_mask)

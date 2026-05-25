@@ -45,19 +45,21 @@ def small_config(**kwargs) -> ShramConfig:
 
 def make_layer(
     config: ShramConfig,
+    device: torch.device,
     seed: int = 0,
 ) -> DecoderLayer:
     torch.manual_seed(seed)
-    return DecoderLayer(config)
+    return DecoderLayer(config).to(device)
 
 
 def make_input(
     config: ShramConfig,
+    device: torch.device,
     batch: int = 2,
     seq: int = 4,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    random_generator = torch.Generator(device="cpu")
+    random_generator = torch.Generator(device=str(device))
     random_generator.manual_seed(seed)
 
     x = torch.randn(
@@ -65,20 +67,22 @@ def make_input(
         seq,
         config.embedding_width,
         generator=random_generator,
+        device=device,
     )
-    position_ids = torch.arange(seq, dtype=torch.long).unsqueeze(0).expand(batch, -1)
-    active_mask = torch.ones(batch, seq, dtype=torch.bool)
+    position_ids = torch.arange(seq, dtype=torch.long, device=device).unsqueeze(0).expand(batch, -1)
+    active_mask = torch.ones(batch, seq, dtype=torch.bool, device=device)
     return x, position_ids, active_mask
 
 
 def make_layer_cache(
     config: ShramConfig,
     batch_size: int,
+    device: torch.device,
 ) -> ShramLayerCache:
     return ShramLayerCache(
         config=config,
         batch_size=batch_size,
-        device=torch.device("cpu"),
+        device=device,
     )
 
 
@@ -87,17 +91,17 @@ def make_layer_cache(
 # ---------------------------------------------------------------------------
 
 class TestInspectionGuards:
-    def test_decoder_layer_uses_shram_hybrid_layer(self):
+    def test_decoder_layer_uses_shram_hybrid_layer(self, device):
         """DecoderLayer must wire in SHRAMHybridLayer, not legacy GQA."""
         config = small_config()
-        layer = make_layer(config)
+        layer = make_layer(config, device)
 
         assert isinstance(layer.attention, SHRAMHybridLayer)
 
-    def test_two_rms_norms_do_not_alias_parameter_storage(self):
+    def test_two_rms_norms_do_not_alias_parameter_storage(self, device):
         """The two RMSNorm instances must have distinct learnable parameters."""
         config = small_config()
-        layer = make_layer(config)
+        layer = make_layer(config, device)
 
         assert layer.attn_norm is not layer.mlp_norm
         assert layer.attn_norm.weight.data_ptr() != layer.mlp_norm.weight.data_ptr()
@@ -108,11 +112,11 @@ class TestInspectionGuards:
 # ---------------------------------------------------------------------------
 
 class TestRuntimeSmoke:
-    def test_real_forward_returns_valid_output_and_scalar_load_balance_loss(self):
+    def test_real_forward_returns_valid_output_and_scalar_load_balance_loss(self, device):
         """DecoderLayer should preserve (B, N, d) and return finite scalar loss."""
         config = small_config()
-        layer = make_layer(config, seed=0)
-        x, position_ids, active_mask = make_input(config, batch=2, seq=4, seed=1)
+        layer = make_layer(config, device, seed=0)
+        x, position_ids, active_mask = make_input(config, device, batch=2, seq=4, seed=1)
 
         output, load_balance_loss, max_vio = layer(
             x,
@@ -129,11 +133,11 @@ class TestRuntimeSmoke:
         assert torch.isfinite(max_vio)
         assert not max_vio.requires_grad
 
-    def test_output_responds_to_input_perturbation(self):
+    def test_output_responds_to_input_perturbation(self, device):
         """A real DecoderLayer should not be dead or bypassed with respect to x."""
         config = small_config()
-        layer = make_layer(config, seed=0)
-        x, position_ids, active_mask = make_input(config, batch=1, seq=4, seed=2)
+        layer = make_layer(config, device, seed=0)
+        x, position_ids, active_mask = make_input(config, device, batch=1, seq=4, seed=2)
 
         baseline_output, baseline_load_balance_loss, _ = layer(
             x,
@@ -161,19 +165,19 @@ class TestRuntimeSmoke:
         assert torch.isfinite(baseline_load_balance_loss)
         assert torch.isfinite(perturbed_load_balance_loss)
 
-    def test_output_responds_to_position_change_on_at_least_one_deterministic_seed(self):
+    def test_output_responds_to_position_change_on_at_least_one_deterministic_seed(self, device):
         """Changing positions should affect the real DecoderLayer on at least one fixed input seed."""
         config = small_config()
-        layer = make_layer(config, seed=0)
+        layer = make_layer(config, device, seed=0)
 
-        position_ids_a = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
-        position_ids_b = torch.tensor([[0, 3, 6, 9]], dtype=torch.long)
+        position_ids_a = torch.tensor([[0, 1, 2, 3]], dtype=torch.long, device=device)
+        position_ids_b = torch.tensor([[0, 3, 6, 9]], dtype=torch.long, device=device)
 
         successful_distinctions = 0
         input_seeds = list(range(10))
 
         for input_seed in input_seeds:
-            x, _, active_mask = make_input(config, batch=1, seq=4, seed=input_seed)
+            x, _, active_mask = make_input(config, device, batch=1, seq=4, seed=input_seed)
 
             output_a, _, _ = layer(
                 x,
@@ -201,12 +205,12 @@ class TestRuntimeSmoke:
             f"successful_distinctions={successful_distinctions}, total_trials={len(input_seeds)}"
         )
 
-    def test_real_cache_passthrough_smoke(self):
+    def test_real_cache_passthrough_smoke(self, device):
         """A real per-layer SHRAM cache should pass cleanly through DecoderLayer."""
         config = small_config()
-        layer = make_layer(config, seed=0)
+        layer = make_layer(config, device, seed=0)
 
-        x, position_ids, active_mask = make_input(config, batch=1, seq=4, seed=3)
+        x, position_ids, active_mask = make_input(config, device, batch=1, seq=4, seed=3)
         prefix_x = x[:, :2]
         prefix_position_ids = position_ids[:, :2]
         prefix_active_mask = active_mask[:, :2]
@@ -217,6 +221,7 @@ class TestRuntimeSmoke:
         layer_cache = make_layer_cache(
             config,
             batch_size=1,
+            device=device,
         )
 
         prefix_output, prefix_load_balance_loss, _ = layer(
