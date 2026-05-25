@@ -104,8 +104,9 @@ class MoSRAHRouter(nn.Module):
         # Biased routing scores R̂ = Softmax(xW_r + b). Used only for TopK head
         # selection. expert_bias is added to logits before softmax so that the bias
         # shifts selection probability without rescaling the unbiased distribution.
+        biased_logits =  logits + self.expert_bias
         biased_routing_scores = F.softmax(                     # R̂, (B, N, L)
-            logits + self.expert_bias, dim=-1
+           biased_logits, dim=-1
         )
 
         # selected_heads I = TopK(R̂): K head indices per token, shape (B, N, K).

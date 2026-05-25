@@ -2631,15 +2631,33 @@ Applying skip-init, however, smooths the underlying variance issues which may ma
 
 ### Unit 21.B - Training capacity fix.
 
-[Deferred: Does stabilization fix it?]
-
 **Responsibility**
 
 Permanent enduring capacity fix by explicit capacity handling in the routing stage
 
 **Context of Correctness**
 
+While fixing stability is well and good, it does not guarentee permanent training or inference capacity. In theory, if routing could be modified such that it cannot assign tokens to full buckets - that is if it respected capacity limits - it would be possible to avoid having capacity overflows in the first place. This may cause minor differences between inference and training behavior, but htis is acceptable
 
+**Invariants**
+
+- Routing is modified to prioritize the tokens which most want a given head when over capacity
+- Routing is modified such that tokens simply choose other best-case options when out of capacity.
+- Routing and broader subsystems are modified in a way that makes testing possible
+
+**Testing**
+
+- Add test for the "balance_capacity" static helper method, verifying functionality, in the routing suite
+- Confirm existing tests continue to pass
+
+**Preliminary implementation strategy**
+
+- The logits can be intercepted in their biased (B, N, L) form. Since logits are ordered the same as probabilities, this will also tell us what will be most strongly chosen later. 
+- Masking out any logits to -1e8 if it would exceed capacity limits is sufficient to maintain load balancing. This could be trivially done if the value of the lowest ranked sorted logit at capacity was known; one would then simply mask out everything where threshold < logits.
+- Finding threshold is straightforward when training. If training, capacity is never used as in inference, and always starts at zero. Taking a kthvalue, with k=capacity, will allow the extraction of the logits at capacity; note inversion is needed to get the largest element instead. However, inference will need a more complex pathway. 
+- For inference, a "used_capacity" tensor of shape (B, L) or (B, 1, L) must be provided from the mosrah cache length.
+- The used capacity inference pattern requires a bit of padding and a while statement to execute properly. When the gathered topk is shorter than the possible capacity, it should be padded with a 1e8 thresold "allow any" value, then any index greater than the length can be redirected into the padding statement with a torch.while statement
+- It would make more sense to distinguish the pathway by passing in the used_capacity tensor, then using kthvalue or topk depending on if it is none or not. But remember, default values are not allowed at this level. 
 
 ### Unit 22 — Final Audit
 

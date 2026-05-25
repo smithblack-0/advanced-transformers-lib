@@ -803,7 +803,7 @@ class TestBackendPath:
             del q, k, v, scale
             seen["called"] = True
             assert block_mask == "mask"
-            return torch.zeros(1, config.num_mosrah_heads, 3, config.head_dim)
+            return torch.zeros(1, config.num_mosrah_heads, 3, config.head_dim, device=device)
 
         monkeypatch.setattr(bea_module, "create_block_mask", fake_create_block_mask)
         monkeypatch.setattr(bea_module, "flex_attention", fake_flex_attention)
