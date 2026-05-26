@@ -88,8 +88,9 @@ class MoSRAHLayer(nn.Module):
         # B*N*K True entries) and the packed active mask (live slots only);
         # active_mask is rebound to the packed form after this point.
         # -------------------------------------------------------------------
+        used_capacity = cache.get_heads_lengths() if cache is not None else None
         selected_heads, routing_probs, load_balance_loss, max_vio = self.router(
-            hidden_states, active_mask
+            hidden_states, active_mask, used_capacity
         )
 
         setup = setup_packing(selected_heads)

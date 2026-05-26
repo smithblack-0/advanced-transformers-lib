@@ -63,7 +63,7 @@ def setup_packing(
         batch_size,
         sequence_length * num_selected_heads,
     )
-
+    num_elements = batch_size*sequence_length*num_selected_heads
     permutation = torch.argsort(flattened_selected_heads, dim=-1, stable=True)
     inverse_permutation = torch.argsort(permutation, dim=-1)
 
@@ -71,6 +71,7 @@ def setup_packing(
         "flattened_selected_heads": flattened_selected_heads,
         "permutation": permutation,
         "inverse_permutation": inverse_permutation,
+        "num_elements" : num_elements,
     }
 
 
@@ -212,6 +213,7 @@ def pack_experts(
             (batch_size, num_experts, packed_length, *extra_shape),
             fill_value=padding_value,
         )
+
         packed_tensor[unpacking_mask] = sorted_tensor.reshape(-1, *extra_shape)
         packed_entries[key] = packed_tensor
 
@@ -256,7 +258,17 @@ def unpack_experts(
     batch_size, sequence_length, num_selected_heads = selected_heads.shape
     hidden_dim = expert_outputs.shape[-1]
 
-    active_outputs = expert_outputs[unpacking_mask]
+    coords = torch.nonzero_static(
+        unpacking_mask,
+        size=setup["num_elements"],
+    )  # shape: (B*N*K, 3)
+
+    active_outputs = expert_outputs[
+        coords[:, 0],
+        coords[:, 1],
+        coords[:, 2],
+    ]  # shape: (B*N*K, d)
+
     sorted_token_choice_outputs = active_outputs.reshape(
         batch_size,
         sequence_length * num_selected_heads,
@@ -266,7 +278,6 @@ def unpack_experts(
         dim=1,
         index=inverse_permutation.unsqueeze(-1).expand(-1, -1, hidden_dim),
     )
-
     return restored_outputs.reshape(
         batch_size,
         sequence_length,

@@ -146,9 +146,12 @@ class TestIntegrationCompilable:
         torch._dynamo.reset()
 
         m = ShramForCausalLM(small_config()).cuda().eval()
+
+
         ids = torch.randint(0, 256, (1, 1)).cuda()
         m(ids, use_cache=False)
         compiled = torch.compile(m, fullgraph=False, dynamic=False)
+        #print(torch._dynamo.explain(compiled, ids, use_cache=False))
         compiled(ids, use_cache=False)
     @pytest.mark.skipif(
         not torch.cuda.is_available(),
