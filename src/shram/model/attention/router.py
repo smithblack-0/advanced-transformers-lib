@@ -35,6 +35,7 @@ import torch.nn.functional as F
 from ..configuration import ShramConfig
 from .load_balance_loss import LoadBalanceLoss
 
+from typing import Optional
 
 class MoSRAHRouter(nn.Module):
     """Token-choice router for MoSRAH sparse attention.
@@ -58,6 +59,10 @@ class MoSRAHRouter(nn.Module):
         self.num_mosrah_heads = config.num_mosrah_heads
         self.num_selected_heads = config.num_selected_heads
         self.load_balance_p = config.load_balance_p
+        if config.use_cache:
+            self.capacity = config.mosrah_cache_length
+        else:
+            self.capacity = config.mosrah_packed_length
 
         # W_r: routing projection, no bias (paper specifies xW_r, no additional term).
         self.routing_projection = nn.Linear(
@@ -69,8 +74,69 @@ class MoSRAHRouter(nn.Module):
         # via the LoadBalanceLoss custom backward.
         self.expert_bias = nn.Parameter(torch.zeros(config.num_mosrah_heads))
 
+    @staticmethod
+    def balance_capacity(logits: torch.Tensor,
+                         used_capacity: torch.Tensor | None,
+                         capacity: int,
+                         )->torch.Tensor:
+        """
+        Balances capacity limits so that if choosing an
+        expert would go over capacity, the expert is simply
+        not chosen instead
+        :param logits: The logits to balance. (B, N, L)
+        :param used_capacity: The used capacity, if it exists. (B, L)
+        :param capacity: The maximum available capacity. Int.
+        :return: Modified logits.
+        """
+
+        if used_capacity is None:
+            # Presume we are in training mode.
+
+            # Looking up capacity limits only
+            # matters if it is, in fact, possible
+            # to exceed capacity limits.
+            if logits.shape[-2] < capacity:
+                return logits
+
+            # Look up the kthvalue and use that as
+            # the threshold to mask when below.
+            # Note we negate then negate again to sort
+            # in ascending order.
+            response = torch.kthvalue(-logits, capacity, dim=-2)
+            threshold = -response.values
+            threshold = threshold.unsqueeze(-2) #(B, 1, L)
+        else:
+            # We are operating in inference mode.
+            # We have to use padding to accomodate the
+            # response physically not being long enough
+            # to reach capacity
+
+            # Note that padding at zero and shifting
+            # the indexes prevents dereferencing a symint,
+            # as a version that just patted at 0, 1 and set to
+            # length + 1 would do. This prevents a graph break.
+            remaining_capacity = capacity - used_capacity # 0 means all used, can be at most capacity
+            response_length = logits.shape[-2]
+            index = torch.clamp(remaining_capacity, 0, response_length+1)
+
+            # Sort, and add padding. Anything asking for a sequence position
+            # outside the current sequence will get a threshold of -1e8; always include
+            # If we are asking for a value at zero, get 1e8, or full and we include
+            # nothing.
+            ordered_logits = torch.sort(logits, dim=-2, descending=True).values
+            ordered_logits = F.pad(ordered_logits, (0,0, 1, 0), value=1e8)
+            ordered_logits = F.pad(ordered_logits, (0, 0, 0, 1), value=-1e8)
+
+            threshold = ordered_logits.gather(-2, index.unsqueeze(-2)) #(B, 1, L)
+
+        mask = threshold > logits
+        logits = logits.masked_fill(mask, -1e8)
+        return logits
     def forward(
-        self, x: torch.Tensor, active_mask: torch.Tensor
+        self,
+        x: torch.Tensor,
+        active_mask: torch.Tensor,
+        used_capacity: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route input tokens to K expert heads each and compute routing probabilities.
 
@@ -79,7 +145,7 @@ class MoSRAHRouter(nn.Module):
             active_mask: Current-chunk active mask of shape (batch, seq_len), where
                 True means the token is semantically live. Dead tokens do not
                 contribute to routing frequencies, load_balance_loss, or max_vio.
-
+            used_capacity: Used for capacity management during inference, missing during training.
         Returns:
             selected_heads: Head indices I of shape (batch, seq_len, num_selected_heads).
                 Each token's K selected head indices, determined by TopK on biased scores.
@@ -104,19 +170,21 @@ class MoSRAHRouter(nn.Module):
         # Biased routing scores R̂ = Softmax(xW_r + b). Used only for TopK head
         # selection. expert_bias is added to logits before softmax so that the bias
         # shifts selection probability without rescaling the unbiased distribution.
-        biased_logits =  logits + self.expert_bias
+        biased_logits = logits + self.expert_bias
+        biased_logits = self.balance_capacity(biased_logits, used_capacity, self.capacity)
         biased_routing_scores = F.softmax(                     # R̂, (B, N, L)
            biased_logits, dim=-1
         )
 
         # selected_heads I = TopK(R̂): K head indices per token, shape (B, N, K).
+        # and routing logits directly
         selected_heads = biased_routing_scores.topk(K, dim=-1).indices
+        gathered = routing_scores.gather(dim=-1, index=selected_heads)   # V, (B, N, K)
 
         # Routing probabilities P: gathered from unbiased R at selected_heads indices,
         # then renormalized so they sum to 1 per token. Gathering from routing_scores
         # (not biased_routing_scores) is the invariant that keeps the gradient path from
         # the output back to the router weights free of expert_bias influence.
-        gathered = routing_scores.gather(dim=-1, index=selected_heads)   # V, (B, N, K)
         routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)    # P, (B, N, K)
 
         # Per-item routing frequencies f_{b,l}: for each batch item b and head l, what

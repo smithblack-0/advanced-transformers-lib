@@ -87,7 +87,7 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        selected_heads, _, _, _ = router(x, active_mask)
+        selected_heads, _, _, _ = router(x, active_mask, None)
         assert selected_heads.shape == (2, 8, config.num_selected_heads)
 
     def test_routing_probs_shape(self):
@@ -96,7 +96,7 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, routing_probs, _, _ = router(x, active_mask)
+        _, routing_probs, _, _ = router(x, active_mask, None)
         assert routing_probs.shape == (2, 8, config.num_selected_heads)
 
     def test_load_balance_loss_is_scalar(self):
@@ -105,7 +105,7 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, load_balance_loss, _ = router(x, active_mask)
+        _, _, load_balance_loss, _ = router(x, active_mask, None)
         assert load_balance_loss.shape == ()
 
     def test_max_vio_is_scalar(self):
@@ -114,7 +114,7 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, _, max_vio = router(x, active_mask)
+        _, _, _, max_vio = router(x, active_mask, None)
         assert max_vio.shape == ()
 
 
@@ -130,7 +130,7 @@ class TestRoutingProbabilities:
         router = MoSRAHRouter(config)
         x = torch.randn(3, 10, 64)
         active_mask = torch.ones(3, 10, dtype=torch.bool)
-        _, routing_probs, _, _ = router(x, active_mask)
+        _, routing_probs, _, _ = router(x, active_mask, None)
         token_sums = routing_probs.sum(dim=-1)
         assert torch.allclose(token_sums, torch.ones_like(token_sums), atol=1e-5)
 
@@ -140,7 +140,7 @@ class TestRoutingProbabilities:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, routing_probs, _, _ = router(x, active_mask)
+        _, routing_probs, _, _ = router(x, active_mask, None)
         assert (routing_probs >= 0).all()
 
     def test_routing_probs_use_unbiased_scores(self):
@@ -156,7 +156,7 @@ class TestRoutingProbabilities:
         active_mask = torch.ones(2, 8, dtype=torch.bool)
 
         with torch.no_grad():
-            selected_heads, routing_probs, _, _ = router(x, active_mask)
+            selected_heads, routing_probs, _, _ = router(x, active_mask, None)
 
             # Recompute unbiased scores without going through the router's full forward
             logits = router.routing_projection(x)
@@ -178,7 +178,7 @@ class TestSelectedHeads:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        selected_heads, _, _, _ = router(x, active_mask)
+        selected_heads, _, _, _ = router(x, active_mask, None)
         assert (selected_heads >= 0).all()
         assert (selected_heads < config.num_mosrah_heads).all()
 
@@ -192,7 +192,7 @@ class TestSelectedHeads:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        selected_heads, _, _, _ = router(x, active_mask)
+        selected_heads, _, _, _ = router(x, active_mask, None)
         B, N, K = selected_heads.shape
         for b in range(B):
             for n in range(N):
@@ -215,7 +215,7 @@ class TestBiasInfluencesSelectionOnly:
         with torch.no_grad():
             router.expert_bias.zero_()
             router.expert_bias[0] = 100.0
-            selected_heads, _, _, _ = router(x, active_mask)
+            selected_heads, _, _, _ = router(x, active_mask, None)
 
         # Head 0 must be selected for every token when its bias is enormous.
         assert (selected_heads == 0).any(dim=-1).all()
@@ -235,7 +235,7 @@ class TestBiasInfluencesSelectionOnly:
         with torch.no_grad():
             router.expert_bias.zero_()
             router.expert_bias[0] = 100.0
-            selected_heads, routing_probs, _, _ = router(x, active_mask)
+            selected_heads, routing_probs, _, _ = router(x, active_mask, None)
 
             logits = router.routing_projection(x)
             unbiased = torch.softmax(logits, dim=-1)
@@ -256,7 +256,7 @@ class TestGradients:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, load_balance_loss, _ = router(x, active_mask)
+        _, _, load_balance_loss, _ = router(x, active_mask, None)
         load_balance_loss.backward()
 
         assert router.expert_bias.grad is not None
@@ -269,7 +269,7 @@ class TestGradients:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, load_balance_loss, _ = router(x, active_mask)
+        _, _, load_balance_loss, _ = router(x, active_mask, None)
         load_balance_loss.backward()
 
         # At initialization with zero biases and random weights the routing will be
@@ -367,7 +367,7 @@ class TestMaxVio:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, _, max_vio = router(x, active_mask)
+        _, _, _, max_vio = router(x, active_mask, None)
         assert not max_vio.requires_grad
 
 
@@ -392,11 +392,11 @@ class TestMaskedContinuationBehavior:
 
         torch.manual_seed(11)
         x = torch.randn(B, N, config.embedding_width)
-        _, _, loss_a, _ = router(x, active_mask)
+        _, _, loss_a, _ = router(x, active_mask, None)
 
         x_modified = x.clone()
         x_modified[0, 3] = torch.randn(config.embedding_width) * 100.0
-        _, _, loss_b, _ = router(x_modified, active_mask)
+        _, _, loss_b, _ = router(x_modified, active_mask, None)
 
         torch.testing.assert_close(loss_a, loss_b)
 
@@ -410,11 +410,11 @@ class TestMaskedContinuationBehavior:
 
         torch.manual_seed(17)
         x = torch.randn(B, N, config.embedding_width)
-        _, _, _, vio_a = router(x, active_mask)
+        _, _, _, vio_a = router(x, active_mask, None)
 
         x_modified = x.clone()
         x_modified[1, 5] = torch.randn(config.embedding_width) * 100.0
-        _, _, _, vio_b = router(x_modified, active_mask)
+        _, _, _, vio_b = router(x_modified, active_mask, None)
 
         torch.testing.assert_close(vio_a, vio_b)
 
@@ -435,8 +435,126 @@ class TestMaskedContinuationBehavior:
         x = torch.randn(B, N, config.embedding_width)
 
         with torch.no_grad():
-            selected_heads, _, _, max_vio = router(x, active_mask)
+            selected_heads, _, _, max_vio = router(x, active_mask, None)
             expected_freqs = _reference_routing_freqs(selected_heads, L, config.load_balance_p)
             expected_max_vio = MoSRAHRouter._compute_max_vio(expected_freqs, L)
 
         torch.testing.assert_close(max_vio, expected_max_vio)
+
+
+# ---------------------------------------------------------------------------
+# balance_capacity
+# ---------------------------------------------------------------------------
+
+class TestBalanceCapacity:
+    """Tests for MoSRAHRouter.balance_capacity.
+
+    Called directly as a static method with synthetic logits to verify
+    each path independently of the full router forward pass.
+    """
+
+    def test_training_passthrough_when_n_below_capacity(self):
+        """When N < capacity in training mode, logits are returned unchanged."""
+        logits = torch.randn(2, 3, 4)
+        result = MoSRAHRouter.balance_capacity(logits, None, capacity=8)
+        assert torch.equal(result, logits)
+
+    def test_training_correct_tokens_masked(self):
+        """Top-capacity tokens per head survive; the rest are masked to -1e8.
+
+        Uses known logits so the expected survivors are exact and analytically
+        derivable: for capacity=3 over N=5 tokens, the three highest logits must
+        survive and the two lowest must be masked.
+        """
+        logits = torch.tensor([[[5.0], [3.0], [1.0], [4.0], [2.0]]])  # (1, 5, 1)
+        result = MoSRAHRouter.balance_capacity(logits, None, capacity=3)
+        # threshold = 3rd largest = 3.0; logits < 3.0 (i.e. 1.0 and 2.0) are masked
+        assert result[0, 0, 0] == 5.0   # top-1 survives
+        assert result[0, 1, 0] == 3.0   # top-3 survives (equals threshold, not strictly less)
+        assert result[0, 2, 0] <= -1e7  # 1.0 masked
+        assert result[0, 3, 0] == 4.0   # top-2 survives
+        assert result[0, 4, 0] <= -1e7  # 2.0 masked
+
+    def test_training_surviving_count_equals_capacity(self):
+        """With N > capacity, exactly capacity logits per (batch, head) are unmasked."""
+        B, N, L, capacity = 2, 10, 4, 3
+        torch.manual_seed(0)
+        logits = torch.randn(B, N, L)
+        result = MoSRAHRouter.balance_capacity(logits, None, capacity=capacity)
+        unmasked_counts = (result > -1e7).sum(dim=-2)   # (B, L)
+        assert (unmasked_counts == capacity).all()
+
+    def test_training_no_masking_when_n_equals_capacity(self):
+        """When N == capacity every token is within the limit — nothing is masked."""
+        torch.manual_seed(2)
+        logits = torch.randn(2, 4, 3)
+        result = MoSRAHRouter.balance_capacity(logits, None, capacity=4)
+        assert torch.equal(result, logits)
+
+    def test_inference_full_head_blocks_all_tokens(self):
+        """When used_capacity equals capacity, all tokens for that head are masked.
+
+        The gather index falls on the padded 1e8 position, making every finite
+        logit smaller than the threshold.
+        """
+        B, N, L, capacity = 1, 4, 2, 4
+        torch.manual_seed(3)
+        logits = torch.randn(B, N, L)
+        # head 0 fully used, head 1 empty
+        used_capacity = torch.tensor([[capacity, 0]])
+        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity)
+        assert (result[0, :, 0] <= -1e7).all()
+
+    def test_inference_correct_tokens_survive_per_head(self):
+        """The surviving tokens must match the expected per-head capacity threshold.
+
+        Uses known logits across two heads with different used_capacity values so
+        the expected threshold and survivors are analytically derivable.
+        """
+        # B=1, N=4, L=2, capacity=4
+        # Head 0 logits: [10, 7, 4, 1] — sorted desc: [10, 7, 4, 1]
+        # Head 1 logits: [9, 6, 3, 0]  — sorted desc: [9, 6, 3, 0]
+
+        logits = torch.tensor([[[10.0, 9.0], [7.0, 6.0], [4.0, 3.0], [1.0, 0.0]]])  # (1, 4, 2)
+        # head 0: used=2 → remaining - 2, threshold=top[2-1]=7 → everything less than 7 masked.
+        # head 1: used=3 → remaining = 1, threshold=top[1-1]=9 → everything less than 9 masked.
+
+        used_capacity = torch.tensor([[2, 3]])
+        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=4)
+
+        # Head 0
+        assert result[0, 0, 0] == 10.0
+        assert result[0, 1, 0] == 7.0
+        assert result[0, 2, 0] <= -1e7
+        assert result[0, 3, 0] <= -1e7
+        # Head 1 — all survive
+        assert result[0, 0, 1] == 9.0
+        assert result[0, 1, 1] <= -1e7
+        assert result[0, 2, 1] <= -1e7
+        assert result[0, 3, 1] <= -1e7
+
+    def test_inference_n_less_than_capacity_empty_head_passes(self):
+        """With N < capacity and an empty head, the single token must not be masked.
+
+        This is the standard decode-step case: one new token, head has room.
+        """
+        B, N, L, capacity = 1, 1, 2, 8
+        torch.manual_seed(4)
+        logits = torch.randn(B, N, L)
+        used_capacity = torch.zeros(B, L, dtype=torch.long)
+        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity)
+        assert (result > -1e7).all()
+
+    def test_inference_n_less_than_capacity_full_head_blocks(self):
+        """With N < capacity and a full head, the single token must be masked.
+
+        Mirrors test_inference_full_head_blocks_all_tokens but with N < capacity.
+        """
+        B, N, L, capacity = 1, 1, 2, 8
+        torch.manual_seed(5)
+        logits = torch.randn(B, N, L)
+        # head 0 full, head 1 empty
+        used_capacity = torch.tensor([[capacity, 0]])
+        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity)
+        assert (result[0, :, 0] <= -1e7).all()
+        assert (result[0, :, 1] > -1e7).all()

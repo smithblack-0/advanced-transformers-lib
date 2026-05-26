@@ -85,11 +85,10 @@ is being achieved, one verified unit at a time.
 - [X] Unit 19.G.5 (Blocker) — Static cache rebuild for compiled inference
 - [X] Unit 20.A (Blocker) — Release pipeline: dev repository staging and E2E test gate
 - [X] Unit 20.B — stage_for_hub.py: inject explicit import block into staged huggingface.py
-- [ ] Unit 21 — Capacity issues
-- [ ] Unit 21.A — huggingface initialization fix
-- [ ] Unit 21.B — training capacity fix.
-- [ ] Unit 22.A — Investigating inference compile errors
-- [ ] Unit 23 — Final audit
+- [X] Unit 21 — Capacity issues
+- [X] Unit 21.A — huggingface initialization fix
+- [X] Unit 21.B — training capacity fix.
+- [ ] Unit 22 — Final audit
 
 ---
 
