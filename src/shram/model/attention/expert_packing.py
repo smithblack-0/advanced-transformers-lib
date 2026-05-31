@@ -172,7 +172,7 @@ def pack_experts(
     tokens_per_expert = _count_tokens_per_expert(flattened_selected_heads, num_experts)
     max_count = tokens_per_expert.max().item()
     no_overflow = max_count <= packed_length
-    _enforce_no_overflow(no_overflow, max_count, tokens_per_expert)
+    _enforce_no_overflow(no_overflow, tokens_per_expert, packed_length)
 
     # -----------------------------------------------------------------------
     # Construct the unpacking mask.
@@ -315,9 +315,9 @@ def _enforce_no_overflow(condition: bool, tokens_per_expert, max_length) -> None
             raise RuntimeError(
                 "Expert packing overflow: at least one expert bucket contains more "
                 "tokens than mosrah_packed_length allows. Increase "
-                "mosrah_overallocation_factor in ShramConfig to resolve."
-                f"head lengths were: \n {tokens_per_expert}"
-                f"max length was: {max_length}"
+                "mosrah_overallocation_factor in ShramConfig to resolve.\n"
+                f"Supported lengths were:\n {max_length}\n"
+                f"head lengths were:\n {tokens_per_expert}\n"
             )
 
 
