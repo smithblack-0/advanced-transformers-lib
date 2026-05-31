@@ -586,13 +586,212 @@ class TestBalanceCapacity:
             MoSRAHRouter.balance_capacity(logits, None, capacity=capacity, min_choices=min_choices, max_rounds=10)
 
 
+class TestRouterRealizedCapacityFuzz:
+    """Fuzz tests for the router's realized selected-head capacity contract.
+
+    Packing consumes the final `selected_heads` index tensor, not the router's
+    internal capacity mask. The contract tested here is therefore only the
+    downstream-relevant one: after routing, no active `(batch, expert)` bucket
+    may contain more routed token copies than `config.mosrah_packed_length`.
+
+    This suite fixes the architecture/config, reads the actual packed capacity
+    from config, varies runtime sequence length to hit a target capacity-use
+    ratio, and counts the realized selected-head indices.
+    """
+
+    NUM_TRIALS = 100
+    BATCH_SIZE = 4
+    TRAINING_SEQUENCE_LENGTH = 256
+    MAX_BID_ROUNDS = 64
+
+    SPARSITY_PROFILES = (
+        (16, 16),
+        (32, 16),
+        (64, 16),
+    )
+
+    @staticmethod
+    def _make_config(num_mosrah_heads: int, num_selected_heads: int) -> ShramConfig:
+        """Build the router config for one sparsity profile.
+
+        The production path obtains packed capacity from
+        `config.mosrah_packed_length`. The test does the same so it certifies
+        the same capacity boundary consumed later by expert packing.
+        """
+
+        return small_config(
+            embedding_width=64,
+            num_mosrah_heads=num_mosrah_heads,
+            num_selected_heads=num_selected_heads,
+            num_sliding_window_heads=4,
+            head_dim=16,
+            training_sequence_length=(
+                TestRouterRealizedCapacityFuzz.TRAINING_SEQUENCE_LENGTH
+            ),
+            inference_sequence_length=(
+                TestRouterRealizedCapacityFuzz.TRAINING_SEQUENCE_LENGTH
+            ),
+            mosrah_overallocation_factor=1.25,
+            max_bid_rounds=TestRouterRealizedCapacityFuzz.MAX_BID_ROUNDS,
+            use_cache=False,
+        )
+
+    @staticmethod
+    def _runtime_length_for_capacity_use(
+        capacity_use: float,
+        capacity: int,
+        num_mosrah_heads: int,
+        num_selected_heads: int,
+    ) -> int:
+        """Return runtime token count for the requested capacity-use ratio.
+
+        Capacity use is `N * K / (C * L)`, where `N` is runtime token count,
+        `K` is selected heads per token, `C` is per-expert packed capacity, and
+        `L` is total MoSRAH heads. In practice `L`, `K`, and `C` are fixed by
+        architecture/config; `N` is the runtime load knob.
+        """
+
+        return int(
+            capacity_use
+            * capacity
+            * num_mosrah_heads
+            / num_selected_heads
+        )
+
+    @staticmethod
+    def _count_selected_heads(
+        selected_heads: torch.Tensor,
+        active_mask: torch.Tensor,
+        num_mosrah_heads: int,
+    ) -> torch.Tensor:
+        """Count active routed token copies per `(batch, expert)` bucket."""
+
+        batch_size = selected_heads.shape[0]
+
+        counts = torch.zeros(
+            batch_size,
+            num_mosrah_heads,
+            dtype=torch.long,
+            device=selected_heads.device,
+        )
+
+        active_selected_heads = selected_heads.masked_fill(
+            ~active_mask.unsqueeze(-1),
+            0,
+        )
+
+        active_copies = active_mask.unsqueeze(-1).expand_as(selected_heads)
+        src = active_copies.to(dtype=torch.long)
+
+        counts.scatter_add_(
+            dim=-1,
+            index=active_selected_heads.reshape(batch_size, -1),
+            src=src.reshape(batch_size, -1),
+        )
+
+        return counts
+
+    def _run_realized_capacity_fuzz(
+        self,
+        device: torch.device,
+        capacity_use: float,
+    ) -> None:
+        """Run randomized realized-capacity trials for one capacity-use ratio."""
+
+        generator = torch.Generator(device=device)
+        generator.manual_seed(19317)
+
+        for num_mosrah_heads, num_selected_heads in self.SPARSITY_PROFILES:
+            config = self._make_config(num_mosrah_heads, num_selected_heads)
+            router = MoSRAHRouter(config).to(device)
+
+            capacity = config.mosrah_packed_length
+            runtime_length = self._runtime_length_for_capacity_use(
+                capacity_use,
+                capacity,
+                num_mosrah_heads,
+                num_selected_heads,
+            )
+
+            assert runtime_length > 0
+
+            actual_capacity_use = (
+                runtime_length
+                * num_selected_heads
+                / (capacity * num_mosrah_heads)
+            )
+
+            for trial in range(self.NUM_TRIALS):
+                x = torch.randn(
+                    self.BATCH_SIZE,
+                    runtime_length,
+                    config.embedding_width,
+                    generator=generator,
+                    device=device,
+                )
+                active_mask = torch.ones(
+                    self.BATCH_SIZE,
+                    runtime_length,
+                    dtype=torch.bool,
+                    device=device,
+                )
+
+                selected_heads, _, _, _ = router(
+                    x,
+                    active_mask,
+                    used_capacity=None,
+                )
+
+                assert selected_heads.shape == (
+                    self.BATCH_SIZE,
+                    runtime_length,
+                    num_selected_heads,
+                )
+
+                counts = self._count_selected_heads(
+                    selected_heads,
+                    active_mask,
+                    num_mosrah_heads,
+                )
+
+                max_count = counts.max().item()
+
+                assert max_count <= capacity, (
+                    "router exceeded realized packed capacity: "
+                    f"requested_capacity_use={capacity_use}, "
+                    f"actual_capacity_use={actual_capacity_use}, "
+                    f"trial={trial}, "
+                    f"B={self.BATCH_SIZE}, "
+                    f"N={runtime_length}, "
+                    f"L={num_mosrah_heads}, "
+                    f"K={num_selected_heads}, "
+                    f"C={capacity}, "
+                    f"max_count={max_count}, "
+                    f"counts={counts}"
+                )
+
+    def test_realized_capacity_fuzz_50_percent(self, device):
+        """Final selected_heads must obey capacity at 50% packed-capacity use."""
+
+        self._run_realized_capacity_fuzz(device, capacity_use=0.50)
+
+    def test_realized_capacity_fuzz_80_percent(self, device):
+        """Final selected_heads must obey capacity at 80% packed-capacity use."""
+
+        self._run_realized_capacity_fuzz(device, capacity_use=0.80)
+
+    def test_realized_capacity_fuzz_90_percent(self, device):
+        """Final selected_heads must obey capacity at 90% packed-capacity use."""
+
+        self._run_realized_capacity_fuzz(device, capacity_use=0.90)
+
 # ---------------------------------------------------------------------------
-# get_threshold
+# get_mask
 # ---------------------------------------------------------------------------
 
 # Alias the static method so tests call the production code directly without
 # being coupled to the class name in every assertion.
-get_threshold = MoSRAHRouter.get_threshold
+get_mask = MoSRAHRouter.get_mask
 
 
 def make_tensor(*shape):
@@ -600,149 +799,144 @@ def make_tensor(*shape):
     return torch.arange(math.prod(shape), dtype=torch.float).reshape(shape)
 
 
-class TestGetThresholdContract:
+class TestGetMaskContract:
     """
-    Tests verify the contract: value >= threshold iff value ranks within top n.
-    Shape, device, and sentinel behaviour are verified separately.
+    Tests verify the contract: mask has exactly min(n_per_slice, dim_length)
+    True entries per slice along dim, at the highest-valued positions.
     """
 
-    def test_int_n_threshold_separates_top_n_dim_last(self):
-        """For every position, exactly n values must be >= threshold per row."""
+    def test_int_n_selects_top_n_dim_last(self):
+        """Exactly n True entries per row along the last dimension."""
         t = torch.randn(3, 8)
         for n in range(1, 8):
-            threshold = get_threshold(t, dim=-1, n=n)
-            count = (t >= threshold).sum(dim=-1)
+            mask = get_mask(t, dim=-1, n=n, capacity_scalar=8)
+            count = mask.sum(dim=-1)
             assert (count == n).all(), \
-                f"n={n}: expected {n} values >= threshold per row, got {count}"
+                f"n={n}: expected {n} True per row, got {count}"
 
-    def test_int_n_threshold_separates_top_n_dim_second_last(self):
-        """For every column, exactly n values must be >= threshold."""
+    def test_int_n_selects_top_n_dim_second_last(self):
+        """Exactly n True entries per column along the second-to-last dimension."""
         t = torch.randn(2, 8, 4)
         for n in range(1, 8):
-            threshold = get_threshold(t, dim=-2, n=n)
-            count = (t >= threshold).sum(dim=-2)
+            mask = get_mask(t, dim=-2, n=n, capacity_scalar=8)
+            count = mask.sum(dim=-2)
             assert (count == n).all(), \
-                f"n={n}: expected {n} values >= threshold per column"
+                f"n={n}: expected {n} True per column"
 
-    def test_tensor_n_threshold_separates_top_n(self):
-        """Each row gets its own rank; the contract holds per row."""
+    def test_tensor_n_selects_top_n_per_row(self):
+        """Each row gets exactly n[row] True entries."""
         t = torch.randn(4, 8)
         n = torch.randint(1, 8, (4,))
-        threshold = get_threshold(t, dim=-1, n=n)
+        mask = get_mask(t, dim=-1, n=n, capacity_scalar=8)
         for i in range(t.shape[0]):
-            count = (t[i] >= threshold[i, 0]).sum()
+            count = mask[i].sum()
             assert count.item() == n[i].item(), \
-                f"row {i}: expected {n[i]} values >= threshold, got {count}"
+                f"row {i}: expected {n[i]} True, got {count}"
 
     def test_tensor_n_column_dim(self):
         """Tensor-n contract holds for the second-to-last dimension."""
         t = torch.randn(2, 8, 4)
         n = torch.randint(1, 8, (2, 4))
-        threshold = get_threshold(t, dim=-2, n=n)
+        mask = get_mask(t, dim=-2, n=n, capacity_scalar=8)
         for b in range(2):
             for j in range(4):
-                count = (t[b, :, j] >= threshold[b, 0, j]).sum()
+                count = mask[b, :, j].sum()
                 assert count.item() == n[b, j].item()
 
+    def test_selected_entries_are_highest_valued(self):
+        """True entries must be the n highest-valued positions per row."""
+        t = torch.randn(3, 8)
+        n = 3
+        mask = get_mask(t, dim=-1, n=n, capacity_scalar=8)
+        for i in range(t.shape[0]):
+            selected_min = t[i][mask[i]].min()
+            unselected_max = t[i][~mask[i]].max()
+            assert selected_min >= unselected_max, \
+                f"row {i}: selected values are not the top {n}"
 
-class TestGetThresholdSentinels:
 
-    def test_int_n_zero_returns_inf(self):
-        """n=0 must return +inf so that no value passes the >= threshold check."""
+class TestGetMaskBoundaries:
+
+    def test_int_n_zero_returns_all_false(self):
+        """n=0 must return all-False — nothing qualifies."""
         t = torch.randn(4, 8)
-        result = get_threshold(t, dim=-1, n=0)
-        assert result.isinf().all()
-        assert (result > 0).all()
+        mask = get_mask(t, dim=-1, n=0, capacity_scalar=8)
+        assert not mask.any()
 
-    def test_int_n_overflow_returns_neg_inf(self):
-        """n > dim_length must return -inf so that every value passes."""
+    def test_int_n_overflow_returns_all_true(self):
+        """n >= dim_length must return all-True — every entry qualifies."""
         t = torch.randn(4, 8)
-        result = get_threshold(t, dim=-1, n=9)   # dim_length == 8
-        assert result.isinf().all()
-        assert (result < 0).all()
+        mask = get_mask(t, dim=-1, n=9, capacity_scalar=9)   # dim_length == 8
+        assert mask.all()
 
-    def test_tensor_n_zero_positions_return_inf(self):
-        """Tensor n=0 per row must return +inf."""
+    def test_tensor_n_zero_positions_return_all_false(self):
+        """Tensor n=0 per row must produce all-False rows."""
         t = torch.randn(4, 8)
         n = torch.zeros(4, dtype=torch.long)
-        result = get_threshold(t, dim=-1, n=n)
-        assert result.isinf().all()
-        assert (result > 0).all()
+        mask = get_mask(t, dim=-1, n=n, capacity_scalar=8)
+        assert not mask.any()
 
-    def test_tensor_n_overflow_positions_return_neg_inf(self):
-        """Tensor n > dim_length per row must return -inf."""
+    def test_tensor_n_overflow_positions_return_all_true(self):
+        """Tensor n >= dim_length per row must produce all-True rows."""
         t = torch.randn(4, 8)
-        n = torch.full((4,), 9, dtype=torch.long)   # dim_length == 8
-        result = get_threshold(t, dim=-1, n=n)
-        assert result.isinf().all()
-        assert (result < 0).all()
+        n = torch.full((4,), 9, dtype=torch.long)
+        mask = get_mask(t, dim=-1, n=n, capacity_scalar=9)   # dim_length == 8
+        assert mask.all()
 
-    def test_tensor_n_mixed_sentinels_and_valid(self):
-        """A mix of n=0, valid n, and n>dim_length must produce the correct sentinels."""
+    def test_tensor_n_mixed_boundaries_and_valid(self):
+        """n=0 rows all-False, valid n rows correct count, overflow rows all-True."""
         t = torch.randn(3, 8)
-        # row 0: n=0 (+inf), row 1: n=4 (valid), row 2: n=9 (-inf)
+        # row 0: n=0 (all False), row 1: n=4 (4 True), row 2: n=9 (all True)
         n = torch.tensor([0, 4, 9])
-        result = get_threshold(t, dim=-1, n=n)
-        assert math.isinf(result[0, 0].item()) and result[0, 0] > 0
-        assert not result[1, 0].isinf()
-        assert math.isinf(result[2, 0].item()) and result[2, 0] < 0
+        mask = get_mask(t, dim=-1, n=n, capacity_scalar=9)
+        assert not mask[0].any()
+        assert mask[1].sum().item() == 4
+        assert mask[2].all()
 
 
-class TestGetThresholdShape:
+class TestGetMaskShape:
 
-    def test_keepdim_int_n_dim_last(self):
-        """Result must have keepdim shape when reducing along the last dimension."""
+    def test_output_shape_matches_input_dim_last(self):
+        """Output shape must equal input shape."""
         t = torch.randn(2, 5, 8)
-        result = get_threshold(t, dim=-1, n=3)
-        assert tuple(result.shape) == (2, 5, 1)
+        mask = get_mask(t, dim=-1, n=3, capacity_scalar=8)
+        assert tuple(mask.shape) == (2, 5, 8)
 
-    def test_keepdim_int_n_dim_second_last(self):
-        """Result must have keepdim shape when reducing along the second-to-last dim."""
+    def test_output_shape_matches_input_dim_second_last(self):
+        """Output shape must equal input shape for dim=-2."""
         t = torch.randn(2, 8, 4)
-        result = get_threshold(t, dim=-2, n=3)
-        assert tuple(result.shape) == (2, 1, 4)
+        mask = get_mask(t, dim=-2, n=3, capacity_scalar=8)
+        assert tuple(mask.shape) == (2, 8, 4)
 
-    def test_keepdim_tensor_n_dim_last(self):
-        """Tensor-n result must have keepdim shape along the last dimension."""
-        t = torch.randn(2, 5, 8)
-        n = torch.randint(1, 8, (2, 5))
-        result = get_threshold(t, dim=-1, n=n)
-        assert tuple(result.shape) == (2, 5, 1)
+    def test_output_is_bool(self):
+        """Output dtype must be bool."""
+        t = torch.randn(4, 8)
+        mask = get_mask(t, dim=-1, n=3, capacity_scalar=8)
+        assert mask.dtype == torch.bool
 
-    def test_keepdim_tensor_n_dim_second_last(self):
-        """Tensor-n result must have keepdim shape along the second-to-last dim."""
-        t = torch.randn(2, 8, 4)
-        n = torch.randint(1, 8, (2, 4))
-        result = get_threshold(t, dim=-2, n=n)
-        assert tuple(result.shape) == (2, 1, 4)
-
-    def test_dtype_and_device_preserved(self):
-        """Output dtype and device must match the input tensor."""
+    def test_device_preserved(self):
+        """Output must be on the same device as the input."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        t = torch.randn(4, 8, device=device, dtype=torch.float32)
-        result = get_threshold(t, dim=-1, n=3)
-        assert result.device.type == device
-        assert result.dtype == torch.float32
+        t = torch.randn(4, 8, device=device)
+        mask = get_mask(t, dim=-1, n=3, capacity_scalar=8)
+        assert mask.device.type == device
 
 
-class TestGetThresholdIntTensorAgreement:
-    """Int and tensor paths must agree on valid n values."""
+class TestGetMaskIntTensorAgreement:
+    """Int and tensor paths must produce identical masks for the same n values."""
 
     def test_paths_agree_dim_last(self):
-        """int n and tensor n must produce identical thresholds for every valid rank."""
         t = torch.randn(3, 8)
         for n_val in range(1, 9):
-            int_result    = get_threshold(t, dim=-1, n=n_val)
-            tensor_result = get_threshold(t, dim=-1, n=torch.full((3,), n_val))
-            assert torch.allclose(int_result, tensor_result), \
+            int_mask    = get_mask(t, dim=-1, n=n_val, capacity_scalar=8)
+            tensor_mask = get_mask(t, dim=-1, n=torch.full((3,), n_val), capacity_scalar=8)
+            assert (int_mask == tensor_mask).all(), \
                 f"paths disagree at n={n_val}"
 
     def test_paths_agree_dim_second_last(self):
-        """int n and tensor n must agree along the second-to-last dimension."""
         t = torch.randn(2, 8, 4)
         for n_val in range(1, 9):
-            int_result    = get_threshold(t, dim=-2, n=n_val)
-            tensor_result = get_threshold(t, dim=-2,
-                                          n=torch.full((2, 4), n_val))
-            assert torch.allclose(int_result, tensor_result), \
+            int_mask    = get_mask(t, dim=-2, n=n_val, capacity_scalar=8)
+            tensor_mask = get_mask(t, dim=-2, n=torch.full((2, 4), n_val), capacity_scalar=8)
+            assert (int_mask == tensor_mask).all(), \
                 f"paths disagree at n={n_val}"

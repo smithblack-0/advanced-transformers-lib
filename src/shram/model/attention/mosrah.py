@@ -40,7 +40,10 @@ class MoSRAHLayer(nn.Module):
     def __init__(self, config: ShramConfig) -> None:
         super().__init__()
         self.num_experts = config.num_mosrah_heads
-        self.packed_length = config.mosrah_packed_length
+        if config.use_cache:
+            self.packed_length = config.mosrah_cache_length
+        else:
+            self.packed_length = config.mosrah_packed_length
 
         self.router = MoSRAHRouter(config)
         self.positions = SparseMoSRAHPositions(config)

@@ -77,86 +77,57 @@ class MoSRAHRouter(nn.Module):
         self.expert_bias = nn.Parameter(torch.zeros(config.num_mosrah_heads))
 
     @staticmethod
-    def get_threshold(
+    def get_mask(
             tensor: torch.Tensor,
             dim: int,
             n: int | torch.Tensor,
+            capacity_scalar: int,
     ) -> torch.Tensor:
+        """Return a boolean mask selecting the top-n entries along dim.
+
+        Uses topk to select exactly min(n_per_slice, dim_length) True entries
+        per slice along dim. Unlike a threshold comparison, this never
+        over-selects under tied logit values, which occurs when padding tokens
+        contribute identical scores to multiple expert slots.
+
+        Args:
+            tensor: Input tensor. Higher values rank first.
+            dim: Dimension to select along.
+            n: Per-slice selection count. Scalar int or tensor broadcastable
+               to tensor with dim removed. Slices where n=0 produce all-False
+               outputs.
+            capacity_scalar: Static upper bound on n; used to derive topk k as
+               min(tensor.shape[dim], capacity_scalar). Must be a Python int
+               for compile compatibility.
+
+        Returns:
+            Boolean mask of the same shape as tensor.
         """
-        Returns the n-th largest value along dim, keepdim=True.
-
-        A value >= threshold ranks within the top n along dim. Boundary cases
-        follow the monotone descending contract:
-
-            n == 0         ->  +inf   nothing qualifies
-            n > dim_length ->  -inf   everything qualifies
-
-        :param tensor: Floating-point input, no NaN.
-        :param dim:    Dimension to reduce along.
-        :param n:      1-indexed rank. Scalar int or tensor of ints broadcastable
-                       to tensor with dim removed.
-        :return:       Threshold with size 1 along dim, same dtype/device.
-        """
-        # -------------------------------------------------------------------------
-        # Algorithm overview
-        # -------------------------------------------------------------------------
-        #
-        # Scalar n does not need a full sorted table. kthvalue selects the n-th
-        # rank directly, and the two boundary sentinels are returned explicitly.
-        #
-        # Tensor n requires a full sorted table because each position along the
-        # complementary dimensions may request a different rank. The table is
-        # built once by sorting descending, then sentinel values are padded at
-        # both ends so that boundary n values resolve correctly via gather:
-        #
-        #     index 0            <- +inf sentinel  (n == 0)
-        #     index 1..dim_length <- sorted values  (valid ranks, 1-indexed)
-        #     index dim_length+1  <- -inf sentinel  (n > dim_length)
-        #
-        # The critical invariant is that n is 1-indexed. This means valid ranks
-        # map directly to their gather index without any offset, and index 0 is
-        # naturally free for the +inf sentinel. n == 0 gathers +inf without
-        # special-casing, and overflow n gathers -inf after clamping.
-        #
-        # F.pad specifies padding from the last dimension inward. Targeting an
-        # arbitrary dim requires a positive index to compute how many trailing
-        # dimensions to skip over in the pad spec.
         positive_dim = dim % tensor.ndim
         dim_length = tensor.shape[positive_dim]
+        k = min(dim_length, capacity_scalar)
 
+        topk_indices = tensor.topk(k, dim=dim).indices
+
+        # Rank tensor broadcast-compatible with topk_indices: rank r along dim
+        # corresponds to the (r+1)-th highest value in that slice.
+        rank_shape = [1] * tensor.ndim
+        rank_shape[positive_dim] = k
+        ranks = torch.arange(k, device=tensor.device, dtype=torch.long).view(rank_shape)
+
+        # element_included: True where this rank falls within the per-slice budget.
+        # For scalar n all k ranks satisfy rank < n (since k = min(dim_length, n)).
+        # For tensor n per-slice budgets differ; rank >= n[slice] yields False,
+        # correctly excluding excess slots including those with n=0.
         if isinstance(n, int):
-            # Scalar rank selection does not need a full sorted table. kthvalue
-            # finds the k-th smallest; negating input and output flips the order
-            # to give the k-th largest. Boundary sentinels follow the descending
-            # contract: +inf sits above every real value (nothing qualifies),
-            # -inf sits below every real value (everything qualifies).
-            if n == 0:
-                shape = list(tensor.shape)
-                shape[positive_dim] = 1
-                return tensor.new_full(shape, float('inf'))
-            if n > dim_length:
-                shape = list(tensor.shape)
-                shape[positive_dim] = 1
-                return tensor.new_full(shape, float('-inf'))
-            return -torch.kthvalue(-tensor, n, dim=dim, keepdim=True).values
-
+            element_included = ranks < n
         else:
-            # Build the rank table once; each position gathers its own threshold.
-            sorted_desc = torch.sort(tensor, dim=dim, descending=True).values
+            element_included = ranks < n.unsqueeze(positive_dim)
 
-            # Each trailing dimension after positive_dim contributes one (left,
-            # right) zero-pair before the target padding entry in the F.pad spec.
-            num_padding_skips = 2 * (tensor.ndim - positive_dim - 1)
-            leading_pad = [0] * num_padding_skips + [1, 0]
-            trailing_pad = [0] * num_padding_skips + [0, 1]
+        mask = torch.zeros_like(tensor, dtype=torch.bool)
+        mask.scatter_(dim, topk_indices, element_included.expand_as(topk_indices))
+        return mask
 
-            sorted_desc = F.pad(sorted_desc, leading_pad, value=float('inf'))
-            sorted_desc = F.pad(sorted_desc, trailing_pad, value=float('-inf'))
-
-            # unsqueeze restores the reduced dimension so gather sees the same
-            # rank as the padded table along dim.
-            gather_index = n.clamp(0, dim_length + 1).long().unsqueeze(dim)
-            return sorted_desc.gather(dim, gather_index)
     @staticmethod
     def _check_bidding_converged(converged: torch.Tensor, max_rounds: int) -> None:
         """Raise if the bidding loop exhausted max_rounds without satisfying all tokens.
@@ -187,12 +158,14 @@ class MoSRAHRouter(nn.Module):
                     f"Increase mosrah_overallocation_factor or max_bid_rounds."
                 )
 
-    @staticmethod
+    @classmethod
     def _run_bidding(
+            cls,
             logits: torch.Tensor,
             remaining_capacity: int | torch.Tensor,
             min_choices: int,
             max_rounds: int,
+            capacity_scalar: int,
     ) -> torch.Tensor:
         """Deferred-acceptance (Gale-Shapley) bidding solver for joint capacity enforcement.
 
@@ -212,6 +185,8 @@ class MoSRAHRouter(nn.Module):
             min_choices: Minimum experts each token must have accepted (K).
             max_rounds: Iteration ceiling; raises via ``_check_bidding_converged``
                 if exhausted.
+            capacity_scalar: Static upper bound on remaining_capacity, passed to
+                ``get_mask`` as the topk k bound for the acceptance step.
 
         Returns:
             accepted: (B, N, L) bool — True at positions accepted by the solver.
@@ -236,18 +211,13 @@ class MoSRAHRouter(nn.Module):
             # Tokens with fewer than min_choices accepted experts propose their
             # next-best unproposed expert(s). The deficit determines how many new
             # proposals each token makes this round; already-satisfied tokens
-            # propose nothing (deficit = 0 → bid_threshold = +inf → no new bids).
+            # propose nothing (deficit = 0 → get_mask returns all-False).
             accepted_per_token = acceptances.sum(dim=-1)           # (B, N)
             choices_deficit = (min_choices - accepted_per_token).clamp_min(0)
 
             unproposed_logits = logits.masked_fill(proposals, float('-inf'))
-            bid_threshold = MoSRAHRouter.get_threshold(
-                unproposed_logits, dim=-1, n=choices_deficit,
-            )
-            new_proposals = (
-                (unproposed_logits >= bid_threshold)
-                & ~proposals
-                & (choices_deficit.unsqueeze(-1) > 0)
+            new_proposals = cls.get_mask(
+                unproposed_logits, dim=-1, n=choices_deficit, capacity_scalar=min_choices,
             )
             updated_proposals = proposals | new_proposals
 
@@ -257,10 +227,9 @@ class MoSRAHRouter(nn.Module):
             # Acceptances are recomputed from scratch each round so that a
             # stronger new proposal can displace a weaker prior one.
             proposed_logits = logits.masked_fill(~updated_proposals, float('-inf'))
-            accept_threshold = MoSRAHRouter.get_threshold(
-                proposed_logits, dim=-2, n=remaining_capacity,
+            updated_acceptances = cls.get_mask(
+                proposed_logits, dim=-2, n=remaining_capacity, capacity_scalar=capacity_scalar,
             )
-            updated_acceptances = updated_proposals & (proposed_logits >= accept_threshold)
 
             return updated_proposals, updated_acceptances, round_count + 1
 
@@ -269,7 +238,7 @@ class MoSRAHRouter(nn.Module):
         )
 
         converged = (acceptances.sum(dim=-1) >= min_choices).all()
-        MoSRAHRouter._check_bidding_converged(converged, max_rounds)
+        cls._check_bidding_converged(converged, max_rounds)
         return acceptances
 
     @classmethod
@@ -353,8 +322,7 @@ class MoSRAHRouter(nn.Module):
         # Mask computation runs under no_grad: the boolean mask is a hard routing
         # decision and must not accumulate gradient memory through the solver.
         with torch.no_grad():
-            col_threshold = cls.get_threshold(logits, dim=-2, n=remaining_capacity)
-            col_capacity_mask = logits >= col_threshold                # (B, N, L)
+            col_capacity_mask = cls.get_mask(logits, dim=-2, n=remaining_capacity, capacity_scalar=capacity)
         if (col_capacity_mask.sum(dim=-1) >= min_choices).all():
             return logits.masked_fill(~col_capacity_mask, mask_value)
 
@@ -362,7 +330,7 @@ class MoSRAHRouter(nn.Module):
         # enough that per-expert capacity limits leave some tokens with fewer
         # than min_choices choices. The bidding solver handles this jointly.
         with torch.no_grad():
-            accepted = cls._run_bidding(logits, remaining_capacity, min_choices, max_rounds)
+            accepted = cls._run_bidding(logits, remaining_capacity, min_choices, max_rounds, capacity)
         return logits.masked_fill(~accepted, mask_value)
     def forward(
         self,
