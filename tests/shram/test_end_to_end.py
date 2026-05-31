@@ -125,6 +125,45 @@ class TestIntegrationTrainable:
 
 
 # ---------------------------------------------------------------------------
+# Integration — Capacity enforcement
+# ---------------------------------------------------------------------------
+
+class TestIntegrationCapacityEnforcement:
+    """Verify balance_capacity prevents overflow under tight capacity budgets.
+
+    Both tests use mosrah_overallocation_factor=1.001 (effectively no headroom)
+    and feed a full training_sequence_length sequence so N > mosrah_packed_length
+    and balance_capacity must do real work to keep routing within budget.
+    """
+
+    def test_dense_routing_stays_within_capacity(self, device):
+        """Dense routing (K/L=0.75) with tight capacity completes without overflow."""
+        config = small_config(
+            num_selected_heads=3,
+            num_mosrah_heads=4,
+            mosrah_overallocation_factor=1.05   ,
+            training_sequence_length=32,
+        )
+        m = ShramForCausalLM(config).train().to(device)
+        ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
+        out = m(ids, labels=ids, use_cache=False)
+        assert out.loss is not None and torch.isfinite(out.loss)
+
+    def test_sparse_routing_stays_within_capacity(self, device):
+        """Sparse routing (K/L=0.25) with tight capacity completes without overflow."""
+        config = small_config(
+            num_selected_heads=1,
+            num_mosrah_heads=4,
+            mosrah_overallocation_factor=1.001,
+            training_sequence_length=32,
+        )
+        m = ShramForCausalLM(config).train().to(device)
+        ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
+        out = m(ids, labels=ids, use_cache=False)
+        assert out.loss is not None and torch.isfinite(out.loss)
+
+
+# ---------------------------------------------------------------------------
 # Integration — Compilable
 # ---------------------------------------------------------------------------
 

@@ -64,6 +64,8 @@ class MoSRAHRouter(nn.Module):
         else:
             self.capacity = config.mosrah_packed_length
 
+        self.max_bid_rounds = config.max_bid_rounds
+
         # W_r: routing projection, no bias (paper specifies xW_r, no additional term).
         self.routing_projection = nn.Linear(
             config.embedding_width, config.num_mosrah_heads, bias=False
@@ -75,63 +77,293 @@ class MoSRAHRouter(nn.Module):
         self.expert_bias = nn.Parameter(torch.zeros(config.num_mosrah_heads))
 
     @staticmethod
-    def balance_capacity(logits: torch.Tensor,
-                         used_capacity: torch.Tensor | None,
-                         capacity: int,
-                         )->torch.Tensor:
+    def get_threshold(
+            tensor: torch.Tensor,
+            dim: int,
+            n: int | torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Balances capacity limits so that if choosing an
-        expert would go over capacity, the expert is simply
-        not chosen instead
-        :param logits: The logits to balance. (B, N, L)
-        :param used_capacity: The used capacity, if it exists. (B, L)
-        :param capacity: The maximum available capacity. Int.
-        :return: Modified logits.
+        Returns the n-th largest value along dim, keepdim=True.
+
+        A value >= threshold ranks within the top n along dim. Boundary cases
+        follow the monotone descending contract:
+
+            n == 0         ->  +inf   nothing qualifies
+            n > dim_length ->  -inf   everything qualifies
+
+        :param tensor: Floating-point input, no NaN.
+        :param dim:    Dimension to reduce along.
+        :param n:      1-indexed rank. Scalar int or tensor of ints broadcastable
+                       to tensor with dim removed.
+        :return:       Threshold with size 1 along dim, same dtype/device.
         """
+        # -------------------------------------------------------------------------
+        # Algorithm overview
+        # -------------------------------------------------------------------------
+        #
+        # Scalar n does not need a full sorted table. kthvalue selects the n-th
+        # rank directly, and the two boundary sentinels are returned explicitly.
+        #
+        # Tensor n requires a full sorted table because each position along the
+        # complementary dimensions may request a different rank. The table is
+        # built once by sorting descending, then sentinel values are padded at
+        # both ends so that boundary n values resolve correctly via gather:
+        #
+        #     index 0            <- +inf sentinel  (n == 0)
+        #     index 1..dim_length <- sorted values  (valid ranks, 1-indexed)
+        #     index dim_length+1  <- -inf sentinel  (n > dim_length)
+        #
+        # The critical invariant is that n is 1-indexed. This means valid ranks
+        # map directly to their gather index without any offset, and index 0 is
+        # naturally free for the +inf sentinel. n == 0 gathers +inf without
+        # special-casing, and overflow n gathers -inf after clamping.
+        #
+        # F.pad specifies padding from the last dimension inward. Targeting an
+        # arbitrary dim requires a positive index to compute how many trailing
+        # dimensions to skip over in the pad spec.
+        positive_dim = dim % tensor.ndim
+        dim_length = tensor.shape[positive_dim]
 
-        if used_capacity is None:
-            # Presume we are in training mode.
+        if isinstance(n, int):
+            # Scalar rank selection does not need a full sorted table. kthvalue
+            # finds the k-th smallest; negating input and output flips the order
+            # to give the k-th largest. Boundary sentinels follow the descending
+            # contract: +inf sits above every real value (nothing qualifies),
+            # -inf sits below every real value (everything qualifies).
+            if n == 0:
+                shape = list(tensor.shape)
+                shape[positive_dim] = 1
+                return tensor.new_full(shape, float('inf'))
+            if n > dim_length:
+                shape = list(tensor.shape)
+                shape[positive_dim] = 1
+                return tensor.new_full(shape, float('-inf'))
+            return -torch.kthvalue(-tensor, n, dim=dim, keepdim=True).values
 
-            # Looking up capacity limits only
-            # matters if it is, in fact, possible
-            # to exceed capacity limits.
-            if logits.shape[-2] < capacity:
-                return logits
-
-            # Look up the kthvalue and use that as
-            # the threshold to mask when below.
-            # Note we negate then negate again to sort
-            # in ascending order.
-            response = torch.kthvalue(-logits, capacity, dim=-2)
-            threshold = -response.values
-            threshold = threshold.unsqueeze(-2) #(B, 1, L)
         else:
-            # We are operating in inference mode.
-            # We have to use padding to accomodate the
-            # response physically not being long enough
-            # to reach capacity
+            # Build the rank table once; each position gathers its own threshold.
+            sorted_desc = torch.sort(tensor, dim=dim, descending=True).values
 
-            # Note that padding at zero and shifting
-            # the indexes prevents dereferencing a symint,
-            # as a version that just patted at 0, 1 and set to
-            # length + 1 would do. This prevents a graph break.
-            remaining_capacity = capacity - used_capacity # 0 means all used, can be at most capacity
-            response_length = logits.shape[-2]
-            index = torch.clamp(remaining_capacity, 0, response_length+1)
+            # Each trailing dimension after positive_dim contributes one (left,
+            # right) zero-pair before the target padding entry in the F.pad spec.
+            num_padding_skips = 2 * (tensor.ndim - positive_dim - 1)
+            leading_pad = [0] * num_padding_skips + [1, 0]
+            trailing_pad = [0] * num_padding_skips + [0, 1]
 
-            # Sort, and add padding. Anything asking for a sequence position
-            # outside the current sequence will get a threshold of -1e8; always include
-            # If we are asking for a value at zero, get 1e8, or full and we include
-            # nothing.
-            ordered_logits = torch.sort(logits, dim=-2, descending=True).values
-            ordered_logits = F.pad(ordered_logits, (0,0, 1, 0), value=1e8)
-            ordered_logits = F.pad(ordered_logits, (0, 0, 0, 1), value=-1e8)
+            sorted_desc = F.pad(sorted_desc, leading_pad, value=float('inf'))
+            sorted_desc = F.pad(sorted_desc, trailing_pad, value=float('-inf'))
 
-            threshold = ordered_logits.gather(-2, index.unsqueeze(-2)) #(B, 1, L)
+            # unsqueeze restores the reduced dimension so gather sees the same
+            # rank as the padded table along dim.
+            gather_index = n.clamp(0, dim_length + 1).long().unsqueeze(dim)
+            return sorted_desc.gather(dim, gather_index)
+    @staticmethod
+    def _check_bidding_converged(converged: torch.Tensor, max_rounds: int) -> None:
+        """Raise if the bidding loop exhausted max_rounds without satisfying all tokens.
 
-        mask = threshold > logits
-        logits = logits.masked_fill(mask, -1e8)
-        return logits
+        In compiled mode ``torch._check`` fires a C++ assertion
+        (``capture_scalar_outputs=True`` is a precondition — see Unit 19.F.1).
+        In eager mode raises ``RuntimeError`` directly.
+
+        Exhausting ``max_rounds`` indicates an extreme routing density case or an
+        infeasible configuration where total capacity is insufficient for N * K
+        demands. In normal training this should never occur; the default
+        ``max_bid_rounds=10`` covers approximately the 98th percentile of routing
+        densities.
+
+        Args:
+            converged: Scalar bool tensor — True if all tokens have >= K accepted experts.
+            max_rounds: The iteration ceiling that was applied, for the error message.
+        """
+        if torch.compiler.is_compiling():
+            torch._check(converged)
+        else:
+            if not converged.item():
+                raise RuntimeError(
+                    f"balance_capacity bidding did not converge within {max_rounds} rounds. "
+                    f"All tokens must have at least K accepted experts before the loop exits. "
+                    f"This indicates either an infeasible configuration (total remaining "
+                    f"capacity < N * K) or an extreme routing density. "
+                    f"Increase mosrah_overallocation_factor or max_bid_rounds."
+                )
+
+    @staticmethod
+    def _run_bidding(
+            logits: torch.Tensor,
+            remaining_capacity: int | torch.Tensor,
+            min_choices: int,
+            max_rounds: int,
+    ) -> torch.Tensor:
+        """Deferred-acceptance (Gale-Shapley) bidding solver for joint capacity enforcement.
+
+        Tokens propose experts in descending preference order; experts provisionally
+        accept their top-``remaining_capacity`` proposed tokens each round. Proposals
+        are monotone (never retracted). The loop continues until every token has at
+        least ``min_choices`` accepted experts or ``max_rounds`` is exhausted.
+
+        Both the column bound (per-expert token count ≤ remaining_capacity) and the
+        row bound (per-token expert count ≥ min_choices) are satisfied simultaneously
+        on the returned mask by construction.
+
+        Args:
+            logits: Routing scores of shape (B, N, L).
+            remaining_capacity: Per-expert token budget. Scalar int for training;
+                (B, L) tensor for inference.
+            min_choices: Minimum experts each token must have accepted (K).
+            max_rounds: Iteration ceiling; raises via ``_check_bidding_converged``
+                if exhausted.
+
+        Returns:
+            accepted: (B, N, L) bool — True at positions accepted by the solver.
+        """
+        # ── initialise loop variables ─────────────────────────────────────────
+        #
+        # All three loop_vars must be tensors of fixed shape across iterations,
+        # as required by torch.while_loop. logits and remaining_capacity are
+        # captured read-only by the closures; they do not travel as loop_vars.
+        proposals  = torch.zeros_like(logits, dtype=torch.bool)
+        acceptances = torch.zeros_like(logits, dtype=torch.bool)
+        round_count = torch.zeros((), device=logits.device, dtype=torch.int64)
+        max_rounds_t = torch.full((), max_rounds, device=logits.device, dtype=torch.int64)
+
+        def cond_fn(proposals, acceptances, round_count):
+            all_satisfied = (acceptances.sum(dim=-1) >= min_choices).all()
+            return (round_count < max_rounds_t) & ~all_satisfied
+
+        def body_fn(proposals, acceptances, round_count):
+            # ── token proposal step ───────────────────────────────────────────
+            #
+            # Tokens with fewer than min_choices accepted experts propose their
+            # next-best unproposed expert(s). The deficit determines how many new
+            # proposals each token makes this round; already-satisfied tokens
+            # propose nothing (deficit = 0 → bid_threshold = +inf → no new bids).
+            accepted_per_token = acceptances.sum(dim=-1)           # (B, N)
+            choices_deficit = (min_choices - accepted_per_token).clamp_min(0)
+
+            unproposed_logits = logits.masked_fill(proposals, float('-inf'))
+            bid_threshold = MoSRAHRouter.get_threshold(
+                unproposed_logits, dim=-1, n=choices_deficit,
+            )
+            new_proposals = (
+                (unproposed_logits >= bid_threshold)
+                & ~proposals
+                & (choices_deficit.unsqueeze(-1) > 0)
+            )
+            updated_proposals = proposals | new_proposals
+
+            # ── expert acceptance step ────────────────────────────────────────
+            #
+            # Each expert accepts its top-remaining_capacity proposed tokens.
+            # Acceptances are recomputed from scratch each round so that a
+            # stronger new proposal can displace a weaker prior one.
+            proposed_logits = logits.masked_fill(~updated_proposals, float('-inf'))
+            accept_threshold = MoSRAHRouter.get_threshold(
+                proposed_logits, dim=-2, n=remaining_capacity,
+            )
+            updated_acceptances = updated_proposals & (proposed_logits >= accept_threshold)
+
+            return updated_proposals, updated_acceptances, round_count + 1
+
+        proposals, acceptances, _ = torch.while_loop(
+            cond_fn, body_fn, (proposals, acceptances, round_count),
+        )
+
+        converged = (acceptances.sum(dim=-1) >= min_choices).all()
+        MoSRAHRouter._check_bidding_converged(converged, max_rounds)
+        return acceptances
+
+    @classmethod
+    def balance_capacity(
+            cls,
+            logits: torch.Tensor,
+            used_capacity: torch.Tensor | None,
+            capacity: int,
+            min_choices: int,
+            max_rounds: int,
+            mask_value: float = -1e8,
+    ) -> torch.Tensor:
+        """Mask logits so both capacity constraints hold simultaneously on the output.
+
+        Two constraints must hold:
+          - Column bound: per-expert unmasked token count ≤ remaining_capacity.
+          - Row bound:    per-token unmasked expert count ≥ min_choices.
+
+        A training fast path and a column-capacity fast path are attempted before
+        falling back to the bidding solver:
+
+        1. Training with N ≤ capacity: return logits unchanged.
+        2. Column-capacity fast path: if the most permissive column-bound-satisfying
+           mask already gives every token at least min_choices choices, return it.
+        3. Bidding fallback: deferred-acceptance solver guaranteeing both bounds.
+
+        Args:
+            logits: Routing scores of shape (B, N, L).
+            used_capacity: Tokens already accumulated per expert, shape (B, L).
+                ``None`` during training (full capacity available).
+            capacity: Maximum tokens per expert (from config).
+            min_choices: Minimum experts each token must retain (K).
+            max_rounds: Bidding iteration ceiling (from config.max_bid_rounds).
+            mask_value: Value written to masked positions. Default -1e8.
+
+        Returns:
+            Logits with unavailable positions set to ``mask_value``, shape (B, N, L).
+        """
+        # ── Algorithm overview ────────────────────────────────────────────────
+        #
+        # Problem: mask (B, N, L) logits so that both the column bound (each
+        # expert receives at most remaining_capacity tokens) and the row bound
+        # (each token retains at least min_choices expert choices) hold
+        # simultaneously. Satisfying either constraint greedily can violate the
+        # other, requiring a joint solver for the hard case.
+        #
+        # Approach: deferred-acceptance (Gale-Shapley) bidding. Each round,
+        # tokens that still lack min_choices accepted experts propose their
+        # next-best unproposed expert. Each expert then provisionally accepts its
+        # top-remaining_capacity proposed tokens, potentially displacing weaker
+        # prior acceptances. Proposals are monotone (never retracted). The loop
+        # terminates when every token has min_choices accepted experts or
+        # max_bid_rounds is exhausted (RuntimeError in the latter case).
+        #
+        # Two cheaper paths precede the solver:
+        #
+        #   Training fast path — when N ≤ capacity and all experts start empty,
+        #   no expert can overflow regardless of routing. No masking is needed.
+        #
+        #   Column-capacity fast path — the most permissive mask satisfying the
+        #   column bound selects each expert's top-remaining_capacity tokens. If
+        #   that mask also satisfies the row bound, both constraints hold and the
+        #   solver is skipped entirely.
+
+        # Training fast path: N ≤ capacity with empty experts → no overflow possible.
+        if used_capacity is None and logits.shape[-2] <= capacity:
+            return logits
+
+        # Compute per-expert remaining budget.
+        # Training (N > capacity path): scalar — all experts start with full capacity.
+        # Inference: subtract already-accumulated tokens; clamp prevents negatives
+        #            when rounding causes used_capacity to slightly exceed capacity.
+        if used_capacity is None:
+            remaining_capacity = capacity
+        else:
+            remaining_capacity = (capacity - used_capacity).clamp(min=0)  # (B, L)
+
+        # Column-capacity fast path: select each expert's top-remaining_capacity
+        # tokens — the most permissive mask satisfying the column bound. If it
+        # also satisfies the row bound, both constraints hold simultaneously.
+        # Mask computation runs under no_grad: the boolean mask is a hard routing
+        # decision and must not accumulate gradient memory through the solver.
+        with torch.no_grad():
+            col_threshold = cls.get_threshold(logits, dim=-2, n=remaining_capacity)
+            col_capacity_mask = logits >= col_threshold                # (B, N, L)
+        if (col_capacity_mask.sum(dim=-1) >= min_choices).all():
+            return logits.masked_fill(~col_capacity_mask, mask_value)
+
+        # Column-capacity mask violates the row bound: routing is concentrated
+        # enough that per-expert capacity limits leave some tokens with fewer
+        # than min_choices choices. The bidding solver handles this jointly.
+        with torch.no_grad():
+            accepted = cls._run_bidding(logits, remaining_capacity, min_choices, max_rounds)
+        return logits.masked_fill(~accepted, mask_value)
     def forward(
         self,
         x: torch.Tensor,
@@ -171,7 +403,13 @@ class MoSRAHRouter(nn.Module):
         # selection. expert_bias is added to logits before softmax so that the bias
         # shifts selection probability without rescaling the unbiased distribution.
         biased_logits = logits + self.expert_bias
-        biased_logits = self.balance_capacity(biased_logits, used_capacity, self.capacity)
+        biased_logits = self.balance_capacity(
+            biased_logits,
+            used_capacity,
+            self.capacity,
+            self.num_selected_heads,
+            self.max_bid_rounds,
+        )
         biased_routing_scores = F.softmax(                     # R̂, (B, N, L)
            biased_logits, dim=-1
         )
