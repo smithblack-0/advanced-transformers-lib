@@ -18,6 +18,9 @@ Invariants verified:
 - all-live active_mask gives routing frequencies equivalent to the pre-masking formula
 """
 
+import math
+
+import pytest
 import torch
 
 from src.shram.model.configuration import ShramConfig
@@ -456,82 +459,68 @@ class TestBalanceCapacity:
     def test_training_passthrough_when_n_below_capacity(self):
         """When N < capacity in training mode, logits are returned unchanged."""
         logits = torch.randn(2, 3, 4)
-        result = MoSRAHRouter.balance_capacity(logits, None, capacity=8)
+        result = MoSRAHRouter.balance_capacity(logits, None, capacity=8, min_choices=1, max_rounds=10)
         assert torch.equal(result, logits)
 
     def test_training_correct_tokens_masked(self):
-        """Top-capacity tokens per head survive; the rest are masked to -1e8.
+        """Both capacity constraints hold when N > capacity.
 
-        Uses known logits so the expected survivors are exact and analytically
-        derivable: for capacity=3 over N=5 tokens, the three highest logits must
-        survive and the two lowest must be masked.
+        N=5, L=2, capacity=3: total capacity (6) exceeds N*min_choices (5), so
+        a valid assignment exists. Verifies column and row bounds both hold.
         """
-        logits = torch.tensor([[[5.0], [3.0], [1.0], [4.0], [2.0]]])  # (1, 5, 1)
-        result = MoSRAHRouter.balance_capacity(logits, None, capacity=3)
-        # threshold = 3rd largest = 3.0; logits < 3.0 (i.e. 1.0 and 2.0) are masked
-        assert result[0, 0, 0] == 5.0   # top-1 survives
-        assert result[0, 1, 0] == 3.0   # top-3 survives (equals threshold, not strictly less)
-        assert result[0, 2, 0] <= -1e7  # 1.0 masked
-        assert result[0, 3, 0] == 4.0   # top-2 survives
-        assert result[0, 4, 0] <= -1e7  # 2.0 masked
+        logits = torch.tensor([[[5.0, 0.4], [3.0, 0.3], [1.0, 0.2], [4.0, 0.1], [2.0, 0.0]]])  # (1, 5, 2)
+        result = MoSRAHRouter.balance_capacity(logits, None, capacity=3, min_choices=1, max_rounds=10)
+        unmasked = result > -1e7
+        assert (unmasked.sum(dim=-2) <= 3).all()   # column bound: at most 3 tokens per expert
+        assert (unmasked.sum(dim=-1) >= 1).all()   # row bound: every token has at least 1 expert
 
     def test_training_surviving_count_equals_capacity(self):
-        """With N > capacity, exactly capacity logits per (batch, head) are unmasked."""
-        B, N, L, capacity = 2, 10, 4, 3
+        """With N > capacity, at most capacity logits per (batch, head) are unmasked,
+        and every token retains at least min_choices experts."""
+        B, N, L, capacity, min_choices = 2, 10, 4, 3, 1
         torch.manual_seed(0)
         logits = torch.randn(B, N, L)
-        result = MoSRAHRouter.balance_capacity(logits, None, capacity=capacity)
-        unmasked_counts = (result > -1e7).sum(dim=-2)   # (B, L)
-        assert (unmasked_counts == capacity).all()
+        result = MoSRAHRouter.balance_capacity(logits, None, capacity=capacity, min_choices=min_choices, max_rounds=10)
+        unmasked = result > -1e7
+        assert (unmasked.sum(dim=-2) <= capacity).all()   # column bound
+        assert (unmasked.sum(dim=-1) >= min_choices).all()  # row bound
 
     def test_training_no_masking_when_n_equals_capacity(self):
         """When N == capacity every token is within the limit — nothing is masked."""
         torch.manual_seed(2)
         logits = torch.randn(2, 4, 3)
-        result = MoSRAHRouter.balance_capacity(logits, None, capacity=4)
+        result = MoSRAHRouter.balance_capacity(logits, None, capacity=4, min_choices=1, max_rounds=10)
         assert torch.equal(result, logits)
 
     def test_inference_full_head_blocks_all_tokens(self):
         """When used_capacity equals capacity, all tokens for that head are masked.
 
-        The gather index falls on the padded 1e8 position, making every finite
-        logit smaller than the threshold.
+        With L=2 and min_choices=1, the token still has the other head available,
+        so the row bound is satisfied while the full head is correctly blocked.
         """
         B, N, L, capacity = 1, 4, 2, 4
         torch.manual_seed(3)
         logits = torch.randn(B, N, L)
         # head 0 fully used, head 1 empty
         used_capacity = torch.tensor([[capacity, 0]])
-        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity)
+        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity, min_choices=1, max_rounds=10)
         assert (result[0, :, 0] <= -1e7).all()
 
     def test_inference_correct_tokens_survive_per_head(self):
-        """The surviving tokens must match the expected per-head capacity threshold.
+        """Both constraints hold for known logits with per-head used_capacity.
 
-        Uses known logits across two heads with different used_capacity values so
-        the expected threshold and survivors are analytically derivable.
+        Uses a (1, 3, 2) case: head 0 has remaining=2, head 1 has remaining=1.
+        Total remaining (3) equals N*min_choices (3) — feasible but tight.
         """
-        # B=1, N=4, L=2, capacity=4
-        # Head 0 logits: [10, 7, 4, 1] — sorted desc: [10, 7, 4, 1]
-        # Head 1 logits: [9, 6, 3, 0]  — sorted desc: [9, 6, 3, 0]
-
-        logits = torch.tensor([[[10.0, 9.0], [7.0, 6.0], [4.0, 3.0], [1.0, 0.0]]])  # (1, 4, 2)
-        # head 0: used=2 → remaining - 2, threshold=top[2-1]=7 → everything less than 7 masked.
-        # head 1: used=3 → remaining = 1, threshold=top[1-1]=9 → everything less than 9 masked.
-
+        # B=1, N=3, L=2, capacity=4
+        # head 0: used=2 → remaining=2; head 1: used=3 → remaining=1
+        logits = torch.tensor([[[10.0, 9.0], [7.0, 6.0], [4.0, 3.0]]])
         used_capacity = torch.tensor([[2, 3]])
-        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=4)
-
-        # Head 0
-        assert result[0, 0, 0] == 10.0
-        assert result[0, 1, 0] == 7.0
-        assert result[0, 2, 0] <= -1e7
-        assert result[0, 3, 0] <= -1e7
-        # Head 1 — all survive
-        assert result[0, 0, 1] == 9.0
-        assert result[0, 1, 1] <= -1e7
-        assert result[0, 2, 1] <= -1e7
-        assert result[0, 3, 1] <= -1e7
+        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=4, min_choices=1, max_rounds=10)
+        unmasked = result > -1e7
+        remaining = (torch.tensor([[4, 4]]) - used_capacity).clamp(min=0)  # [[2, 1]]
+        assert (unmasked.sum(dim=-2) <= remaining).all()   # column bound
+        assert (unmasked.sum(dim=-1) >= 1).all()           # row bound
 
     def test_inference_n_less_than_capacity_empty_head_passes(self):
         """With N < capacity and an empty head, the single token must not be masked.
@@ -542,19 +531,218 @@ class TestBalanceCapacity:
         torch.manual_seed(4)
         logits = torch.randn(B, N, L)
         used_capacity = torch.zeros(B, L, dtype=torch.long)
-        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity)
+        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity, min_choices=1, max_rounds=10)
         assert (result > -1e7).all()
 
     def test_inference_n_less_than_capacity_full_head_blocks(self):
-        """With N < capacity and a full head, the single token must be masked.
+        """With N < capacity and a full head, that head's token must be masked.
 
-        Mirrors test_inference_full_head_blocks_all_tokens but with N < capacity.
+        N=1, L=2, min_choices=1: head 0 is full so its token is masked, but
+        head 1 is empty so the token still has one valid choice — row bound met.
         """
         B, N, L, capacity = 1, 1, 2, 8
         torch.manual_seed(5)
         logits = torch.randn(B, N, L)
         # head 0 full, head 1 empty
         used_capacity = torch.tensor([[capacity, 0]])
-        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity)
+        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity, min_choices=1, max_rounds=10)
         assert (result[0, :, 0] <= -1e7).all()
         assert (result[0, :, 1] > -1e7).all()
+
+    def test_both_constraints_satisfied_training(self):
+        """Both column and row bounds hold simultaneously under a tight capacity budget.
+
+        N=32, L=4, capacity=25, min_choices=3. Total capacity (100) > N*K (96),
+        so a valid assignment exists, but the budget is tight enough to require
+        real enforcement.
+        """
+        B, N, L, capacity, min_choices = 1, 32, 4, 25, 3
+        torch.manual_seed(7)
+        logits = torch.randn(B, N, L)
+        result = MoSRAHRouter.balance_capacity(logits, None, capacity=capacity, min_choices=min_choices, max_rounds=10)
+        unmasked = result > -1e7
+        assert (unmasked.sum(dim=-2) <= capacity).all(), "column bound violated"
+        assert (unmasked.sum(dim=-1) >= min_choices).all(), "row bound violated"
+
+    def test_both_constraints_satisfied_inference(self):
+        """Both bounds hold simultaneously with mixed per-head remaining capacities."""
+        B, N, L, capacity, min_choices = 1, 16, 4, 20, 2
+        torch.manual_seed(8)
+        logits = torch.randn(B, N, L)
+        # Give each head a different used value; remaining = [18, 15, 12, 9]
+        used_capacity = torch.tensor([[2, 5, 8, 11]])
+        remaining = (capacity - used_capacity).clamp(min=0)  # (1, 4)
+        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity, min_choices=min_choices, max_rounds=10)
+        unmasked = result > -1e7
+        assert (unmasked.sum(dim=-2) <= remaining).all(), "column bound violated"
+        assert (unmasked.sum(dim=-1) >= min_choices).all(), "row bound violated"
+
+    def test_non_convergence_raises(self):
+        """Infeasible config (total capacity < N * K) must raise RuntimeError in eager."""
+        # L=4, capacity=2 → total=8; N=8, min_choices=3 → demand=24. Infeasible.
+        B, N, L, capacity, min_choices = 1, 8, 4, 2, 3
+        logits = torch.randn(B, N, L)
+        with pytest.raises(RuntimeError):
+            MoSRAHRouter.balance_capacity(logits, None, capacity=capacity, min_choices=min_choices, max_rounds=10)
+
+
+# ---------------------------------------------------------------------------
+# get_threshold
+# ---------------------------------------------------------------------------
+
+# Alias the static method so tests call the production code directly without
+# being coupled to the class name in every assertion.
+get_threshold = MoSRAHRouter.get_threshold
+
+
+def make_tensor(*shape):
+    """Deterministic tensor for reproducible tests."""
+    return torch.arange(math.prod(shape), dtype=torch.float).reshape(shape)
+
+
+class TestGetThresholdContract:
+    """
+    Tests verify the contract: value >= threshold iff value ranks within top n.
+    Shape, device, and sentinel behaviour are verified separately.
+    """
+
+    def test_int_n_threshold_separates_top_n_dim_last(self):
+        """For every position, exactly n values must be >= threshold per row."""
+        t = torch.randn(3, 8)
+        for n in range(1, 8):
+            threshold = get_threshold(t, dim=-1, n=n)
+            count = (t >= threshold).sum(dim=-1)
+            assert (count == n).all(), \
+                f"n={n}: expected {n} values >= threshold per row, got {count}"
+
+    def test_int_n_threshold_separates_top_n_dim_second_last(self):
+        """For every column, exactly n values must be >= threshold."""
+        t = torch.randn(2, 8, 4)
+        for n in range(1, 8):
+            threshold = get_threshold(t, dim=-2, n=n)
+            count = (t >= threshold).sum(dim=-2)
+            assert (count == n).all(), \
+                f"n={n}: expected {n} values >= threshold per column"
+
+    def test_tensor_n_threshold_separates_top_n(self):
+        """Each row gets its own rank; the contract holds per row."""
+        t = torch.randn(4, 8)
+        n = torch.randint(1, 8, (4,))
+        threshold = get_threshold(t, dim=-1, n=n)
+        for i in range(t.shape[0]):
+            count = (t[i] >= threshold[i, 0]).sum()
+            assert count.item() == n[i].item(), \
+                f"row {i}: expected {n[i]} values >= threshold, got {count}"
+
+    def test_tensor_n_column_dim(self):
+        """Tensor-n contract holds for the second-to-last dimension."""
+        t = torch.randn(2, 8, 4)
+        n = torch.randint(1, 8, (2, 4))
+        threshold = get_threshold(t, dim=-2, n=n)
+        for b in range(2):
+            for j in range(4):
+                count = (t[b, :, j] >= threshold[b, 0, j]).sum()
+                assert count.item() == n[b, j].item()
+
+
+class TestGetThresholdSentinels:
+
+    def test_int_n_zero_returns_inf(self):
+        """n=0 must return +inf so that no value passes the >= threshold check."""
+        t = torch.randn(4, 8)
+        result = get_threshold(t, dim=-1, n=0)
+        assert result.isinf().all()
+        assert (result > 0).all()
+
+    def test_int_n_overflow_returns_neg_inf(self):
+        """n > dim_length must return -inf so that every value passes."""
+        t = torch.randn(4, 8)
+        result = get_threshold(t, dim=-1, n=9)   # dim_length == 8
+        assert result.isinf().all()
+        assert (result < 0).all()
+
+    def test_tensor_n_zero_positions_return_inf(self):
+        """Tensor n=0 per row must return +inf."""
+        t = torch.randn(4, 8)
+        n = torch.zeros(4, dtype=torch.long)
+        result = get_threshold(t, dim=-1, n=n)
+        assert result.isinf().all()
+        assert (result > 0).all()
+
+    def test_tensor_n_overflow_positions_return_neg_inf(self):
+        """Tensor n > dim_length per row must return -inf."""
+        t = torch.randn(4, 8)
+        n = torch.full((4,), 9, dtype=torch.long)   # dim_length == 8
+        result = get_threshold(t, dim=-1, n=n)
+        assert result.isinf().all()
+        assert (result < 0).all()
+
+    def test_tensor_n_mixed_sentinels_and_valid(self):
+        """A mix of n=0, valid n, and n>dim_length must produce the correct sentinels."""
+        t = torch.randn(3, 8)
+        # row 0: n=0 (+inf), row 1: n=4 (valid), row 2: n=9 (-inf)
+        n = torch.tensor([0, 4, 9])
+        result = get_threshold(t, dim=-1, n=n)
+        assert math.isinf(result[0, 0].item()) and result[0, 0] > 0
+        assert not result[1, 0].isinf()
+        assert math.isinf(result[2, 0].item()) and result[2, 0] < 0
+
+
+class TestGetThresholdShape:
+
+    def test_keepdim_int_n_dim_last(self):
+        """Result must have keepdim shape when reducing along the last dimension."""
+        t = torch.randn(2, 5, 8)
+        result = get_threshold(t, dim=-1, n=3)
+        assert tuple(result.shape) == (2, 5, 1)
+
+    def test_keepdim_int_n_dim_second_last(self):
+        """Result must have keepdim shape when reducing along the second-to-last dim."""
+        t = torch.randn(2, 8, 4)
+        result = get_threshold(t, dim=-2, n=3)
+        assert tuple(result.shape) == (2, 1, 4)
+
+    def test_keepdim_tensor_n_dim_last(self):
+        """Tensor-n result must have keepdim shape along the last dimension."""
+        t = torch.randn(2, 5, 8)
+        n = torch.randint(1, 8, (2, 5))
+        result = get_threshold(t, dim=-1, n=n)
+        assert tuple(result.shape) == (2, 5, 1)
+
+    def test_keepdim_tensor_n_dim_second_last(self):
+        """Tensor-n result must have keepdim shape along the second-to-last dim."""
+        t = torch.randn(2, 8, 4)
+        n = torch.randint(1, 8, (2, 4))
+        result = get_threshold(t, dim=-2, n=n)
+        assert tuple(result.shape) == (2, 1, 4)
+
+    def test_dtype_and_device_preserved(self):
+        """Output dtype and device must match the input tensor."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        t = torch.randn(4, 8, device=device, dtype=torch.float32)
+        result = get_threshold(t, dim=-1, n=3)
+        assert result.device.type == device
+        assert result.dtype == torch.float32
+
+
+class TestGetThresholdIntTensorAgreement:
+    """Int and tensor paths must agree on valid n values."""
+
+    def test_paths_agree_dim_last(self):
+        """int n and tensor n must produce identical thresholds for every valid rank."""
+        t = torch.randn(3, 8)
+        for n_val in range(1, 9):
+            int_result    = get_threshold(t, dim=-1, n=n_val)
+            tensor_result = get_threshold(t, dim=-1, n=torch.full((3,), n_val))
+            assert torch.allclose(int_result, tensor_result), \
+                f"paths disagree at n={n_val}"
+
+    def test_paths_agree_dim_second_last(self):
+        """int n and tensor n must agree along the second-to-last dimension."""
+        t = torch.randn(2, 8, 4)
+        for n_val in range(1, 9):
+            int_result    = get_threshold(t, dim=-2, n=n_val)
+            tensor_result = get_threshold(t, dim=-2,
+                                          n=torch.full((2, 4), n_val))
+            assert torch.allclose(int_result, tensor_result), \
+                f"paths disagree at n={n_val}"

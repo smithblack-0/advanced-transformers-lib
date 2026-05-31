@@ -87,7 +87,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 20.B — stage_for_hub.py: inject explicit import block into staged huggingface.py
 - [X] Unit 21 — Capacity issues
 - [X] Unit 21.A — huggingface initialization fix
-- [X] Unit 21.B — training capacity fix.
+- [ ] Unit 21.B — training capacity fix. (Sinkhorn implementation — SUPERSEDED by Unit 21.C due to convergence failure)
+- [X] Unit 21.C — Bidding-based capacity enforcement: SIGNED OFF
 - [ ] Unit 22 — Final audit
 
 ---
@@ -2657,6 +2658,48 @@ While fixing stability is well and good, it does not guarentee permanent trainin
 - For inference, a "used_capacity" tensor of shape (B, L) or (B, 1, L) must be provided from the mosrah cache length.
 - The used capacity inference pattern requires a bit of padding and a while statement to execute properly. When the gathered topk is shorter than the possible capacity, it should be padded with a 1e8 thresold "allow any" value, then any index greater than the length can be redirected into the padding statement with a torch.while statement
 - It would make more sense to distinguish the pathway by passing in the used_capacity tensor, then using kthvalue or topk depending on if it is none or not. But remember, default values are not allowed at this level. 
+
+**Closure note (Unit 21.B):**
+The Sinkhorn alternating-projection implementation was foundationally broken. Convergence was too slow and too unreliable at the routing densities required for this architecture — not a tuning problem, a structural one. This unit is superseded by Unit 21.C.
+
+---
+
+### Unit 21.C — Bidding-based capacity enforcement
+
+**Responsibility**
+
+Replace `balance_capacity` with an implementation that simultaneously satisfies both the per-expert capacity bound and the per-token minimum-choice bound, and certify it as a verified unit. The Sinkhorn implementation in Unit 21.B could not reliably satisfy these constraints together and is superseded by this unit.
+
+**Context of Correctness**
+
+Routing correctness requires two constraints to hold simultaneously: every expert's token count must not exceed its capacity budget (column bound), and every token must retain at least K available expert choices (row bound). These are not independent — satisfying one greedily can violate the other. When a token is left with fewer than K unmasked experts, `topk(K)` fills the remaining slots via tie-breaking on effectively-zero masked entries, producing ghost selections that inflate actual head occupancy above capacity and cause an overflow crash in `pack_experts`.
+
+The Sinkhorn approach (Unit 21.B) alternated row/column projections on a shifted logit space. In theory this should converge; in practice convergence was too slow and too unreliable. A deferred-acceptance (Gale-Shapley) bidding approach was developed in a standalone probe and validated empirically: the probe compiled successfully under `torch.compile(fullgraph=True)`, and 10 rounds covers convergence up to approximately the 98th percentile of routing densities — beyond 10 rounds you are in the top 2% of extreme-density cases not expected under normal training. This unit installs that algorithm to project standards.
+
+**Invariants**
+
+1. For every (batch, expert) pair: the number of non-masked token positions does not exceed `remaining_capacity` for that expert.
+2. For every (batch, token) pair: the number of non-masked expert positions is at least K.
+3. Invariants 1 and 2 hold simultaneously on every output of `balance_capacity`.
+4. When called in training mode (no `used_capacity`) with N ≤ `capacity`, the output is identical to the input — no masking is applied.
+5. When `used_capacity` is provided (inference mode), remaining capacity is computed per-expert as `capacity − used_capacity` clamped to zero; invariants 1 and 2 hold with respect to this per-expert budget.
+6. When no valid joint assignment exists, the method raises `RuntimeError` in eager mode.
+7. `max_bid_rounds` is a `ShramConfig` integer parameter, default 10, validated ≥ 1 at construction time; it is the iteration ceiling before invariant 6 fires.
+
+**Tests**
+
+- Joint constraint, training, tight budget: verify invariants 1 and 2 hold simultaneously when N approaches the column capacity budget.
+- Joint constraint, inference, per-head remaining: provide `used_capacity` with mixed per-expert values; verify both invariants hold against the per-expert remaining budget.
+- Fast-path, N ≤ capacity: verify output equals input unchanged.
+- Non-convergence: infeasible config (total capacity < N * K) raises `RuntimeError` in eager mode.
+- `max_bid_rounds` roundtrips through `to_dict`/`from_dict`.
+- `max_bid_rounds = 0` raises `ValueError` at config construction.
+
+**Preliminary implementation strategy**
+
+The validated algorithm is deferred-acceptance (Gale-Shapley) bidding: tokens propose experts in preference order (proposals are monotone — never retracted); experts accept their top-capacity proposed tokens each round; the loop continues until all tokens have K accepted experts or `max_bid_rounds` is exhausted. Three single-pass fast paths precede the solver: training N ≤ capacity (return unchanged); row-topK precheck (if top-K selections already fit column budgets, mask and return); column-capacity precheck (if top-capacity selection already satisfies row minimum, mask and return). The bidding loop uses `torch.while_loop` for compile compatibility. Convergence checking follows the 19.F.1 pattern: `torch._check` in compiled mode, direct `RuntimeError` in eager. `max_bid_rounds = 10` covers convergence at approximately the 98th percentile of routing densities; beyond 10 rounds you are in the top 2% of extreme-density cases not expected under normal training. This should be documented as such. If the inference path's `remaining_capacity` as a (B, L) tensor is incompatible with the while_loop structure, surface and stop rather than adapting silently.
+
+---
 
 ### Unit 22 — Final Audit
 

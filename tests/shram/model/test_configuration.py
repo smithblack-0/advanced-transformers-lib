@@ -315,6 +315,7 @@ class TestSerialisation:
         assert restored.output_hidden_states == original.output_hidden_states
         assert restored.tie_word_embeddings == original.tie_word_embeddings
         assert restored.mosrah_overallocation_factor == original.mosrah_overallocation_factor
+        assert restored.max_bid_rounds == original.max_bid_rounds
 
 
 # ---------------------------------------------------------------------------
@@ -362,3 +363,34 @@ class TestMosrahPackedLength:
         config = small_config(mosrah_overallocation_factor=1.25)
         restored = ShramConfig.from_dict(config.to_dict())
         assert restored.mosrah_overallocation_factor == 1.25
+
+
+# ---------------------------------------------------------------------------
+# max_bid_rounds
+# ---------------------------------------------------------------------------
+
+class TestMaxBidRounds:
+    def test_default_is_ten(self):
+        """max_bid_rounds must default to 10."""
+        config = ShramConfig()
+        assert config.max_bid_rounds == 10
+
+    def test_stored(self):
+        config = small_config(max_bid_rounds=20)
+        assert config.max_bid_rounds == 20
+
+    def test_zero_raises(self):
+        """max_bid_rounds=0 must raise — at least one round is required."""
+        with pytest.raises(ValueError, match="max_bid_rounds"):
+            small_config(max_bid_rounds=0)
+
+    def test_one_is_valid(self):
+        """max_bid_rounds=1 is the minimum valid value."""
+        config = small_config(max_bid_rounds=1)
+        assert config.max_bid_rounds == 1
+
+    def test_roundtrip(self):
+        """max_bid_rounds must survive to_dict/from_dict roundtrip."""
+        config = small_config(max_bid_rounds=25)
+        restored = ShramConfig.from_dict(config.to_dict())
+        assert restored.max_bid_rounds == 25

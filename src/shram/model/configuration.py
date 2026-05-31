@@ -88,6 +88,12 @@ class ShramConfig(PretrainedConfig):
             frequencies into the load balance signal. Higher p weights aggregation
             toward the worst-case batch item, making the correction signal more
             sensitive to per-item allocation spikes. Must be positive. Default 2.0.
+        max_bid_rounds: Maximum bidding rounds for the deferred-acceptance capacity
+            solver in ``balance_capacity``. 10 covers convergence at approximately
+            the 98th percentile of routing densities; the top 2% of extreme-density
+            cases are not expected under normal training. The bound exists as a
+            correctness guard — exhausting it raises ``RuntimeError``. Must be >= 1.
+            Default 10.
     """
 
     model_type = "shram"
@@ -122,6 +128,7 @@ class ShramConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         mosrah_overallocation_factor: float = 2.0,
         load_balance_p: float = 2.0,
+        max_bid_rounds: int = 10,
         **kwargs
     ):
         if head_dim % 2 != 0:
@@ -162,6 +169,11 @@ class ShramConfig(PretrainedConfig):
                 f"load_balance_p must be positive, got {load_balance_p}."
             )
 
+        if max_bid_rounds < 1:
+            raise ValueError(
+                f"max_bid_rounds must be at least 1, got {max_bid_rounds}."
+            )
+
         self.vocab_size = vocab_size
         self.embedding_width = embedding_width
         self.mlp_width = mlp_width
@@ -181,6 +193,7 @@ class ShramConfig(PretrainedConfig):
         self.beta = beta
         self.mosrah_overallocation_factor = mosrah_overallocation_factor
         self.load_balance_p = load_balance_p
+        self.max_bid_rounds = max_bid_rounds
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
 
