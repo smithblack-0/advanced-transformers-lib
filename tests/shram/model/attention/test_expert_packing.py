@@ -788,7 +788,116 @@ class TestOverflowDetection:
                 compiled_pack(entries, setup, selected_heads, num_experts, packed_length=2)
         finally:
             torch._dynamo.config.capture_scalar_outputs = original
+    def test_exact_capacity_succeeds_in_eager_mode(self):
+        """pack_experts must allow an expert bucket containing exactly packed_length entries.
 
+        Capacity is a count of available packed slots, not a maximum valid index.
+        A bucket with exactly C routed token copies occupies slots 0..C-1 and is
+        therefore valid.
+        """
+
+        packed_length = 5
+        num_experts = 2
+
+        hidden_states = torch.arange(
+            packed_length * 2,
+            dtype=torch.float32,
+        ).view(1, packed_length, 2)
+
+        position_ids = torch.arange(
+            packed_length,
+            dtype=torch.long,
+        ).view(1, packed_length)
+
+        selected_heads = torch.zeros(
+            1,
+            packed_length,
+            1,
+            dtype=torch.long,
+        )
+
+        outer_active_mask = torch.ones(
+            1,
+            packed_length,
+            dtype=torch.bool,
+        )
+
+        setup = setup_packing(selected_heads)
+        entries = {
+            "hidden_states": (hidden_states, 0.0),
+            "position_ids": (position_ids, 0),
+            "active_mask": (outer_active_mask, False),
+        }
+
+        packed, unpacking_mask = pack_experts(
+            entries,
+            setup,
+            selected_heads,
+            num_experts,
+            packed_length,
+        )
+
+        expected_expert_zero_mask = torch.ones(packed_length, dtype=torch.bool)
+        expected_expert_one_mask = torch.zeros(packed_length, dtype=torch.bool)
+
+        torch.testing.assert_close(
+            unpacking_mask[0, 0],
+            expected_expert_zero_mask,
+        )
+        torch.testing.assert_close(
+            unpacking_mask[0, 1],
+            expected_expert_one_mask,
+        )
+        torch.testing.assert_close(
+            packed["hidden_states"][0, 0],
+            hidden_states[0],
+        )
+
+    def test_one_over_capacity_raises_in_eager_mode(self):
+        """pack_experts must reject an expert bucket containing packed_length + 1 entries."""
+
+        packed_length = 5
+        num_tokens = packed_length + 1
+        num_experts = 2
+
+        hidden_states = torch.arange(
+            num_tokens * 2,
+            dtype=torch.float32,
+        ).view(1, num_tokens, 2)
+
+        position_ids = torch.arange(
+            num_tokens,
+            dtype=torch.long,
+        ).view(1, num_tokens)
+
+        selected_heads = torch.zeros(
+            1,
+            num_tokens,
+            1,
+            dtype=torch.long,
+        )
+
+        outer_active_mask = torch.ones(
+            1,
+            num_tokens,
+            dtype=torch.bool,
+        )
+
+        setup = setup_packing(selected_heads)
+        entries = {
+            "hidden_states": (hidden_states, 0.0),
+            "position_ids": (position_ids, 0),
+            "active_mask": (outer_active_mask, False),
+        }
+
+        with pytest.raises(RuntimeError, match="mosrah_overallocation_factor"):
+            pack_experts(
+                entries,
+                setup,
+                selected_heads,
+                num_experts,
+                packed_length,
+            )
 
 # ---------------------------------------------------------------------------
 # Compiled packing

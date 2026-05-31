@@ -55,7 +55,7 @@ class DecoderLayer(nn.Module):
         self.mlp_norm = nn.RMSNorm(config.embedding_width, eps=config.rms_norm_eps)
         self.attention = SHRAMHybridLayer(config)
         self.mlp = SwiGLUMLP(config)
-        self.residual_gate = nn.Parameter(torch.zeros([config.embedding_width]))
+        self.residual_gate = nn.Parameter(1e-6*torch.randn([config.embedding_width]))
     def num_mosrah_parameters(self) -> int:
         """Return the total number of trainable MoSRAH parameters in this decoder layer."""
         return self.attention.num_mosrah_parameters()
