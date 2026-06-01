@@ -228,11 +228,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
 
     @staticmethod
     def create_masks_for_generate(
-        config: Any,
-        inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None,
-        position_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | None:
         """Return the 2D attention_mask unchanged.
