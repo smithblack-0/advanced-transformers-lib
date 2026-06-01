@@ -129,34 +129,25 @@ class MoSRAHRouter(nn.Module):
         return mask
 
     @staticmethod
-    def _check_bidding_converged(converged: torch.Tensor, max_rounds: int) -> None:
+    def _check_bidding_converged(acceptances: torch.Tensor,
+                                 min_choices: int,
+                                 max_rounds: int) -> None:
         """Raise if the bidding loop exhausted max_rounds without satisfying all tokens.
 
-        In compiled mode ``torch._check`` fires a C++ assertion
-        (``capture_scalar_outputs=True`` is a precondition — see Unit 19.F.1).
-        In eager mode raises ``RuntimeError`` directly.
-
-        Exhausting ``max_rounds`` indicates an extreme routing density case or an
-        infeasible configuration where total capacity is insufficient for N * K
-        demands. In normal training this should never occur; the default
-        ``max_bid_rounds=10`` covers approximately the 98th percentile of routing
-        densities.
-
         Args:
-            converged: Scalar bool tensor — True if all tokens have >= K accepted experts.
-            max_rounds: The iteration ceiling that was applied, for the error message.
+            acceptances: bool tensor of shape (B, N, L) indicating what experts L accepted
+                what tokens.
+            min_choices: Convergence has been reached if acceptances are such that a sum along
+                N always has at least min_choices choices.
+            max_rounds: The iteration ceiling that was applied, for the error message. Used
+                for reporting
         """
-        if torch.compiler.is_compiling():
-            torch._check(converged)
-        else:
-            if not converged.item():
-                raise RuntimeError(
-                    f"balance_capacity bidding did not converge within {max_rounds} rounds. "
-                    f"All tokens must have at least K accepted experts before the loop exits. "
-                    f"This indicates either an infeasible configuration (total remaining "
-                    f"capacity < N * K) or an extreme routing density. "
-                    f"Increase mosrah_overallocation_factor or max_bid_rounds."
-                )
+        msg = (
+            f"balance_capacity bidding did not converge within {max_rounds} rounds. "
+            f"Increase mosrah_overallocation_factor or max_bid_rounds."
+        )
+        converged = (acceptances.sum(dim=-1) >= min_choices).all()
+        torch._assert_async(converged, msg)
 
     @classmethod
     def _run_bidding(
@@ -236,9 +227,6 @@ class MoSRAHRouter(nn.Module):
         proposals, acceptances, _ = torch.while_loop(
             cond_fn, body_fn, (proposals, acceptances, round_count),
         )
-
-        converged = (acceptances.sum(dim=-1) >= min_choices).all()
-        cls._check_bidding_converged(converged, max_rounds)
         return acceptances
 
     @classmethod
@@ -321,17 +309,27 @@ class MoSRAHRouter(nn.Module):
         # also satisfies the row bound, both constraints hold simultaneously.
         # Mask computation runs under no_grad: the boolean mask is a hard routing
         # decision and must not accumulate gradient memory through the solver.
-        with torch.no_grad():
-            col_capacity_mask = cls.get_mask(logits, dim=-2, n=remaining_capacity, capacity_scalar=capacity)
-        if (col_capacity_mask.sum(dim=-1) >= min_choices).all():
-            return logits.masked_fill(~col_capacity_mask, mask_value)
+        def skip(mask: torch.Tensor, logits: torch.Tensor)->torch.Tensor:
+            """Skip bidding on the mask"""
+            return mask.clone()
 
-        # Column-capacity mask violates the row bound: routing is concentrated
-        # enough that per-expert capacity limits leave some tokens with fewer
-        # than min_choices choices. The bidding solver handles this jointly.
+        def resolve_mask(mask: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+            """Execute full bidding process"""
+            return cls._run_bidding(logits,
+                                    remaining_capacity,
+                                    min_choices,
+                                    max_rounds,
+                                    capacity)
+
         with torch.no_grad():
-            accepted = cls._run_bidding(logits, remaining_capacity, min_choices, max_rounds, capacity)
-        return logits.masked_fill(~accepted, mask_value)
+            col_capacity_mask = cls.get_mask(logits,
+                                             dim=-2,
+                                             n=remaining_capacity,
+                                             capacity_scalar=capacity)
+            mask_sufficient = (col_capacity_mask.sum(dim=-1) >= min_choices).all()
+            final_mask = torch.cond(mask_sufficient, skip, resolve_mask, [col_capacity_mask, logits])
+            cls._check_bidding_converged(final_mask, min_choices, max_rounds)
+        return logits.masked_fill(~final_mask, mask_value)
     def forward(
         self,
         x: torch.Tensor,

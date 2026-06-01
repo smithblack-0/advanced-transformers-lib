@@ -582,7 +582,7 @@ class TestBalanceCapacity:
         # L=4, capacity=2 → total=8; N=8, min_choices=3 → demand=24. Infeasible.
         B, N, L, capacity, min_choices = 1, 8, 4, 2, 3
         logits = torch.randn(B, N, L)
-        with pytest.raises(RuntimeError):
+        with pytest.raises([RuntimeError, AssertionError]):
             MoSRAHRouter.balance_capacity(logits, None, capacity=capacity, min_choices=min_choices, max_rounds=10)
 
 
@@ -784,6 +784,219 @@ class TestRouterRealizedCapacityFuzz:
         """Final selected_heads must obey capacity at 90% packed-capacity use."""
 
         self._run_realized_capacity_fuzz(device, capacity_use=0.90)
+
+
+class TestRouterCompileEquivalenceFuzz:
+    """Fuzz tests for eager-vs-compiled MoSRAHRouter equivalence.
+
+    This suite certifies that compiling the router does not change its forward
+    contract. It intentionally compares the full router outputs, not just the
+    realized capacity counts, because the compile boundary should preserve
+    selection, probabilities, load-balance loss, and monitoring output for the
+    same module state and input tensors.
+
+    The tests are CUDA-only because this project already treats uncached
+    torch.compile coverage as CUDA-only.
+    """
+
+    NUM_TRIALS = 25
+    BATCH_SIZE = 4
+    TRAINING_SEQUENCE_LENGTH = 256
+    MAX_BID_ROUNDS = 64
+
+    SPARSITY_PROFILES = (
+        (16, 16),
+        (32, 16),
+        (64, 16),
+    )
+
+    @staticmethod
+    def _make_config(
+        num_mosrah_heads: int,
+        num_selected_heads: int,
+    ) -> ShramConfig:
+        """Build the router config for one sparsity profile."""
+
+        return small_config(
+            embedding_width=64,
+            num_mosrah_heads=num_mosrah_heads,
+            num_selected_heads=num_selected_heads,
+            num_sliding_window_heads=4,
+            head_dim=16,
+            training_sequence_length=(
+                TestRouterCompileEquivalenceFuzz.TRAINING_SEQUENCE_LENGTH
+            ),
+            inference_sequence_length=(
+                TestRouterCompileEquivalenceFuzz.TRAINING_SEQUENCE_LENGTH
+            ),
+            mosrah_overallocation_factor=1.25,
+            max_bid_rounds=TestRouterCompileEquivalenceFuzz.MAX_BID_ROUNDS,
+            use_cache=False,
+        )
+
+    @staticmethod
+    def _runtime_length_for_capacity_use(
+        capacity_use: float,
+        capacity: int,
+        num_mosrah_heads: int,
+        num_selected_heads: int,
+    ) -> int:
+        """Return runtime token count for the requested capacity-use ratio."""
+
+        return int(
+            capacity_use
+            * capacity
+            * num_mosrah_heads
+            / num_selected_heads
+        )
+
+    def _run_compile_equivalence_fuzz(
+        self,
+        device: torch.device,
+        capacity_use: float,
+    ) -> None:
+        """Compare eager and compiled router outputs at one capacity pressure."""
+
+        if device.type != "cuda":
+            pytest.skip(
+                "Router torch.compile equivalence is CUDA-only for this suite."
+            )
+
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.reset()
+
+        generator = torch.Generator(device=device)
+        generator.manual_seed(24103)
+
+        for num_mosrah_heads, num_selected_heads in self.SPARSITY_PROFILES:
+            config = self._make_config(num_mosrah_heads, num_selected_heads)
+
+            router = MoSRAHRouter(config).eval().to(device)
+            compiled_router = torch.compile(
+                router,
+                fullgraph=True,
+                dynamic=False,
+            )
+
+            capacity = config.mosrah_packed_length
+            runtime_length = self._runtime_length_for_capacity_use(
+                capacity_use,
+                capacity,
+                num_mosrah_heads,
+                num_selected_heads,
+            )
+
+            assert runtime_length > 0
+
+            actual_capacity_use = (
+                runtime_length
+                * num_selected_heads
+                / (capacity * num_mosrah_heads)
+            )
+
+            for trial in range(self.NUM_TRIALS):
+                x = torch.randn(
+                    self.BATCH_SIZE,
+                    runtime_length,
+                    config.embedding_width,
+                    generator=generator,
+                    device=device,
+                )
+                active_mask = torch.ones(
+                    self.BATCH_SIZE,
+                    runtime_length,
+                    dtype=torch.bool,
+                    device=device,
+                )
+
+                with torch.no_grad():
+                    eager_selected, eager_probs, eager_loss, eager_vio = router(
+                        x,
+                        active_mask,
+                        used_capacity=None,
+                    )
+
+                    compiled_selected, compiled_probs, compiled_loss, compiled_vio = (
+                        compiled_router(
+                            x,
+                            active_mask,
+                            None,
+                        )
+                    )
+
+                assert torch.equal(eager_selected, compiled_selected), (
+                    "compiled router selected different heads: "
+                    f"capacity_use={capacity_use}, "
+                    f"actual_capacity_use={actual_capacity_use}, "
+                    f"trial={trial}, "
+                    f"B={self.BATCH_SIZE}, "
+                    f"N={runtime_length}, "
+                    f"L={num_mosrah_heads}, "
+                    f"K={num_selected_heads}, "
+                    f"C={capacity}"
+                )
+
+                torch.testing.assert_close(
+                    compiled_probs,
+                    eager_probs,
+                    rtol=1e-5,
+                    atol=1e-6,
+                    msg=(
+                        "compiled router produced different routing_probs: "
+                        f"capacity_use={capacity_use}, "
+                        f"actual_capacity_use={actual_capacity_use}, "
+                        f"trial={trial}, "
+                        f"L={num_mosrah_heads}, "
+                        f"K={num_selected_heads}"
+                    ),
+                )
+
+                torch.testing.assert_close(
+                    compiled_loss,
+                    eager_loss,
+                    rtol=1e-5,
+                    atol=1e-6,
+                    msg=(
+                        "compiled router produced different load_balance_loss: "
+                        f"capacity_use={capacity_use}, "
+                        f"actual_capacity_use={actual_capacity_use}, "
+                        f"trial={trial}, "
+                        f"L={num_mosrah_heads}, "
+                        f"K={num_selected_heads}"
+                    ),
+                )
+
+                torch.testing.assert_close(
+                    compiled_vio,
+                    eager_vio,
+                    rtol=1e-5,
+                    atol=1e-6,
+                    msg=(
+                        "compiled router produced different max_vio: "
+                        f"capacity_use={capacity_use}, "
+                        f"actual_capacity_use={actual_capacity_use}, "
+                        f"trial={trial}, "
+                        f"L={num_mosrah_heads}, "
+                        f"K={num_selected_heads}"
+                    ),
+                )
+
+        torch._dynamo.reset()
+
+    def test_compile_equivalence_fuzz_50_percent(self, device):
+        """Compiled and eager router forward must match at 50% capacity use."""
+
+        self._run_compile_equivalence_fuzz(device, capacity_use=0.50)
+
+    def test_compile_equivalence_fuzz_80_percent(self, device):
+        """Compiled and eager router forward must match at 80% capacity use."""
+
+        self._run_compile_equivalence_fuzz(device, capacity_use=0.80)
+
+    def test_compile_equivalence_fuzz_90_percent(self, device):
+        """Compiled and eager router forward must match at 90% capacity use."""
+
+        self._run_compile_equivalence_fuzz(device, capacity_use=0.90)
 
 # ---------------------------------------------------------------------------
 # get_mask
