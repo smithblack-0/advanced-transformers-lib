@@ -257,13 +257,10 @@ class MoSRAHRouter(nn.Module):
           - Column bound: per-expert unmasked token count ≤ remaining_capacity.
           - Row bound:    per-token unmasked expert count ≥ min_choices.
 
-        A training fast path and a column-capacity fast path are attempted before
-        falling back to the bidding solver:
+        A training fast path is attempted before the bidding solver:
 
         1. Training with N ≤ capacity: return logits unchanged.
-        2. Column-capacity fast path: if the most permissive column-bound-satisfying
-           mask already gives every token at least min_choices choices, return it.
-        3. Bidding fallback: deferred-acceptance solver guaranteeing both bounds.
+        2. Bidding: deferred-acceptance solver guaranteeing both bounds simultaneously.
 
         Args:
             logits: Routing scores of shape (B, N, L).
@@ -293,15 +290,8 @@ class MoSRAHRouter(nn.Module):
         # terminates when every token has min_choices accepted experts or
         # max_bid_rounds is exhausted (RuntimeError in the latter case).
         #
-        # Two cheaper paths precede the solver:
-        #
-        #   Training fast path — when N ≤ capacity and all experts start empty,
-        #   no expert can overflow regardless of routing. No masking is needed.
-        #
-        #   Column-capacity fast path — the most permissive mask satisfying the
-        #   column bound selects each expert's top-remaining_capacity tokens. If
-        #   that mask also satisfies the row bound, both constraints hold and the
-        #   solver is skipped entirely.
+        # Training fast path — when N ≤ capacity and all experts start empty,
+        # no expert can overflow regardless of routing. No masking is needed.
 
         # Training fast path: N ≤ capacity with empty experts → no overflow possible.
         if used_capacity is None and logits.shape[-2] <= capacity:
@@ -316,34 +306,14 @@ class MoSRAHRouter(nn.Module):
         else:
             remaining_capacity = (capacity - used_capacity).clamp(min=0)  # (B, L)
 
-        # Column-capacity fast path: select each expert's top-remaining_capacity
-        # tokens — the most permissive mask satisfying the column bound. If it
-        # also satisfies the row bound, both constraints hold simultaneously.
-        # Mask computation runs under no_grad: the boolean mask is a hard routing
-        # decision and must not accumulate gradient memory through the solver.
-        def skip(mask: torch.Tensor, logits: torch.Tensor)->torch.Tensor:
-            """Skip bidding on the mask"""
-            return mask.clone()
-
-        def resolve_mask(mask: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-            """Execute full bidding process"""
-            outcome = cls._run_bidding(logits,
-                                    remaining_capacity,
-                                    min_choices,
-                                    max_rounds,
-                                    capacity)
-            assert mask.shape == outcome.shape
-            return outcome
-
+        # Bidding solver: jointly satisfies column and row bounds. Runs under
+        # no_grad because the boolean mask is a hard routing decision and must
+        # not accumulate gradient memory.
         with torch.no_grad():
-            col_capacity_mask = cls.get_mask(logits,
-                                             dim=-2,
-                                             n=remaining_capacity,
-                                             capacity_scalar=capacity)
-            mask_sufficient = (col_capacity_mask.sum(dim=-1) >= min_choices).all()
-            final_mask = torch.cond(mask_sufficient, skip, resolve_mask, [col_capacity_mask, logits])
+            final_mask = cls._run_bidding(logits, remaining_capacity, min_choices, max_rounds, capacity)
             cls._check_bidding_converged(final_mask, min_choices, max_rounds)
         return logits.masked_fill(~final_mask, mask_value)
+
     def forward(
         self,
         x: torch.Tensor,
