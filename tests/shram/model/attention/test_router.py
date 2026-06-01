@@ -582,7 +582,7 @@ class TestBalanceCapacity:
         # L=4, capacity=2 → total=8; N=8, min_choices=3 → demand=24. Infeasible.
         B, N, L, capacity, min_choices = 1, 8, 4, 2, 3
         logits = torch.randn(B, N, L)
-        with pytest.raises([RuntimeError, AssertionError]):
+        with pytest.raises((RuntimeError, AssertionError)):
             MoSRAHRouter.balance_capacity(logits, None, capacity=capacity, min_choices=min_choices, max_rounds=10)
 
 
