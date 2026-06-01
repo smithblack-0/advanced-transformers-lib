@@ -87,7 +87,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 20.B — stage_for_hub.py: inject explicit import block into staged huggingface.py
 - [X] Unit 21 — Capacity issues
 - [X] Unit 21.A — huggingface initialization fix
-- [ ] Unit 21.B — training capacity fix. (Sinkhorn implementation — SUPERSEDED by Unit 21.C due to convergence failure)
+- [X] Unit 21.B — training capacity fix. (Sinkhorn implementation — SUPERSEDED by Unit 21.C due to convergence failure)
 - [X] Unit 21.C — Bidding-based capacity enforcement: SIGNED OFF
 - [ ] Unit 22 — Final audit
 

@@ -124,8 +124,20 @@ class MoSRAHRouter(nn.Module):
         else:
             element_included = ranks < n.unsqueeze(positive_dim)
 
-        mask = torch.zeros_like(tensor, dtype=torch.bool)
-        mask.scatter_(dim, topk_indices, element_included.expand_as(topk_indices))
+        # Allocate from explicit logical shape rather than using zeros_like. This keeps
+        # the output mask tied to tensor.shape, not to any stride/layout metadata carried
+        # by tensor from earlier view operations or compiler lowering.
+        mask = torch.zeros(
+            tuple(tensor.shape),
+            device=tensor.device,
+            dtype=torch.bool,
+        )
+
+        # Materialize the scatter source shape explicitly. This avoids passing a
+        # broadcast-view source into scatter while preserving the same logical rule:
+        # every selected top-k index receives True iff its rank is within budget.
+        scatter_values = torch.broadcast_to(element_included, topk_indices.shape)
+        mask = mask.scatter(dim, topk_indices, scatter_values)
         return mask
 
     @staticmethod
@@ -315,11 +327,13 @@ class MoSRAHRouter(nn.Module):
 
         def resolve_mask(mask: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
             """Execute full bidding process"""
-            return cls._run_bidding(logits,
+            outcome = cls._run_bidding(logits,
                                     remaining_capacity,
                                     min_choices,
                                     max_rounds,
                                     capacity)
+            assert mask.shape == outcome.shape
+            return outcome
 
         with torch.no_grad():
             col_capacity_mask = cls.get_mask(logits,
