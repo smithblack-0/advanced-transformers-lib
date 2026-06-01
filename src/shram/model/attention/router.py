@@ -174,8 +174,9 @@ class MoSRAHRouter(nn.Module):
 
         Tokens propose experts in descending preference order; experts provisionally
         accept their top-``remaining_capacity`` proposed tokens each round. Proposals
-        are monotone (never retracted). The loop continues until every token has at
-        least ``min_choices`` accepted experts or ``max_rounds`` is exhausted.
+        are monotone (never retracted). Runs for exactly ``max_rounds`` iterations;
+        each round is skipped via ``torch.cond`` once all tokens are satisfied, so
+        subsequent iterations are no-ops without data-dependent Python control flow.
 
         Both the column bound (per-expert token count ≤ remaining_capacity) and the
         row bound (per-token expert count ≥ min_choices) are satisfied simultaneously
@@ -186,35 +187,26 @@ class MoSRAHRouter(nn.Module):
             remaining_capacity: Per-expert token budget. Scalar int for training;
                 (B, L) tensor for inference.
             min_choices: Minimum experts each token must have accepted (K).
-            max_rounds: Iteration ceiling; raises via ``_check_bidding_converged``
-                if exhausted.
+            max_rounds: Number of iterations to run. Convergence is checked after
+                all rounds via ``_check_bidding_converged``; raises if not met.
             capacity_scalar: Static upper bound on remaining_capacity, passed to
                 ``get_mask`` as the topk k bound for the acceptance step.
 
         Returns:
             accepted: (B, N, L) bool — True at positions accepted by the solver.
         """
-        # ── initialise loop variables ─────────────────────────────────────────
-        #
-        # All three loop_vars must be tensors of fixed shape across iterations,
-        # as required by torch.while_loop. logits and remaining_capacity are
-        # captured read-only by the closures; they do not travel as loop_vars.
-        proposals  = torch.zeros_like(logits, dtype=torch.bool)
+        proposals   = torch.zeros_like(logits, dtype=torch.bool)
         acceptances = torch.zeros_like(logits, dtype=torch.bool)
-        round_count = torch.zeros((), device=logits.device, dtype=torch.int64)
-        max_rounds_t = torch.full((), max_rounds, device=logits.device, dtype=torch.int64)
 
-        def cond_fn(proposals, acceptances, round_count):
-            all_satisfied = (acceptances.sum(dim=-1) >= min_choices).all()
-            return (round_count < max_rounds_t) & ~all_satisfied
-
-        def body_fn(proposals, acceptances, round_count):
+        # Branch functions defined once so Dynamo sees stable function objects
+        # across all loop iterations. logits, remaining_capacity, min_choices, and
+        # capacity_scalar are captured read-only from the enclosing scope.
+        def body_fn(proposals: torch.Tensor, acceptances: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             # ── token proposal step ───────────────────────────────────────────
             #
             # Tokens with fewer than min_choices accepted experts propose their
             # next-best unproposed expert(s). The deficit determines how many new
-            # proposals each token makes this round; already-satisfied tokens
-            # propose nothing (deficit = 0 → get_mask returns all-False).
+            # proposals each token makes; satisfied tokens propose nothing.
             accepted_per_token = acceptances.sum(dim=-1)           # (B, N)
             choices_deficit = (min_choices - accepted_per_token).clamp_min(0)
 
@@ -233,12 +225,18 @@ class MoSRAHRouter(nn.Module):
             updated_acceptances = cls.get_mask(
                 proposed_logits, dim=-2, n=remaining_capacity, capacity_scalar=capacity_scalar,
             )
+            return updated_proposals, updated_acceptances
 
-            return updated_proposals, updated_acceptances, round_count + 1
+        def skip_fn(proposals: torch.Tensor, acceptances: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # Already converged — return clones so torch.cond aliasing rule is satisfied.
+            return proposals.clone(), acceptances.clone()
 
-        proposals, acceptances, _ = torch.while_loop(
-            cond_fn, body_fn, (proposals, acceptances, round_count),
-        )
+        for _ in range(max_rounds):
+            # Skip this round if every token already has min_choices accepted experts.
+            # torch.cond avoids data-dependent Python branches in compiled graphs.
+            not_done = ~(acceptances.sum(dim=-1) >= min_choices).all()
+            proposals, acceptances = torch.cond(not_done, body_fn, skip_fn, [proposals, acceptances])
+
         return acceptances
 
     @classmethod
@@ -310,7 +308,8 @@ class MoSRAHRouter(nn.Module):
         # no_grad because the boolean mask is a hard routing decision and must
         # not accumulate gradient memory.
         with torch.no_grad():
-            final_mask = cls._run_bidding(logits, remaining_capacity, min_choices, max_rounds, capacity)
+            final_mask = cls._run_bidding(logits, remaining_capacity,
+                                          min_choices, max_rounds, capacity)
             cls._check_bidding_converged(final_mask, min_choices, max_rounds)
         return logits.masked_fill(~final_mask, mask_value)
 
