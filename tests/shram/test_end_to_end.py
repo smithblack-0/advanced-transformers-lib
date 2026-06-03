@@ -56,24 +56,18 @@ def model(device):
 class TestIntegrationGeneratable:
     def test_output_shape(self, model, device):
         """generate() must return (batch, input_len + max_new_tokens)."""
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.reset()
         ids = torch.randint(0, 256, (1, 4), device=device)
         out = model.generate(ids, max_new_tokens=5)
         assert out.shape == (1, 9)
 
     def test_valid_token_ids(self, model, device):
         """All generated token IDs must be in [0, vocab_size)."""
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.reset()
         ids = torch.randint(0, 256, (1, 4), device=device)
         out = model.generate(ids, max_new_tokens=5)
         assert (out >= 0).all() and (out < model.config.vocab_size).all()
 
     def test_determinism(self, model, device):
         """Greedy decoding must be deterministic: identical input produces identical output."""
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.reset()
         ids = torch.randint(0, 256, (1, 4), device=device)
         out1 = model.generate(ids, max_new_tokens=5)
         out2 = model.generate(ids, max_new_tokens=5)
@@ -162,6 +156,105 @@ class TestIntegrationCapacityEnforcement:
         out = m(ids, labels=ids, use_cache=False)
         assert out.loss is not None and torch.isfinite(out.loss)
 
+# ---------------------------------------------------------------------------
+# Integration — Extended inference (YaRN rescaling)
+# ---------------------------------------------------------------------------
+
+class TestIntegrationExtendedInference:
+    """A model saved at training_sequence_length must generate past that horizon
+    when reloaded with a larger inference_sequence_length override (YaRN rescaling).
+
+    The save-load-with-override path is the real researcher workflow: train at one
+    context length, then extend at inference time by overriding inference_sequence_length
+    at load time. Both eager and compiled paths are exercised.
+
+    training_sequence_length=16, inference_sequence_length=32 (2× YaRN scale).
+    Input is 4 tokens; max_new_tokens=28 so the full 32-token inference budget is
+    reached. mosrah_overallocation_factor=2.0 matches production harness headroom.
+    """
+
+    def _save_base_model(self, tmp_path):
+        """Save a model trained at training_sequence_length=16 with no YaRN override."""
+        config = small_config(
+            training_sequence_length=16,
+            mosrah_overallocation_factor=2.0,
+        )
+        ShramForCausalLM(config).save_pretrained(tmp_path)
+
+    def test_generate_beyond_training_length(self, tmp_path, device):
+        """Eager generate() must reach the full inference budget after a length override at load."""
+
+        self._save_base_model(tmp_path)
+        m = ShramForCausalLM.from_pretrained(
+            tmp_path, inference_sequence_length=32,
+        ).eval().to(device)
+
+        ids = torch.randint(0, m.config.vocab_size, (1, 4), device=device)
+        out = m.generate(ids, max_new_tokens=28)
+        assert out.shape == (1, 32)
+        assert (out >= 0).all() and (out < m.config.vocab_size).all()
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "Compiled inference requires CUDA; CPU compilation is not supported "
+            "for the cached inference path. "
+            "See https://github.com/pytorch/pytorch/issues/148752"
+        ),
+    )
+    def test_compiled_generate_beyond_training_length(self, tmp_path, device):
+        """Compiled and uncompiled generate() must agree after a length override at load."""
+        self._save_base_model(tmp_path)
+        m = ShramForCausalLM.from_pretrained(
+            tmp_path, inference_sequence_length=32,
+        ).eval().to(device)
+
+        ids = torch.randint(0, m.config.vocab_size, (1, 4), device=device)
+        out_eager = m.generate(ids, max_new_tokens=28)
+        torch._dynamo.reset()
+        compiled = torch.compile(m, fullgraph=False, dynamic=False)
+        out_compiled = compiled.generate(ids, max_new_tokens=28)
+        assert torch.equal(out_eager, out_compiled)
+
+    def test_prefill_beyond_training_length(self, tmp_path, device):
+        """Eager generate() must work when the prompt exceeds training_sequence_length.
+
+        Prompt of 20 tokens sits between training_sequence_length=16 and
+        inference_sequence_length=32, exercising positions the model was not
+        trained to cover without YaRN rescaling.
+        """
+        self._save_base_model(tmp_path)
+        m = ShramForCausalLM.from_pretrained(
+            tmp_path, inference_sequence_length=32,
+        ).eval().to(device)
+
+        ids = torch.randint(0, m.config.vocab_size, (1, 20), device=device)
+        out = m.generate(ids, max_new_tokens=4)
+        assert out.shape == (1, 24)
+        assert (out >= 0).all() and (out < m.config.vocab_size).all()
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "Compiled inference requires CUDA; CPU compilation is not supported "
+            "for the cached inference path. "
+            "See https://github.com/pytorch/pytorch/issues/148752"
+        ),
+    )
+    def test_compiled_prefill_beyond_training_length(self, tmp_path, device):
+        """Compiled and uncompiled generate() must agree when the prompt exceeds training_sequence_length."""
+        self._save_base_model(tmp_path)
+        m = ShramForCausalLM.from_pretrained(
+            tmp_path, inference_sequence_length=32,
+        ).eval().to(device)
+
+        ids = torch.randint(0, m.config.vocab_size, (1, 20), device=device)
+        out_eager = m.generate(ids, max_new_tokens=4)
+        torch._dynamo.reset()
+        compiled = torch.compile(m, fullgraph=False, dynamic=False)
+        out_compiled = compiled.generate(ids, max_new_tokens=4)
+        assert torch.equal(out_eager, out_compiled)
+
 
 # ---------------------------------------------------------------------------
 # Integration — Compilable
@@ -181,17 +274,42 @@ class TestIntegrationCompilable:
     def test_compile_uncached_forward(self):
         """torch.compile must succeed on the uncached forward path."""
 
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.reset()
+        torch.manual_seed(0)
 
         m = ShramForCausalLM(small_config()).cuda().eval()
+        ids = torch.randint(0, 256, (1, 4)).cuda()
 
-
-        ids = torch.randint(0, 256, (1, 1)).cuda()
         m(ids, use_cache=False)
+
         compiled = torch.compile(m, fullgraph=False, dynamic=False)
-        #print(torch._dynamo.explain(compiled, ids, use_cache=False))
+        print(torch._dynamo.explain(compiled, ids, use_cache=False))
         compiled(ids, use_cache=False)
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "Training-path compilation requires CUDA; CPU compilation is not supported "
+            "for the uncached (training) forward path. "
+            "See https://github.com/pytorch/pytorch/issues/148752"
+        ),
+    )
+    def test_compile_uncached_backward(self, device):
+        """Compiled training forward+backward must complete without error.
+
+        Verifies that loss.backward() on the compiled uncached training path
+        does not raise. Graph breaks in the backward pass that cause a crash
+        are caught here.
+        """
+
+        torch.manual_seed(0)
+        m = ShramForCausalLM(small_config()).to(device).train()
+        ids = torch.randint(0, 256, (1, 4), device=device)
+
+        compiled = torch.compile(m, fullgraph=False, dynamic=False)
+        out = compiled(ids, labels=ids, use_cache=False)
+        out.loss.backward()
+
+        assert torch.isfinite(out.loss)
+
     @pytest.mark.skipif(
         not torch.cuda.is_available(),
         reason=(
@@ -208,9 +326,6 @@ class TestIntegrationCompilable:
         divergence indicates the compiled path is producing different attention or
         routing behaviour than the eager path.
         """
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.reset()
-
         m = ShramForCausalLM(small_config()).cuda().eval()
         ids = torch.randint(0, 256, (1, 4)).cuda()
         compile_config = CompileConfig(fullgraph=False, dynamic=True)
@@ -240,8 +355,6 @@ class TestIntegrationCompilable:
         it fails loudly rather than silently falling back to eager.
         See https://github.com/pytorch/pytorch/issues/148752
         """
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.reset()
         m = ShramForCausalLM(small_config()).cuda().eval()
         compile_config = CompileConfig(fullgraph=False, dynamic=True)
         compile_config._compile_all_devices = True

@@ -41,7 +41,7 @@ class ShramConfig(PretrainedConfig):
         config = AutoConfig.from_pretrained(
             "your-namespace/advanced-transformers-lib",
             trust_remote_code=True,
-            num_hidden_layers=12,
+            num_decoder_layers=12,
         )
         model = AutoModelForCausalLM.from_config(config)
 

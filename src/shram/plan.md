@@ -88,7 +88,10 @@ is being achieved, one verified unit at a time.
 - [X] Unit 21 — Capacity issues
 - [X] Unit 21.A — huggingface initialization fix
 - [X] Unit 21.B — training capacity fix. (Sinkhorn implementation — SUPERSEDED by Unit 21.C due to convergence failure)
-- [X] Unit 21.C — Bidding-based capacity enforcement: SIGNED OFF
+- [X] Unit 21.C — Bidding-based capacity enforcement
+- [X] Unit 22.A — fix hacked assertions using torch._assert_async.
+- [X] Unit 22.B — Remove capture_scalar_outputs dependency.
+- [X] Unit 22.C — Expert packing: fixed-shape compact-to-padded transfer.
 - [ ] Unit 22 — Final audit
 
 ---
@@ -2701,7 +2704,123 @@ The validated algorithm is deferred-acceptance (Gale-Shapley) bidding: tokens pr
 
 ---
 
-### Unit 22 — Final Audit
+## Unit 22 - Cleanup 
+
+The online version in huggingface is corrupt. There are also minor quality of life issues that need to be fixed
+
+### Unit 22.A
+
+**Responsibility**: 
+
+Replace the existing assertion hack with the proper testing hook to remove dependency on capture_scalar_output. 
+
+**Context of Correctness**
+
+When the synchronous inline assertion system was orginally installed, it was found the only way to make it work was to use a dynamo capture_scalar_outputs flag, This resulted in the installation of three horribly slow but necessary tests. This involved forcing the capture of scalar outputs, and inserting tests at the following locations, and a test to ensure capture scalar output was set in the environment. 
+
+  - src/shram/model/huggingface.py — two sites: position-zero check (~line 387) and _enforce_capture_scalar_outputs (~line 413)                           - src/shram/model/cache/mosrah_cache.py — overflow check (~line 357)                         
+  - src/shram/model/attention/expert_packing.py — overflow check (~line 311)  
+
+It is now known that torch._assert_async can accomplish the same thing without causing a graph break and in a manner that can be compiled. Given how slow capture_scalar_output is, it should be substituted, and shutting off the flag investigated.
+
+**Invariants**
+
+- The three test files listed above should have their checks replaced with torch._assert_async statements. Note messages cannot be longer than 256 characters.
+- To prevent mass testing failure, only the compiled branch should be replaced like this.
+- Validation is refactored to be sane; passes in parameters that are checked in the function. 
+
+**Tests**
+-  torch.AcceleratorError, RunTimeError, and AssertionError should be caught when checking for if the change worked.
+
+**Preliminary implementation strategy**
+
+- Most validation functions currently accept just a tensor bool. The logic to produce that bool should be moved inside the tests
+- torch._assert_async accepts that tensor bool and a message no longer than 256 characters
+
+### Unit 22.B — Remove `capture_scalar_outputs` dependency
+
+**Responsibility:** Certify that `torch._assert_async`-based safety checks operate correctly under `torch.compile` without `capture_scalar_outputs`, and remove the enforcement infrastructure whose precondition has ceased to hold.
+
+**Context of Correctness:**
+
+This project's inline safety checks (capacity overflow, position-zero constraint) exist to catch invariant violations at compiled runtime. Their only value is that they fire. A check that is silently absent in the compiled model is worse than no check — it provides false confidence.
+
+Unit 22.A replaced the `torch._check + .item()` mechanism with `torch._assert_async`, which operates on tensor booleans and requires no scalar extraction. That eliminated the dependency on `capture_scalar_outputs`. The enforcement guard installed in `ShramForCausalLM` was correct when the dependency existed: it detected misconfiguration at trace time before the checks could go silent. Now that the dependency is gone, the guard enforces a requirement that has ceased to exist.
+
+A vacuous enforcement check is not neutral. It misleads future maintainers into believing a real dependency remains, imposes a compilation cost (dynamo captures every `.item()` as a SymInt when the flag is set), and embeds a false statement into the test contracts. Leaving it in place is a correctness violation of the documentation and test layer, even if the runtime behavior happens to be unaffected.
+
+The alternative — leaving the flag in place — is less correct because the cost is real and the justification has evaporated.
+
+**Invariants:**
+
+1. Safety checks in the compiled model (capacity overflow, position-zero constraint) fire correctly with `capture_scalar_outputs` at its default value.
+2. The compiled model produces no errors and no degraded behavior when `capture_scalar_outputs` is not set.
+3. No test file sets `capture_scalar_outputs` as a prerequisite for any test to pass.
+
+**Tests:**
+
+All currently-passing compiled tests serve as the regression gate: they must pass without `capture_scalar_outputs = True` in setup. The test for the enforcement guard is deleted — it tested a method whose precondition no longer holds, and a test with a false premise cannot enforce a true invariant.
+
+**Preliminary implementation avenues (not invariants):**
+
+- Remove the enforcement method and its call site from `ShramForCausalLM.forward`.
+- Remove save/set/restore boilerplate from all test files. Delete `TestCaptureScalarOutputsEnforcement` entirely.
+- Affected files: `huggingface.py`, `test_end_to_end.py`, `test_expert_packing.py`, `test_huggingface.py`, `test_router.py`, `test_mosrah_cache.py`, `test_sliding_window_cache.py`.
+
+### Unit 22.C — Expert packing: fixed-shape compact-to-padded transfer
+
+**Responsibility**
+
+Fix graph breaks in the compiled backward pass by replacing the boolean mask-based scatter/gather in `pack_experts` and `unpack_experts` with a fixed-shape integer index, without changing the external semantic contract of packing or unpacking.
+
+**Context of Correctness**
+
+Forward passes through the compiled model currently succeed. Backward passes do not: the boolean mask assignment used to transfer the compact expert-major stream into the padded tensor exposes a data-dependent shape to the compiler. Even though the system guarantees exactly B×N×K selected entries by invariant, the compiler sees the selected dimension as depending on mask contents and cannot trace through it cleanly in the backward pass.
+
+The correct fix is a coordinate-space transformation: compute an integer index that maps each compact-stream position to its padded destination, then use scatter and gather on that index. The index values depend on routing, but the index shape is fixed by B, N, K, num_experts, and packed_length — all statically known at trace time. This is the distinction the compiler needs.
+
+Keeping the boolean mask as the transfer mechanism and adding assertions or static-shape hints was rejected. Such workarounds carry no semantic guarantee to the compiler and do not address the root cause.
+
+**Invariants**
+
+- For all valid inputs, `pack_experts` produces numerically identical output to the previous implementation.
+- For all valid inputs, `unpack_experts` recovers the same token-choice output as the previous implementation.
+- No tensor shape in the packing or unpacking transfer path depends on the number of True entries in any mask.
+- The active mask is preserved in the packing output and remains available to downstream attention consumers.
+- Padding positions in the packed tensor contain the padding fill value.
+- Every routed copy is stored exactly once in the packed tensor.
+- Inserted additional code is still done to standards; block comments and algorithm overviews are used liberally to ensure why execution occurs this way is clear, nad how execution occurs. 
+
+**Tests**
+
+- Behavioral equivalence: over a range of routing configurations including imbalanced routing, new packing and unpacking produce numerically identical results to the previous implementation.
+- Round-trip: pack then unpack recovers the original compact expert-major stream exactly.
+- Padding invariant: positions beyond each expert's token count contain the padding fill value after packing.
+- Compile backward: `test_compile_uncached_backward` in `TestIntegrationCompilable` passes — this is the primary regression gate for this unit.
+
+**Preliminary implementation strategy**
+
+The proposed approach computes a flat integer destination index from `tokens_per_expert`. Given counts of shape `(B, L)` and packed length T:
+
+```
+block_counts   = tokens_per_expert.flatten()                    # (B*L,)
+skipped        = T - block_counts                               # (B*L,)
+skipped_before = exclusive_cumsum(skipped)                      # (B*L,)
+skipped_stream = repeat_interleave(
+                     skipped_before, block_counts,
+                     output_size=B*N*K,
+                 )                                              # (B*N*K,)
+linear_destination = arange(B*N*K) + skipped_stream             # (B*N*K,)
+```
+
+The `output_size` parameter on `repeat_interleave` is what fixes the output shape at B×N×K regardless of routing distribution. Whether this form compiles cleanly under dynamo is an empirical question — if it does not, surface and stop rather than working around it silently.
+
+`linear_destination` should be stored in the packing setup payload so unpacking reuses the same index without recomputation.
+
+
+
+
+### Unit 23 — Final Audit
 
 **What:** Review every audit note in plan.md and, if not overridden, ensure compliance. Crosscheck with papers/main.tex and verify whether or not paper is still complaint.
 
