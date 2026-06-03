@@ -282,7 +282,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             raise ValueError(
                 "position_ids must match the current input_ids shape exactly."
             )
-        if input_ids.dtype != torch.long:
+        if position_ids.dtype != torch.long:
             raise TypeError("position_ids must be an long tensor.")
 
     def _validate_labels(
@@ -297,7 +297,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             raise ValueError("labels must have shape (batch, seq_len).")
         if labels.shape != input_ids.shape:
             raise ValueError("labels must have the same shape as input_ids.")
-        if input_ids.dtype != torch.long:
+        if labels.dtype != torch.long:
             raise TypeError("labels must be a long tensor.")
 
     def _validate_cache_inputs(

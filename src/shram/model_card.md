@@ -48,7 +48,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 config = AutoConfig.from_pretrained(
     "{repo_id}",
     trust_remote_code=True,
-    num_hidden_layers=16,       # example override
+    num_decoder_layers=16,      # example override
     num_mosrah_heads=32,        # example override
 )
 

@@ -47,7 +47,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 config = AutoConfig.from_pretrained(
     "smithblack-0/SHRAM",
     trust_remote_code=True,
-    num_hidden_layers=16,       # example override
+    num_decoder_layers=16,      # example override
     num_mosrah_heads=32,        # example override
 )
 
@@ -84,7 +84,7 @@ contains no weights. All values are overridable via kwargs.
 | `intermediate_size` | 1366 |
 | `local_rope_theta` | 10000.0 |
 | `mosrah_rope_theta` | 10000.0 |
-| `num_hidden_layers` | 12 |
+| `num_decoder_layers` | 12 |
 | `num_mosrah_heads` | 16 |
 | `num_selected_heads` | 16 |
 | `num_sliding_window_heads` | 16 |
