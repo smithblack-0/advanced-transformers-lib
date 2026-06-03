@@ -154,6 +154,7 @@ class BottleneckedEnsembleAttention(nn.Module):
              key_length=key_states.shape[2],
              device=packed_embeddings.device,
          )
+
         attended_states = flex_attention(
              rotated_query_states,
              key_states,

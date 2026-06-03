@@ -98,7 +98,7 @@ class MoSRAHRouter(nn.Module):
                outputs.
             capacity_scalar: Static upper bound on n; used to derive topk k as
                min(tensor.shape[dim], capacity_scalar). Must be a Python int
-               for compile compatibility.
+           for compile compatibility.
 
         Returns:
             Boolean mask of the same shape as tensor.

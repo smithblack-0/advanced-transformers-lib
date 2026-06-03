@@ -44,6 +44,29 @@ def small_config(**kwargs) -> ShramConfig:
     return ShramConfig(**defaults)
 
 
+def _make_eval_batch(
+    device: torch.device,
+    batch_size: int = 4,
+    seq_len: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create a synthetic batch with mixed-length right-padded attention masks.
+
+    Returns (input_ids, labels, attention_mask). Rows have varied active lengths
+    so mixed-padding code paths are exercised. Seed is fixed for reproducibility.
+    """
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, 256, (batch_size, seq_len), device=device)
+    labels = input_ids.clone()
+
+    # Row active lengths deliberately varied; the first and last rows are full.
+    active_lengths = [seq_len, 100, 75, 90]
+    attention_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+    for i, length in enumerate(active_lengths[:batch_size]):
+        attention_mask[i, :length] = True
+
+    return input_ids, labels, attention_mask
+
+
 @pytest.fixture
 def model(device):
     return ShramForCausalLM(small_config()).eval().to(device)
@@ -282,7 +305,7 @@ class TestIntegrationCompilable:
         m(ids, use_cache=False)
 
         compiled = torch.compile(m, fullgraph=False, dynamic=False)
-        print(torch._dynamo.explain(compiled, ids, use_cache=False))
+        #print(torch._dynamo.explain(compiled, ids, use_cache=False))
         compiled(ids, use_cache=False)
     @pytest.mark.skipif(
         not torch.cuda.is_available(),
@@ -332,7 +355,7 @@ class TestIntegrationCompilable:
 
         out_eager = m.generate(ids, max_new_tokens=10, disable_compile=True)
         torch._dynamo.reset()
-        out_compiled = m.generate(ids, max_new_tokens=10, compile_config=compile_config)
+        out_compiled = m.generate(ids, max_new_tokens=10, compile_config=CompileConfig(fullgraph=False, dynamic=False))
         assert torch.equal(out_eager, out_compiled)
 
     @pytest.mark.skipif(
@@ -356,10 +379,112 @@ class TestIntegrationCompilable:
         See https://github.com/pytorch/pytorch/issues/148752
         """
         m = ShramForCausalLM(small_config()).cuda().eval()
-        compile_config = CompileConfig(fullgraph=False, dynamic=True)
+        compile_config = CompileConfig(fullgraph=False, dynamic=False)
         compile_config._compile_all_devices = True
         ids = torch.randint(0, 256, (1, 4)).cuda()
         m.generate(ids, max_new_tokens=3, compile_config=compile_config)
+
+
+# ---------------------------------------------------------------------------
+# Integration — Compiled eval (eval mode, no_grad, mixed precision)
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrationCompiledEval:
+    """Compiled model under inference-style execution contexts.
+
+    Covers eval mode, no_grad, and fp16 autocast — the conditions present in
+    an observed production Inductor FlexAttention layout failure and absent
+    from TestIntegrationCompilable. All tests use batch=4, seq=128 with a
+    mixed-padding attention_mask.
+    """
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "Compiled eval forward requires CUDA; CPU compilation is not "
+            "supported for the uncached forward path. "
+            "See https://github.com/pytorch/pytorch/issues/148752"
+        ),
+    )
+    def     test_compiled_eval_labeled_forward(self, device):
+        """Compiled eval+no_grad labeled forward must complete without error."""
+        m = ShramForCausalLM(
+            small_config(training_sequence_length=128)
+        ).eval().to(device)
+        input_ids, labels, attention_mask = _make_eval_batch(device)
+
+        torch._dynamo.reset()
+        compiled = torch.compile(m, fullgraph=False, dynamic=False)
+        with torch.no_grad():
+            out = compiled(
+                input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+        assert torch.isfinite(out.loss)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "Compiled eval forward requires CUDA; CPU compilation is not "
+            "supported for the uncached forward path. "
+            "See https://github.com/pytorch/pytorch/issues/148752"
+        ),
+    )
+    def test_compiled_eval_autocast_labeled_forward(self, device):
+        """Compiled eval+no_grad labeled forward under fp16 autocast must complete without error."""
+        m = ShramForCausalLM(
+            small_config(training_sequence_length=128)
+        ).eval().to(device)
+        input_ids, labels, attention_mask = _make_eval_batch(device)
+
+        torch._dynamo.reset()
+        compiled = torch.compile(m, fullgraph=False, dynamic=False)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
+            out = compiled(
+                input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+        assert torch.isfinite(out.loss)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason=(
+            "Compiled eval forward requires CUDA; CPU compilation is not "
+            "supported for the uncached forward path. "
+            "See https://github.com/pytorch/pytorch/issues/148752"
+        ),
+    )
+    def test_compiled_eval_matches_eager(self, device):
+        """Compiled eval forward must produce logits numerically identical to eager."""
+        m = ShramForCausalLM(
+            small_config(training_sequence_length=128)
+        ).eval().to(device)
+        input_ids, labels, attention_mask = _make_eval_batch(device)
+
+        with torch.no_grad():
+            out_eager = m(
+                input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+
+        torch._dynamo.reset()
+        compiled = torch.compile(m, fullgraph=False, dynamic=False)
+        with torch.no_grad():
+            out_compiled = compiled(
+                input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+
+        torch.testing.assert_close(out_eager.logits, out_compiled.logits)
 
 
 # ---------------------------------------------------------------------------

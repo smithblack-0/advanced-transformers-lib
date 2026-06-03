@@ -66,6 +66,10 @@ model.save_pretrained("./my-checkpoint")
 model = AutoModelForCausalLM.from_pretrained("./my-checkpoint", trust_remote_code=True)
 ```
 
+### Compile compatibility
+
+`torch.compile` with `dynamic=False` is supported. `dynamic=True` is not supported and will produce trace errors — routing indices are data, not shape, which is structurally incompatible with dynamic-shape tracing.
+
 ## Constructor Defaults
 
 The values below are the defaults you get if you call `AutoConfig.from_pretrained` with

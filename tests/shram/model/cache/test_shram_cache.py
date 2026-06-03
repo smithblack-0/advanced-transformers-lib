@@ -16,8 +16,15 @@ HF Cache protocol and construction:
 
 Composite behaviors:
 - reset() clears all layer caches through the ShramCache boundary
+- reset() zeroes _active_token_counts in-place
 - reorder_cache() permutes all layer caches consistently through the ShramCache boundary
 - len(cache) == num_decoder_layers
+
+total_active_tokens:
+- Returns zeros on the first call — no prior accumulation
+- Returns the pre-update accumulated count on subsequent calls
+- Accumulates independently per batch item
+- Returns zeros after cache.reset()
 """
 
 import torch
@@ -63,6 +70,14 @@ def make_cache(num_layers: int = NUM_LAYERS, batch: int = BATCH) -> ShramCache:
         batch_size=batch,
         device=torch.device("cpu"),
     )
+
+
+def make_active_mask(batch: int, seq_len: int, active_per_item: list[int]) -> torch.BoolTensor:
+    """Construct a left-justified active mask with specified per-item active counts."""
+    mask = torch.zeros(batch, seq_len, dtype=torch.bool)
+    for b, count in enumerate(active_per_item):
+        mask[b, :count] = True
+    return mask
 
 
 def sw_update(layer_cache: ShramLayerCache, batch: int, num_tokens: int) -> None:
@@ -185,6 +200,55 @@ def test_get_seq_length_uses_specified_layer():
 
 
 # ---------------------------------------------------------------------------
+# total_active_tokens
+# ---------------------------------------------------------------------------
+
+class TestTotalActiveTokens:
+
+    def test_returns_zeros_on_first_call(self):
+        """total_active_tokens must return zeros on the first call — no prior accumulation."""
+        cache = make_cache(batch=BATCH)
+        active_mask = torch.ones(BATCH, 4, dtype=torch.bool)
+
+        prior_counts = cache.total_active_tokens(active_mask)
+
+        assert prior_counts.shape == (BATCH,)
+        assert prior_counts.sum() == 0
+
+    def test_returns_pre_update_count_on_subsequent_calls(self):
+        """total_active_tokens must return the accumulated count before this call updates it."""
+        cache = make_cache(batch=BATCH)
+        # First call: returns zeros, accumulates 3 per item.
+        cache.total_active_tokens(torch.ones(BATCH, 3, dtype=torch.bool))
+
+        prior_counts = cache.total_active_tokens(torch.ones(BATCH, 5, dtype=torch.bool))
+
+        expected = torch.full((BATCH,), 3, dtype=torch.long)
+        assert torch.equal(prior_counts, expected)
+
+    def test_accumulates_independently_per_batch_item(self):
+        """total_active_tokens must accumulate independently for each batch item."""
+        cache = make_cache(batch=2)
+        # Item 0: 3 active tokens, item 1: 5 active tokens.
+        step1_mask = make_active_mask(2, 6, [3, 5])
+        cache.total_active_tokens(step1_mask)
+
+        prior_counts = cache.total_active_tokens(torch.ones(2, 2, dtype=torch.bool))
+
+        assert torch.equal(prior_counts, torch.tensor([3, 5], dtype=torch.long))
+
+    def test_counts_zero_after_reset(self):
+        """total_active_tokens must return zeros after cache.reset() clears the counter."""
+        cache = make_cache(batch=BATCH)
+        cache.total_active_tokens(torch.ones(BATCH, 4, dtype=torch.bool))
+
+        cache.reset()
+        prior_counts = cache.total_active_tokens(torch.ones(BATCH, 2, dtype=torch.bool))
+
+        assert prior_counts.sum() == 0
+
+
+# ---------------------------------------------------------------------------
 # reset()
 # ---------------------------------------------------------------------------
 
@@ -199,23 +263,30 @@ def test_reset_clears_all_sliding_window_caches():
 
 
 def test_reset_clears_all_mosrah_caches():
-    """reset() clears the MoSRAH cache in every layer."""
+    """reset() clears the MoSRAH cache in every layer and zeroes _active_token_counts."""
     cache = make_cache()
     for layer in cache.layers:
         mosrah_update(layer, BATCH, 2)
+    cache.total_active_tokens(torch.ones(BATCH, 2, dtype=torch.bool))
+
     cache.reset()
+
     for layer in cache.layers:
         assert layer.mosrah_cache.get_heads_lengths().sum() == 0
+    assert cache._active_token_counts.sum() == 0
 
 
 def test_reset_on_fresh_cache_is_idempotent():
     """reset() on a fresh cache does not raise and leaves all layers in clean state."""
     cache = make_cache()
+
     cache.reset()
+
     for layer in cache.layers:
         assert not layer.sliding_window_cache.active_mask.any()
     for layer in cache.layers:
         assert layer.mosrah_cache.get_heads_lengths().sum() == 0
+    assert cache._active_token_counts.sum() == 0
 
 
 # ---------------------------------------------------------------------------
