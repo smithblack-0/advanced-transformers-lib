@@ -1,4 +1,4 @@
-# Specification: advanced-transformers-lib — SHRAM Research Baseline
+3# Specification: advanced-transformers-lib — SHRAM Research Baseline
 
 ## Purpose
 
@@ -207,6 +207,12 @@ Clean, well-structured code is an unconditional requirement across the entire co
 - Placeholders must raise `NotImplementedError`, never pass silently
 - Code strives to follow best practices such as single responsibility
 
+The standards below form a set of constraints that must all be satisfied simultaneously. They are intentionally strict and occasionally in tension with each other. This is not a bug — it is the point. When satisfying all constraints at once seems impossible, that is a signal that the code under review has a structural problem: it is doing too much in one place, the abstraction boundary is wrong, or the algorithm needs to be decomposed further. The constraints act as a forcing function.
+
+Do not relax a constraint to make code fit. Instead, surface the conflict. The user always knows how to resolve it. An implementer who cannot see how to make a block of code both well-named and documented with a clear "why" without narrating the "how" should stop and ask — that tension is diagnostic information, not an obstacle to route around.
+
+Two constraints are stricter here than in most projects: variable names must carry full semantic content (data-space, role, gradient-path status) without the reader consulting surrounding context; and block comments must explain architectural reason and invariant, never mechanical operation. Both are required because a researcher must be able to verify decisions against the paper without reconstructing implementation history.
+
 **Documentation and commenting:**
 - All classes must have docstrings
 - All public methods must have docstrings
@@ -215,6 +221,17 @@ Clean, well-structured code is an unconditional requirement across the entire co
 - When code cannot be made clearly self-documenting through variable names and structure alone, it must be documented with block comments explaining what the block achieves and why this approach was chosen
 - Do not document line by line narrating what the code does; document at the block level explaining what it accomplishes and why
 - Skipping documentation on non-self-documenting code and writing useless line-by-line narration are both failure modes of equal severity
+- Inline line comments (after code on the same line) are permitted only for genuinely surprising individual statements — they are the exception, not the pattern
+
+**Variable naming:**
+- Variable names must encode semantic role, not just data type. Names like `n`, `k`, `x` are only acceptable where they are standard mathematical notation for that domain (e.g. `q`, `k`, `v` for attention, `x` for input hidden state). All other variables must be descriptive.
+- Tensor names must reflect their data-space and role: `packed_` prefix for expert-choice layout, `biased_`/`unbiased_` to signal gradient-path role, `active_mask` vs `unpacking_mask` vs `block_mask` are distinct concepts and must not be collapsed into a generic `mask`
+- Count, occupancy, and length are distinct concepts and must be named distinctly (`tokens_per_expert`, `remaining_capacity`, `num_tokens_processed` are not interchangeable)
+
+**Code layout within functions:**
+- Blank lines within a function are semantic: they mark phase or scope boundaries. They are never used for visual padding.
+- Multi-phase functions (those implementing a sequential algorithm with distinct steps) must use transition block comments between phases. These comments name the phase and explain what invariant or output it establishes — not what the code does mechanically.
+- Methods within a class must be ordered: `__init__` first, then public API methods, then validation helpers (`_validate_*`), then algorithm helpers, then state management methods (`reset`, `reorder`, etc.).
 
 ---
 
@@ -232,6 +249,23 @@ Tests are first-class artifacts of this project. They are written alongside the 
 - Integration tests do not replicate the testing functionality and level of detail of unit tests; they verify that pieces work together, not that subunits were unit tested correctly
 - When making changes to support new functionality for other work units, tests must be updated to accurately reflect the new correct behavior before the unit is considered verified. Passing tests that no longer reflect intent are not verification — they are false confidence.
 - The coder must ask the user when uncertain how to correctly test a given component. A bad test is worse than no test.
+
+**Test file structure:**
+- Every test file must open with a module docstring listing the invariants it verifies as a bulleted checklist. This docstring is the contract the test file enforces.
+- Tests must be organized into classes grouped by invariant category. Class names are noun phrases describing the category (`TestOutputShapes`, `TestBiasInfluencesSelectionOnly`), not verb phrases. Classes are separated by formatted section-header comments (`# ───────────────────────────────`).
+- Every test method must have a docstring stating what invariant it verifies, written as a behavioral contract ("must," "must not," "must equal"), not a description of test procedure.
+- Boundary and edge cases must be grouped into a dedicated class (`TestXBoundaries` or `TestXEdgeCases`), not scattered across other classes.
+- Pytest fixtures are used for infrastructure only (device selection, session-scoped resources). Business logic setup must use plain helper functions with typed signatures, not fixtures.
+- Do not use `@pytest.mark.parametrize` for parametric sweeps. Use an explicit inner method that accepts parameters, called from multiple test methods. This makes the sweep structure explicit and assertion messages debuggable.
+
+**Test method layout:**
+- Test methods must follow a three-phase arrange/act/assert structure, with blank lines separating the phases. Setup at top, call in middle, assertions at bottom.
+- Input variables are named by their content role (`x`, `hidden_states`, `active_mask`). Expected/reference values are prefixed `expected_`. Comparative variants use `baseline_`/`perturbed_` or `_a`/`_b` suffixes.
+- All randomness must be explicitly seeded. Never rely on default or implicit seeds. Use `torch.manual_seed()` or pass a `seed` parameter to factory functions.
+- Complex assertions in fuzz and boundary tests must include diagnostic messages with enough context to reproduce the failure without re-running (relevant dimensions, parameter values, trial index).
+- When test setup involves a non-obvious choice (seed value, specific tensor layout, fixture construction), add a one-to-two line comment explaining why.
+- Helper functions in test files must have typed signatures and docstrings when their purpose is not immediately self-evident. Reference/oracle implementations must always be documented.
+- Device-dependent tests must use the `device` fixture from `conftest.py`, not `@pytest.mark.skipif(not torch.cuda.is_available(), ...)`.
 
 ---
 

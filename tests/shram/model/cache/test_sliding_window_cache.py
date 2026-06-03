@@ -407,7 +407,6 @@ def test_batch_repeat_interleave_preserves_alignment_observationally():
 
 def test_update_compiled_no_graph_breaks():
     torch._dynamo.reset()
-    torch._dynamo.config.capture_scalar_outputs = True
 
     cache = make_cache(sliding_window=3, batch_size=1)
     compiled_update = torch.compile(cache.update, fullgraph=True)

@@ -692,25 +692,18 @@ def test_update_compiled_no_graph_breaks():
 
     fullgraph=True causes torch.compile to raise if any graph break occurs, making
     this the definitive check that update() contains no data-dependent shape ops.
-    capture_scalar_outputs must be enabled so the overflow check's .item() folds
-    into the compiled graph rather than breaking it. Several decode steps are
-    simulated to confirm the compiled graph is reused without error.
+    Several decode steps are simulated to confirm the compiled graph is reused without error.
     """
     torch._dynamo.reset()
-    original = torch._dynamo.config.capture_scalar_outputs
-    torch._dynamo.config.capture_scalar_outputs = True
-    try:
-        B, L, T = 1, NUM_HEADS, 2
-        cache = make_cache(batch=B, cache_length=CACHE_LENGTH)
-        compiled_update = torch.compile(cache.update, fullgraph=True)
+    B, L, T = 1, NUM_HEADS, 2
+    cache = make_cache(batch=B, cache_length=CACHE_LENGTH)
+    compiled_update = torch.compile(cache.update, fullgraph=True)
 
-        for _ in range(3):
-            key = torch.randn(B, L, T, HEAD_DIM)
-            val = torch.randn(B, L, T, HEAD_DIM)
-            mask = torch.zeros(B, L, T, dtype=torch.bool)
-            mask[0, 0, 0] = True
-            keys_out, vals_out, active_mask = compiled_update(key, val, mask)
-            assert keys_out.shape == (B, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
-            assert active_mask.dtype == torch.bool
-    finally:
-        torch._dynamo.config.capture_scalar_outputs = original
+    for _ in range(3):
+        key = torch.randn(B, L, T, HEAD_DIM)
+        val = torch.randn(B, L, T, HEAD_DIM)
+        mask = torch.zeros(B, L, T, dtype=torch.bool)
+        mask[0, 0, 0] = True
+        keys_out, vals_out, active_mask = compiled_update(key, val, mask)
+        assert keys_out.shape == (B, NUM_HEADS, CACHE_LENGTH, HEAD_DIM)
+        assert active_mask.dtype == torch.bool

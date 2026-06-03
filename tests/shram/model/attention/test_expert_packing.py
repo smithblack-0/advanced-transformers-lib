@@ -2,12 +2,11 @@
 
 Invariants verified: paper-specified packing behavior, stable-sort-based causal
 order preservation within expert buckets, failure of a deliberately unstable
-alternative, unpacking-mask cardinality and padding identification, left-justified
-packing, authoritative upstream original-token positions, restoration of
-token-choice shape on unpacking, round-trip identity on active entries, padding
+alternative, transfer-index fixed shape (B*N*K) independent of routing distribution,
+left-justified packing, authoritative upstream original-token positions, restoration
+of token-choice shape on unpacking, round-trip identity on active entries, padding
 inactivity through unpacking, active_mask correctly excludes dead outer tokens,
-and the unpacking_mask/active_mask distinction is maintained under masked
-continuation.
+and dead outer tokens still occupy B*N*K transfer slots.
 """
 
 import pytest
@@ -177,7 +176,7 @@ class TestPaperAlgorithmBehavior:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
         packed_hidden_states = packed["hidden_states"]
         packed_positions = packed["position_ids"]
         active_mask = packed["active_mask"]
@@ -190,13 +189,6 @@ class TestPaperAlgorithmBehavior:
             ]],
             dtype=torch.long,
         )
-        expected_unpacking_mask = torch.tensor(
-            [[
-                [True, True, True, False],
-                [True, True, True, False],
-                [True, True, False, False],
-            ]]
-        )
         expected_hidden_states = torch.tensor(
             [[
                 [[10.0, 11.0], [20.0, 21.0], [40.0, 41.0], [0.0, 0.0]],
@@ -207,11 +199,9 @@ class TestPaperAlgorithmBehavior:
 
         assert packed_hidden_states.shape == expected_hidden_states.shape
         assert packed_positions.shape == expected_positions.shape
-        assert unpacking_mask.shape == expected_unpacking_mask.shape
 
         torch.testing.assert_close(packed_hidden_states, expected_hidden_states)
         torch.testing.assert_close(packed_positions, expected_positions)
-        torch.testing.assert_close(unpacking_mask, expected_unpacking_mask)
 
     def test_packing_preserves_advanced_upstream_positions_through_expert_rearrangement(self):
         """Advanced upstream positions should survive packing rather than collapse to local indices."""
@@ -226,7 +216,7 @@ class TestPaperAlgorithmBehavior:
             "position_ids": (torch.tensor([[100, 101, 102, 103]], dtype=torch.long), 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
         packed_hidden_states = packed["hidden_states"]
         packed_positions = packed["position_ids"]
 
@@ -252,7 +242,7 @@ class TestPaperAlgorithmBehavior:
         # The blocker fix exists precisely so these positions are not regenerated
         # from the local chunk as 0, 1, 2, 3 during cached inference.
         assert not torch.equal(
-            packed_positions[unpacking_mask],
+            packed_positions[packed["active_mask"]],
             torch.tensor([0, 1, 3, 0, 2, 3, 1, 2], dtype=torch.long),
         )
 
@@ -269,9 +259,10 @@ class TestPaperAlgorithmBehavior:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
         packed_hidden_states = packed["hidden_states"]
         packed_positions = packed["position_ids"]
+        active_mask = packed["active_mask"]
 
         expected_hidden_by_position = {
             100: hidden_states[0, 0],
@@ -281,8 +272,8 @@ class TestPaperAlgorithmBehavior:
         }
 
         for expert_idx in range(num_experts):
-            active_positions = packed_positions[0, expert_idx][unpacking_mask[0, expert_idx]].tolist()
-            active_hidden_states = packed_hidden_states[0, expert_idx][unpacking_mask[0, expert_idx]]
+            active_positions = packed_positions[0, expert_idx][active_mask[0, expert_idx]].tolist()
+            active_hidden_states = packed_hidden_states[0, expert_idx][active_mask[0, expert_idx]]
             for position, hidden_state in zip(active_positions, active_hidden_states):
                 torch.testing.assert_close(
                     hidden_state,
@@ -298,11 +289,11 @@ class TestPaperAlgorithmBehavior:
 
         setup = setup_packing(selected_heads)
 
-        packed_a, unpacking_mask_a = pack_experts(
+        packed_a, transfer_indices_a = pack_experts(
             {"hidden_states": (hidden_states, 0.0), "position_ids": (sequential_position_ids, 0), "active_mask": (outer_active_mask, False)},
             setup, selected_heads, num_experts, packed_length,
         )
-        packed_b, unpacking_mask_b = pack_experts(
+        packed_b, transfer_indices_b = pack_experts(
             {"hidden_states": (hidden_states, 0.0), "position_ids": (advanced_position_ids, 0), "active_mask": (outer_active_mask, False)},
             setup, selected_heads, num_experts, packed_length,
         )
@@ -312,7 +303,7 @@ class TestPaperAlgorithmBehavior:
         packed_positions_b = packed_b["position_ids"]
 
         torch.testing.assert_close(packed_hidden_states_a, packed_hidden_states_b)
-        torch.testing.assert_close(unpacking_mask_a, unpacking_mask_b)
+        assert torch.equal(transfer_indices_a, transfer_indices_b)
         assert not torch.equal(packed_positions_a, packed_positions_b)
 
 
@@ -332,11 +323,12 @@ class TestStableSortBehavior:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
         packed_positions = packed["position_ids"]
+        active_mask = packed["active_mask"]
 
         for expert_idx in range(num_experts):
-            active_positions = packed_positions[0, expert_idx][unpacking_mask[0, expert_idx]]
+            active_positions = packed_positions[0, expert_idx][active_mask[0, expert_idx]]
             # Strictly increasing: each token has a unique position and routing assigns
             # each token to K distinct experts, so no token appears twice in one bucket.
             assert torch.all(active_positions[1:] > active_positions[:-1])
@@ -355,13 +347,14 @@ class TestStableSortBehavior:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, unstable_setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, unstable_setup, selected_heads, num_experts, packed_length)
         packed_positions = packed["position_ids"]
+        active_mask = packed["active_mask"]
 
         # At least one expert bucket should now be out of original token order.
         found_causal_violation = False
         for expert_idx in range(num_experts):
-            active_positions = packed_positions[0, expert_idx][unpacking_mask[0, expert_idx]]
+            active_positions = packed_positions[0, expert_idx][active_mask[0, expert_idx]]
             if torch.any(active_positions[1:] < active_positions[:-1]):
                 found_causal_violation = True
                 break
@@ -375,7 +368,7 @@ class TestStableSortBehavior:
 
 class TestActiveMask:
     def test_unpacking_mask_has_correct_cardinality(self):
-        """The unpacking mask must contain exactly B * N * K true entries."""
+        """The transfer index must contain exactly B * N * K entries."""
         hidden_states, position_ids, selected_heads, num_experts, packed_length = make_batch_example()
         outer_active_mask = torch.ones(2, 4, dtype=torch.bool)
 
@@ -385,10 +378,10 @@ class TestActiveMask:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        _, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        _, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
 
         batch_size, sequence_length, num_selected_heads = selected_heads.shape
-        assert unpacking_mask.sum().item() == batch_size * sequence_length * num_selected_heads
+        assert transfer_indices.shape[0] == batch_size * sequence_length * num_selected_heads
 
     def test_active_mask_behavior_is_unchanged_by_position_sourcing_fix(self):
         """Changing only upstream positions should not change the unpacking-mask layout."""
@@ -398,16 +391,16 @@ class TestActiveMask:
         outer_active_mask = torch.ones(1, 4, dtype=torch.bool)
 
         setup = setup_packing(selected_heads)
-        _, unpacking_mask_a = pack_experts(
+        _, transfer_indices_a = pack_experts(
             {"hidden_states": (hidden_states, 0.0), "position_ids": (sequential_position_ids, 0), "active_mask": (outer_active_mask, False)},
             setup, selected_heads, num_experts, packed_length,
         )
-        _, unpacking_mask_b = pack_experts(
+        _, transfer_indices_b = pack_experts(
             {"hidden_states": (hidden_states, 0.0), "position_ids": (advanced_position_ids, 0), "active_mask": (outer_active_mask, False)},
             setup, selected_heads, num_experts, packed_length,
         )
 
-        torch.testing.assert_close(unpacking_mask_a, unpacking_mask_b)
+        assert torch.equal(transfer_indices_a, transfer_indices_b)
 
     def test_active_mask_correctly_distinguishes_active_tokens_from_padding(self):
         """Unpacking mask should mark real packed tokens and exclude padding slots."""
@@ -420,12 +413,13 @@ class TestActiveMask:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
         packed_hidden_states = packed["hidden_states"]
         packed_positions = packed["position_ids"]
+        active_mask = packed["active_mask"]
 
-        assert torch.all(packed_hidden_states[~unpacking_mask] == 0)
-        assert torch.all(packed_positions[~unpacking_mask] == 0)
+        assert torch.all(packed_hidden_states[~active_mask] == 0)
+        assert torch.all(packed_positions[~active_mask] == 0)
 
     def test_active_tokens_are_left_justified(self):
         """Within each expert slot, occupied entries should appear before all padding."""
@@ -438,9 +432,9 @@ class TestActiveMask:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        _, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
 
-        assert_left_justified(unpacking_mask)
+        assert_left_justified(packed["active_mask"])
 
     def test_dead_outer_token_produces_dead_active_mask_slots(self):
         """A dead outer token must produce False active_mask entries at its packed slots.
@@ -452,8 +446,8 @@ class TestActiveMask:
           expert 1: tokens [0(live), 2(live), 3(live), pad] → [True, True, True, False]
           expert 2: tokens [1(dead), 2(live), pad, pad]     → [False, True, False, False]
 
-        The unpacking_mask at those same slots must remain True — dead tokens still
-        occupy slots and must be tracked by unpack_experts.
+        Dead tokens still occupy transfer slots: transfer_indices.shape[0] == B*N*K
+        regardless of outer token liveness.
         """
         hidden_states, position_ids, selected_heads, num_experts, packed_length = make_example()
         outer_active_mask = torch.tensor([[True, False, True, True]], dtype=torch.bool)
@@ -464,25 +458,21 @@ class TestActiveMask:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
         active_mask = packed["active_mask"]
 
-        expected_unpacking_mask = torch.tensor([[
-            [True, True, True, False],
-            [True, True, True, False],
-            [True, True, False, False],
-        ]])
+        batch_size, sequence_length, num_selected_heads = selected_heads.shape
+        assert transfer_indices.shape[0] == batch_size * sequence_length * num_selected_heads
+
         expected_active_mask = torch.tensor([[
             [True, False, True, False],
             [True, True, True, False],
             [False, True, False, False],
         ]])
-
-        torch.testing.assert_close(unpacking_mask, expected_unpacking_mask)
         torch.testing.assert_close(active_mask, expected_active_mask)
 
     def test_unpacking_mask_cardinality_unchanged_when_outer_tokens_are_dead(self):
-        """Dead outer tokens still occupy packed slots: unpacking_mask.sum() == B*N*K."""
+        """Dead outer tokens still occupy packed slots: transfer_indices.shape[0] == B*N*K."""
         hidden_states, position_ids, selected_heads, num_experts, packed_length = make_example()
         outer_active_mask = torch.tensor([[True, False, True, True]], dtype=torch.bool)
 
@@ -492,10 +482,10 @@ class TestActiveMask:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        _, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        _, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
 
         batch_size, sequence_length, num_selected_heads = selected_heads.shape
-        assert unpacking_mask.sum().item() == batch_size * sequence_length * num_selected_heads
+        assert transfer_indices.shape[0] == batch_size * sequence_length * num_selected_heads
 
     def test_active_mask_cardinality_matches_live_token_count(self):
         """active_mask.sum() must equal the number of live outer tokens times K."""
@@ -517,7 +507,7 @@ class TestActiveMask:
         assert active_mask.sum().item() == num_live_tokens * num_selected_heads
 
     def test_all_live_outer_mask_makes_active_mask_equal_unpacking_mask(self):
-        """When all tokens are live, active_mask must equal unpacking_mask exactly."""
+        """When all tokens are live, active_mask must mark exactly B*N*K slots and be left-justified."""
         hidden_states, position_ids, selected_heads, num_experts, packed_length = make_batch_example()
         outer_active_mask = torch.ones(2, 4, dtype=torch.bool)
 
@@ -527,10 +517,12 @@ class TestActiveMask:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
         active_mask = packed["active_mask"]
 
-        torch.testing.assert_close(active_mask, unpacking_mask)
+        batch_size, sequence_length, num_selected_heads = selected_heads.shape
+        assert active_mask.sum().item() == batch_size * sequence_length * num_selected_heads
+        assert_left_justified(active_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -549,12 +541,12 @@ class TestUnpacking:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
 
         restored = unpack_experts(
             expert_outputs=packed["hidden_states"],
             setup=setup,
-            unpacking_mask=unpacking_mask,
+            flat_packed_transfer_indices=transfer_indices,
             selected_heads=selected_heads,
         )
 
@@ -577,11 +569,11 @@ class TestUnpacking:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
         restored = unpack_experts(
             expert_outputs=packed["hidden_states"],
             setup=setup,
-            unpacking_mask=unpacking_mask,
+            flat_packed_transfer_indices=transfer_indices,
             selected_heads=selected_heads,
         )
 
@@ -602,11 +594,11 @@ class TestUnpacking:
 
         setup = setup_packing(selected_heads)
 
-        packed_a, unpacking_mask_a = pack_experts(
+        packed_a, transfer_indices_a = pack_experts(
             {"hidden_states": (hidden_states, 0.0), "position_ids": (sequential_position_ids, 0), "active_mask": (outer_active_mask, False)},
             setup, selected_heads, num_experts, packed_length,
         )
-        packed_b, unpacking_mask_b = pack_experts(
+        packed_b, transfer_indices_b = pack_experts(
             {"hidden_states": (hidden_states, 0.0), "position_ids": (advanced_position_ids, 0), "active_mask": (outer_active_mask, False)},
             setup, selected_heads, num_experts, packed_length,
         )
@@ -614,13 +606,13 @@ class TestUnpacking:
         restored_a = unpack_experts(
             expert_outputs=packed_a["hidden_states"],
             setup=setup,
-            unpacking_mask=unpacking_mask_a,
+            flat_packed_transfer_indices=transfer_indices_a,
             selected_heads=selected_heads,
         )
         restored_b = unpack_experts(
             expert_outputs=packed_b["hidden_states"],
             setup=setup,
-            unpacking_mask=unpacking_mask_b,
+            flat_packed_transfer_indices=transfer_indices_b,
             selected_heads=selected_heads,
         )
 
@@ -637,15 +629,15 @@ class TestUnpacking:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
 
         expert_outputs = packed["hidden_states"].clone()
-        expert_outputs[~unpacking_mask] = torch.randn_like(expert_outputs[~unpacking_mask])
+        expert_outputs[~packed["active_mask"]] = torch.randn_like(expert_outputs[~packed["active_mask"]])
 
         restored = unpack_experts(
             expert_outputs=expert_outputs,
             setup=setup,
-            unpacking_mask=unpacking_mask,
+            flat_packed_transfer_indices=transfer_indices,
             selected_heads=selected_heads,
         )
 
@@ -658,12 +650,13 @@ class TestUnpacking:
         torch.testing.assert_close(restored, expected)
 
     def test_unpack_uses_unpacking_mask_not_active_mask(self):
-        """Unpacking must use unpacking_mask so dead-token copies are correctly un-scattered.
+        """Unpacking must use the transfer index so dead-token copies are correctly un-scattered.
 
-        With a dead outer token, active_mask has fewer True entries than B*N*K. Passing
-        active_mask to unpack_experts would break the reshape invariant. This test
-        verifies the round-trip succeeds when the outer active mask has a dead token,
-        confirming that unpacking_mask is the correct mask for unpacking.
+        With a dead outer token, active_mask has fewer True entries than B*N*K. Using
+        active_mask to index into the packed frame would produce the wrong number of
+        entries for the inverse permutation reshape. This test verifies the round-trip
+        succeeds when the outer active mask has a dead token, confirming that the
+        transfer index (not active_mask) is the correct unpacking artifact.
         """
         hidden_states, position_ids, selected_heads, num_experts, packed_length = make_example()
         outer_active_mask = torch.tensor([[True, False, True, True]], dtype=torch.bool)
@@ -674,12 +667,12 @@ class TestUnpacking:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
+        packed, transfer_indices = pack_experts(entries, setup, selected_heads, num_experts, packed_length)
 
         restored = unpack_experts(
             expert_outputs=packed["hidden_states"],
             setup=setup,
-            unpacking_mask=unpacking_mask,
+            flat_packed_transfer_indices=transfer_indices,
             selected_heads=selected_heads,
         )
 
@@ -780,14 +773,9 @@ class TestOverflowDetection:
         }
 
         torch._dynamo.reset()
-        original = torch._dynamo.config.capture_scalar_outputs
-        torch._dynamo.config.capture_scalar_outputs = True
-        try:
-            compiled_pack = torch.compile(pack_experts)
-            with pytest.raises(RuntimeError):
-                compiled_pack(entries, setup, selected_heads, num_experts, packed_length=2)
-        finally:
-            torch._dynamo.config.capture_scalar_outputs = original
+        compiled_pack = torch.compile(pack_experts)
+        with pytest.raises(RuntimeError):
+            compiled_pack(entries, setup, selected_heads, num_experts, packed_length=2)
     def test_exact_capacity_succeeds_in_eager_mode(self):
         """pack_experts must allow an expert bucket containing exactly packed_length entries.
 
@@ -829,7 +817,7 @@ class TestOverflowDetection:
             "active_mask": (outer_active_mask, False),
         }
 
-        packed, unpacking_mask = pack_experts(
+        packed, transfer_indices = pack_experts(
             entries,
             setup,
             selected_heads,
@@ -841,11 +829,11 @@ class TestOverflowDetection:
         expected_expert_one_mask = torch.zeros(packed_length, dtype=torch.bool)
 
         torch.testing.assert_close(
-            unpacking_mask[0, 0],
+            packed["active_mask"][0, 0],
             expected_expert_zero_mask,
         )
         torch.testing.assert_close(
-            unpacking_mask[0, 1],
+            packed["active_mask"][0, 1],
             expected_expert_one_mask,
         )
         torch.testing.assert_close(
@@ -909,8 +897,6 @@ class TestCompiledPacking:
 
         fullgraph=True raises immediately if dynamo inserts any graph break, so a
         successful run confirms the entire packing path is traceable end-to-end.
-        capture_scalar_outputs=True is required for the .item() call in the overflow
-        check path to be captured as a SymInt rather than causing a specialization.
         """
         hidden_states, position_ids, selected_heads, num_experts, packed_length = make_example()
         outer_active_mask = torch.ones(1, 4, dtype=torch.bool)
@@ -923,10 +909,5 @@ class TestCompiledPacking:
         }
 
         torch._dynamo.reset()
-        original = torch._dynamo.config.capture_scalar_outputs
-        torch._dynamo.config.capture_scalar_outputs = True
-        try:
-            compiled_pack = torch.compile(pack_experts, fullgraph=True)
-            compiled_pack(entries, setup, selected_heads, num_experts, packed_length)
-        finally:
-            torch._dynamo.config.capture_scalar_outputs = original
+        compiled_pack = torch.compile(pack_experts, fullgraph=True)
+        compiled_pack(entries, setup, selected_heads, num_experts, packed_length)

@@ -102,7 +102,7 @@ class MoSRAHLayer(nn.Module):
             "position_ids": (position_ids, 0),
             "active_mask": (active_mask, False),
         }
-        packed, unpacking_mask = pack_experts(entries, setup, selected_heads, self.num_experts, self.packed_length)
+        packed, unpacking_map = pack_experts(entries, setup, selected_heads, self.num_experts, self.packed_length)
         packed_hidden_states = packed["hidden_states"]
         packed_positions = packed["position_ids"]
         active_mask = packed["active_mask"]
@@ -138,7 +138,7 @@ class MoSRAHLayer(nn.Module):
         token_choice_outputs = unpack_experts(
             expert_outputs=packed_outputs,
             setup=setup,
-            unpacking_mask=unpacking_mask,
+            flat_packed_transfer_indices=unpacking_map,
             selected_heads=selected_heads,
         )
         final_output = (

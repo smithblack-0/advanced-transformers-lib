@@ -345,17 +345,21 @@ class MoSRAHCache(CacheLayerMixin):
     def _check_no_overflow(max_count: torch.Tensor, capacity: int) -> None:
         """Raise if any (batch, head) slot would exceed the static buffer capacity.
 
-        Uses the 19.F.1 pattern: branches on whether the graph is being compiled.
-        In compiled mode, `.item()` folds into the graph when capture_scalar_outputs=True
-        and `torch._check` issues a compile-time assertion. In eager mode, a plain
-        RuntimeError is raised with a descriptive message.
+        Branches on whether the graph is being compiled. In compiled mode,
+        torch._assert_async fires asynchronously on the GPU when the condition
+        tensor is False. In eager mode, a plain RuntimeError is raised with a
+        descriptive message.
 
         Args:
             max_count: Scalar tensor — the maximum post-update count across all slots.
             capacity: The static buffer capacity (mosrah_cache_length).
         """
         if torch.compiler.is_compiling():
-            torch._check(max_count.item() <= capacity)
+            torch._assert_async(
+                max_count <= capacity,
+                "MoSRAHCache overflow: buffer capacity exceeded. "
+                "Increase mosrah_overallocation_factor in ShramConfig.",
+            )
         else:
             if max_count.item() > capacity:
                 raise RuntimeError(

@@ -77,7 +77,7 @@ class MoSRAHRouter(nn.Module):
         self.expert_bias = nn.Parameter(torch.zeros(config.num_mosrah_heads))
 
     @staticmethod
-    def get_mask(
+    def get_best_proposals(
             tensor: torch.Tensor,
             dim: int,
             n: int | torch.Tensor,
@@ -210,7 +210,7 @@ class MoSRAHRouter(nn.Module):
             choices_deficit = (min_choices - accepted_per_token).clamp_min(0)
 
             unproposed_logits = logits.masked_fill(proposals, float('-inf'))
-            new_proposals = cls.get_mask(
+            new_proposals = cls.get_best_proposals(
                 unproposed_logits, dim=-1, n=choices_deficit, capacity_scalar=min_choices,
             )
             proposals = proposals | new_proposals
@@ -221,7 +221,7 @@ class MoSRAHRouter(nn.Module):
             # Acceptances are recomputed from scratch each round so that a
             # stronger new proposal can displace a weaker prior one.
             proposed_logits = logits.masked_fill(~proposals, float('-inf'))
-            acceptances = cls.get_mask(
+            acceptances = cls.get_best_proposals(
                 proposed_logits, dim=-2, n=remaining_capacity, capacity_scalar=capacity_scalar,
             )
 

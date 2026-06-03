@@ -862,7 +862,6 @@ class TestRouterCompileEquivalenceFuzz:
                 "Router torch.compile equivalence is CUDA-only for this suite."
             )
 
-        torch._dynamo.config.capture_scalar_outputs = True
         torch._dynamo.reset()
 
         generator = torch.Generator(device=device)
@@ -1004,7 +1003,7 @@ class TestRouterCompileEquivalenceFuzz:
 
 # Alias the static method so tests call the production code directly without
 # being coupled to the class name in every assertion.
-get_mask = MoSRAHRouter.get_mask
+get_mask = MoSRAHRouter.get_best_proposals
 
 
 def make_tensor(*shape):

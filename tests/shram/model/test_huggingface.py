@@ -375,14 +375,9 @@ class TestUncachedPositionConstraint:
             return x * condition.to(x.dtype)
 
         torch._dynamo.reset()
-        original = torch._dynamo.config.capture_scalar_outputs
-        torch._dynamo.config.capture_scalar_outputs = True
-        try:
-            compiled = torch.compile(_check_wrapper)
-            with pytest.raises(RuntimeError):
-                compiled(torch.tensor(False), torch.ones(1))
-        finally:
-            torch._dynamo.config.capture_scalar_outputs = original
+        compiled = torch.compile(_check_wrapper)
+        with pytest.raises(RuntimeError):
+            compiled(torch.tensor(False), torch.ones(1))
 
     def test_compiled_enforce_accepts_valid_condition(self) -> None:
         """Static method compiled in isolation must not raise when condition is True."""
@@ -392,44 +387,8 @@ class TestUncachedPositionConstraint:
             return x * condition.to(x.dtype)
 
         torch._dynamo.reset()
-        original = torch._dynamo.config.capture_scalar_outputs
-        torch._dynamo.config.capture_scalar_outputs = True
-        try:
-            compiled = torch.compile(_check_wrapper)
-            compiled(torch.tensor(True), torch.ones(1))
-        finally:
-            torch._dynamo.config.capture_scalar_outputs = original
-
-
-# ---------------------------------------------------------------------------
-# capture_scalar_outputs enforcement
-# ---------------------------------------------------------------------------
-
-
-class TestCaptureScalarOutputsEnforcement:
-    """Verify that compiling without capture_scalar_outputs=True raises at compile time."""
-    def test_compiled_without_flag_raises(self) -> None:
-        """Compiling without capture_scalar_outputs must raise at compile time."""
-        torch._dynamo.reset()
-        original = torch._dynamo.config.capture_scalar_outputs
-        torch._dynamo.config.capture_scalar_outputs = False
-        try:
-            compiled = torch.compile(ShramForCausalLM._enforce_capture_scalar_outputs)
-            with pytest.raises(RuntimeError, match="capture_scalar_outputs"):
-                compiled()
-        finally:
-            torch._dynamo.config.capture_scalar_outputs = original
-
-    def test_compiled_with_flag_does_not_raise(self) -> None:
-        """Compiling with capture_scalar_outputs=True must not raise."""
-        torch._dynamo.reset()
-        original = torch._dynamo.config.capture_scalar_outputs
-        torch._dynamo.config.capture_scalar_outputs = True
-        try:
-            compiled = torch.compile(ShramForCausalLM._enforce_capture_scalar_outputs)
-            compiled()
-        finally:
-            torch._dynamo.config.capture_scalar_outputs = original
+        compiled = torch.compile(_check_wrapper)
+        compiled(torch.tensor(True), torch.ones(1))
 
 
 # ---------------------------------------------------------------------------

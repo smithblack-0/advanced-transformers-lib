@@ -106,7 +106,7 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         # Cumulative count of all token positions presented through update() for
         # this cache instance. This is the quantity HuggingFace generation reads
         # through get_seq_length() to track how far along the sequence we are.
-        self._total_processed: int = 0
+        self._total_processed = torch.tensor(0)
 
     def update(  # type: ignore[override]
         self,
@@ -246,7 +246,7 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         generation reads to track sequence progress and is not the same as active-token
         count or current window occupancy.
         """
-        return self._total_processed
+        return int(self._total_processed)
 
     def get_max_cache_shape(self) -> int:
         return self.sliding_window
