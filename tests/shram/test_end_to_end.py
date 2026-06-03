@@ -407,7 +407,7 @@ class TestIntegrationCompiledEval:
             "See https://github.com/pytorch/pytorch/issues/148752"
         ),
     )
-    def test_compiled_eval_labeled_forward(self, device):
+    def     test_compiled_eval_labeled_forward(self, device):
         """Compiled eval+no_grad labeled forward must complete without error."""
         m = ShramForCausalLM(
             small_config(training_sequence_length=128)

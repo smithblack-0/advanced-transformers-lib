@@ -92,7 +92,10 @@ is being achieved, one verified unit at a time.
 - [X] Unit 22.A — fix hacked assertions using torch._assert_async.
 - [X] Unit 22.B — Remove capture_scalar_outputs dependency.
 - [X] Unit 22.C — Expert packing: fixed-shape compact-to-padded transfer.
-- [ ] Unit 22 — Final audit
+- [X] Unit 23.A — Compiled inference-style execution: eval, no_grad, mixed-precision coverage
+- [X] Unit 23.B — Fix position ID resolution: replace cumsum with arange + active-token bias
+- [X] Unit 23.C — Documentation: compile-mode constraints and minor documentation gaps
+- [ ] Unit 24 — Final Audit
 
 ---
 
@@ -2777,7 +2780,7 @@ Fix graph breaks in the compiled backward pass by replacing the boolean mask-bas
 
 Forward passes through the compiled model currently succeed. Backward passes do not: the boolean mask assignment used to transfer the compact expert-major stream into the padded tensor exposes a data-dependent shape to the compiler. Even though the system guarantees exactly B×N×K selected entries by invariant, the compiler sees the selected dimension as depending on mask contents and cannot trace through it cleanly in the backward pass.
 
-The correct fix is a coordinate-space transformation: compute an integer index that maps each compact-stream position to its padded destination, then use scatter and gather on that index. The index values depend on routing, but the index shape is fixed by B, N, K, num_experts, and packed_length — all statically known at trace time. This is the distinction the compiler needs.
+The correct fix is a coordinate-space transformation: compute an integer index that maps each compact-stream position to its padded destination, then use scatter and gather on that index. The index values depend on routing, but the index shape is fixed by B, N, K, num_experts, and packed_len2gth — all statically known at trace time. This is the distinction the compiler needs.
 
 Keeping the boolean mask as the transfer mechanism and adding assertions or static-shape hints was rejected. Such workarounds carry no semantic guarantee to the compiler and do not address the root cause.
 
@@ -2820,7 +2823,90 @@ The `output_size` parameter on `repeat_interleave` is what fixes the output shap
 
 
 
-### Unit 23 — Final Audit
+### Unit 23.A — Compiled inference-style execution: eval, no_grad, mixed-precision coverage
+
+**Responsibility:** Add a dedicated test class that exercises the compiled model under inference-style execution contexts — eval mode, no_grad, and fp16 autocast — where an observed production Inductor failure occurs and the current suite provides no coverage.
+
+**Context of Correctness:**
+
+`TestIntegrationCompilable` covers compilation under training-style contexts (train+grad uncached forward, compiled generate). A production failure was observed under eval+no_grad+fp16 autocast: `InductorError: LoweringException: AssertionError: convert FlexibleLayout to FixedLayout first` at the FlexAttention boundary. These three contexts are qualitatively distinct from what is currently tested. In training mode with gradients, Inductor's fusion and layout finalization may incidentally produce FixedLayout tensors before reaching FlexAttention. In eval+no_grad, with no autograd graph to guide fusion, tensors produced by view+transpose+RoPE may remain FlexibleLayout all the way to FlexAttention lowering, triggering the assertion. Under fp16 autocast, dtype casting changes the operation sequence Inductor sees, potentially altering layout finalization order. None of these contexts are covered. A compile test suite that cannot detect a production Inductor failure at a known code site is not providing the coverage it claims.
+
+**Invariants:**
+
+1. A test class exists whose sole responsibility is the compiled model under inference-style execution contexts (eval, no_grad, mixed precision).
+2. The class contains a test that compiles the model, runs it in eval+no_grad mode with labels and `use_cache=False`, and completes without error.
+3. The class contains a test that compiles the model, runs it in eval+no_grad mode under fp16 autocast with labels and `use_cache=False`, and completes without error.
+4. The class contains a test verifying compiled eval output matches eager eval output on identical inputs.
+5. All tests use batch ≥ 2 and sequence length ≥ 128, with at least one attention_mask row shorter than the sequence dimension, exercising mixed-padding code paths.
+6. All tests use the `device` fixture (CUDA skipif), consistent with the existing suite.
+
+**Tests that certify them:**
+
+- `test_compiled_eval_labeled_forward` — compiled eval+no_grad, batch=4, seq=128, mixed-length attention_mask, labels, `use_cache=False`
+- `test_compiled_eval_autocast_labeled_forward` — same under `torch.amp.autocast("cuda", dtype=torch.float16)`
+- `test_compiled_eval_matches_eager` — eager eval and compiled eval on the same inputs produce identical outputs
+
+**Preliminary implementation strategy:**
+
+New class `TestIntegrationCompiledEval` in `test_end_to_end.py`, adjacent to `TestIntegrationCompilable`. A module-level helper constructs a synthetic batch: batch=4, seq=128, attention_mask with rows of varied active lengths (e.g. [128, 100, 75, 128]). `torch._dynamo.reset()` between compiled and eager variants to prevent graph caching from hiding mode distinctions. The reproduction tests are expected to fail on the unpatched codebase — that failure confirms we have correctly identified the failure surface. Passing after the fix is the regression gate.
+
+**Closure note:** All three tests in `TestIntegrationCompiledEval` reproduced the `InductorError: convert FlexibleLayout to FixedLayout first` at the FlexAttention boundary under compiled eval+no_grad and compiled eval+autocast. Issue confirmed. Fix (`.contiguous()` on q/k/v before `flex_attention`) is the next unit.
+
+---
+
+### Unit 23.B — Fix position ID resolution: replace cumsum with arange + active-token bias
+
+**Responsibility:** Replace the cumsum-based position ID computation in `_resolve_current_position_ids` with a fresh-allocation `arange`-based approach, and install `ShramCache.total_active_tokens` to supply the per-batch active-token offset needed for correct cached-inference positions.
+
+**Context of Correctness:**
+
+An `InductorError: convert FlexibleLayout to FixedLayout first` was observed under compiled eval+no_grad and fp16 autocast contexts. The source was identified as `_resolve_current_position_ids`: position IDs were computed via `cumsum(dim=-1)` over the full attention mask and sliced with `[:, -current_length:]`, producing a non-contiguous stride-based view that Inductor encountered when tracing the `_make_block_mask` closure. `cumsum`-based position computation with a trailing slice cannot be used in a compiled model.
+
+The SHRAM masking contract guarantees that within any single sequence, active tokens are left-justified — all active positions precede all padding positions. Cross-batch variation in sequence length is permitted, so different batch items may have different active lengths. Under this contract, the count of active tokens seen by a batch item across all prior forward passes equals its next available position index. This leaves room for a solution: any mechanism that produces a fresh contiguous allocation and biases a per-batch arange by the prior active-token count satisfies the positional contract for both training and inference.
+
+Accumulating a per-batch active token count on the cache and reading it as the position bias each step is simpler and faster than alternatives such as one-hot sums or scatter-based position reconstruction. The uncached training path uses a zero bias directly. The count tensor must be pre-allocated at cache construction time and updated in-place each step; CUDAGraph captures a fixed memory graph after the first traced step and new tensor allocations in subsequent steps fall outside it.
+
+**Invariants:**
+
+1. `_resolve_current_position_ids` does not use `cumsum`. All tensors it produces are fresh contiguous allocations, not views.
+2. For uncached calls, token at index i in batch item b receives position i if active, 0 if inactive.
+3. For cached calls, token at index i in batch item b receives position (prior_active_count_b + i) if active, 0 if inactive, where prior_active_count_b is the total count of active tokens seen by batch item b across all prior forward passes through this cache.
+4. `ShramCache.total_active_tokens(active_mask)` returns the per-batch active token count accumulated before this call, then updates the internal count to accurately reflect the active tokens in `active_mask`.
+5. All counter tensors on cache objects are updated in-place. Creating new tensors for counter state is not permitted; all counter mutations operate on pre-allocated buffers via in-place operations.
+6. `_active_token_counts` is pre-allocated in `ShramCache.__init__` as zeros with shape `(B,)`, on the same device as other cache tensors, where B is the batch size passed at construction.
+7. `ShramCache.reset()` zeroes `_active_token_counts` in-place and delegates to `super().reset()` to reset all layer caches.
+8. `TestIntegrationCompiledEval` passes in full: compiled eval, compiled eval+autocast, and compiled eval matches eager.
+
+**Tests:** The three tests in `TestIntegrationCompiledEval` are the end-to-end regression gate. Unit tests for `total_active_tokens` must cover: returns zero on first call, returns correct pre-update count on subsequent calls, accumulates independently per batch item, and resets to zero after `reset()`.
+
+**Preliminary implementation strategy:** Add `_active_token_counts` buffer and `total_active_tokens` method to `ShramCache`. Override `reset()` to zero the buffer in-place before calling `super().reset()`. Rewrite `_resolve_current_position_ids` in `huggingface.py` to accept the optional cache; when cache is present call `total_active_tokens` for the bias, otherwise use zero; build positions from `arange` offset by the per-batch bias. Pass the cache through at the call site in `forward`.
+
+---
+
+### Unit 23.C — Documentation: compile-mode constraints and minor documentation gaps
+
+**Responsibility:** Document that `torch.compile(dynamic=True)` is architecturally excluded from SHRAM, and close any minor documentation gaps identified during Unit 23.B implementation.
+
+**Context of Correctness:**
+
+SHRAM uses token-choice routing whose output — the expert selection indices — is data, not shape. Under `dynamic=True`, torch.compile treats tensor dimensions symbolically and propagates those symbols through traced operations. Routing indices keyed on `selected_heads` values would become symbolic, making every scatter and gather operation that uses them shape-dependent. This is not a limitation waiting to be lifted; the architecture is structurally incompatible with dynamic-shape tracing. A user or maintainer who attempts `torch.compile(dynamic=True)` will encounter confusing trace failures with no indication of the underlying reason unless the constraint is stated explicitly.
+
+The compile test suite had historically used `dynamic=True` for the `generate()` path on the assumption that varying decode-step lengths require it. This was incorrect: the cached single-token decode path is always length-1 and `dynamic=False` is appropriate and correct there too. That error is corrected as a background bug fix; this unit records the constraint in documentation so the error cannot recur.
+
+**Invariants:**
+
+1. `documentation.md` states that `dynamic=True` is architecturally excluded, gives the reason (routing indices are data, not shape), and distinguishes this from the supported `torch.compile(dynamic=False)` and `fullgraph=True` paths.
+2. `model/README.md` includes a compile compatibility note visible to Hub users: `torch.compile` is supported with `dynamic=False`; `dynamic=True` is not supported and will produce trace errors.
+3. Both documentation surfaces are accurate and do not contradict each other.
+4. Any minor documentation gaps identified during Unit 23.B that fall below the threshold of their own plan entry are also closed here.
+
+**Tests:** Documentation content is the artifact. No code tests.
+
+**Preliminary implementation strategy:** Add a "Compile compatibility" subsection to the Important Notes area of `documentation.md` and a corresponding note to `model/README.md`. Keep both brief — the constraint statement and its one-sentence reason are sufficient.
+
+---
+
+### Unit 24 — Final Audit
 
 **What:** Review every audit note in plan.md and, if not overridden, ensure compliance. Crosscheck with papers/main.tex and verify whether or not paper is still complaint.
 

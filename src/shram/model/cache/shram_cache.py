@@ -36,6 +36,13 @@ class ShramCache(Cache):
     layer have materially different update semantics; callers must update sub-caches directly
     via cache.layers[layer_idx].sliding_window_cache or cache.layers[layer_idx].mosrah_cache.
 
+    ShramCache also tracks per-batch cumulative active token counts via
+    ``_active_token_counts``. ``total_active_tokens(active_mask)`` returns the accumulated
+    count before the current step and updates the buffer in-place; the caller uses this as a
+    per-batch position bias for contiguous arange-based position ID resolution. All counter
+    updates are in-place to satisfy CUDAGraph fixed-memory requirements. ``reset()``
+    zeroes the buffer along with all layer caches.
+
     Args:
         config: ShramConfig instance. All layer counts, buffer sizes, and sub-cache
             dimensions are derived from config so that a single source of truth governs
@@ -62,17 +69,59 @@ class ShramCache(Cache):
         ]
         super().__init__(layers=layers)
 
+        # Active token counter for position ID resolution (Unit 23.B). Pre-allocated
+        # at construction so all updates remain in-place across forward passes,
+        # satisfying CUDAGraph fixed-memory requirements.
+        self._active_token_counts: torch.Tensor = torch.zeros(
+            batch_size, dtype=torch.long, device=device
+        )
+
     # ---------------------------------------------------------------------------
     # Cache — composite-meaningful methods
     # ---------------------------------------------------------------------------
     #
-    # reset(): Inherited. Iterates all layer caches and calls reset() on each.
+    # reset(): Overridden. Zeroes _active_token_counts in-place, then delegates to
+    #   the inherited implementation to reset all layer caches.
     #
     # reorder_cache(beam_idx): Inherited. Iterates all layer caches and reorders each.
     #
     # is_initialized: Inherited property. True iff all layer caches are initialized.
     #   Since ShramLayerCache.is_initialized is True from construction, this is True
     #   immediately after ShramCache.__init__ returns.
+
+    def total_active_tokens(self, active_mask: torch.BoolTensor) -> torch.Tensor:
+        """Return the per-batch accumulated active token count before this step, then update.
+
+        Reads the current per-batch accumulated count as a position bias for the caller,
+        then increments the internal counter in-place by the number of active tokens in
+        ``active_mask`` for each batch item. The pre-update count is returned so the
+        caller can offset an arange-based position tensor to the correct starting position
+        for this forward pass.
+
+        All updates are in-place to satisfy CUDAGraph fixed-memory requirements. The
+        counter persists across forward passes until ``reset()`` is called.
+
+        Args:
+            active_mask: Boolean mask of shape ``(B, N)`` for the current forward step,
+                where True marks an active (non-padding) token position.
+
+        Returns:
+            Integer tensor of shape ``(B,)`` — the accumulated count before this update.
+        """
+        prior_counts = self._active_token_counts.clone()
+        self._active_token_counts.add_(active_mask.sum(dim=-1))
+        return prior_counts
+
+    def reset(self) -> None:
+        """Clear all layer caches and reset the active token counter.
+
+        Zeroes ``_active_token_counts`` in-place, then delegates to the inherited
+        implementation to reset all ShramLayerCache instances. In-place mutation of
+        the counter is required for CUDAGraph compatibility — the buffer must remain
+        at the same memory address across steps.
+        """
+        self._active_token_counts.zero_()
+        super().reset()
 
     def get_seq_length(self, layer_idx: int = 0) -> int:  # type: ignore[override]
         """Return the cumulative sequence length for the specified layer.

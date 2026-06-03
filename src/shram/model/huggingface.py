@@ -407,19 +407,49 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
         return attention_mask.to(dtype=torch.bool)
 
     def _resolve_current_position_ids(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor | None,
-        full_attention_mask: torch.BoolTensor,
+            self,
+            input_ids: torch.Tensor,
+            position_ids: torch.Tensor | None,
+            current_active_mask: torch.BoolTensor,
+            cache: ShramCache | None,
     ) -> torch.LongTensor:
-        """Resolve concrete current-step position IDs for the backbone."""
+        """Resolve concrete current-step position IDs for the backbone.
+
+        Builds a fresh contiguous allocation via arange + per-batch bias. No cumsum
+        or stride-based views are produced; the returned tensor is always a new
+        allocation safe for Inductor tracing at the FlexAttention boundary.
+
+        When a cache is present, ``total_active_tokens()`` provides the per-batch
+        accumulated active token count as a position bias. Uncached calls use a zero
+        bias. In both cases positions are ``bias + arange(current_length)``, with
+        inactive positions masked to 0.
+
+        Args:
+            input_ids: Current token IDs of shape ``(B, N)``.
+            position_ids: Explicit positions if supplied by the caller; returned
+                unchanged (cast to long). Bias computation is skipped entirely.
+            current_active_mask: Boolean mask of shape ``(B, N)`` for the current step.
+            cache: Active ``ShramCache``, or ``None`` for uncached forward passes.
+
+        Returns:
+            Long tensor of shape ``(B, N)`` — position index per token, 0 for inactive.
+        """
         if position_ids is not None:
             return position_ids.to(dtype=torch.long)
 
-        full_position_ids = full_attention_mask.to(dtype=torch.long).cumsum(dim=-1) - 1
-        full_position_ids = full_position_ids.masked_fill(~full_attention_mask, 0)
         current_length = input_ids.shape[1]
-        return full_position_ids[:, -current_length:]
+
+        if cache is not None:
+            position_bias = cache.total_active_tokens(current_active_mask)
+        else:
+            position_bias = torch.zeros(
+                input_ids.shape[0], dtype=torch.long, device=input_ids.device
+            )
+
+        positions = position_bias.unsqueeze(1) + torch.arange(
+            current_length, device=input_ids.device, dtype=torch.long
+        )
+        return positions.masked_fill(~current_active_mask, 0)
 
     def forward(
         self,
@@ -524,12 +554,13 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
         )
         current_length: int = input_ids.shape[1]
         current_active_mask: torch.BoolTensor = full_attention_mask[:, -current_length:]
+        shram_cache: ShramCache | None = past_key_values if use_cache else None
         current_position_ids: torch.LongTensor = self._resolve_current_position_ids(
             input_ids=input_ids,
             position_ids=position_ids,
-            full_attention_mask=full_attention_mask,
+            current_active_mask=current_active_mask,
+            cache=shram_cache,
         )
-        shram_cache: ShramCache | None = past_key_values if use_cache else None
 
         if shram_cache is None:
             positions_start_sane = torch.all(current_position_ids[:, 0] == 0)

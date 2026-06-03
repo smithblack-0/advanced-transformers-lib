@@ -83,6 +83,10 @@ A few SHRAM settings are easier to understand in terms of their relationships wi
 
 Ordinary generation modes are intended to work almost completely flawlessly. Greedy, beam, and contrastive paths are explicitly tested. The main caveat worth documenting at the user level is that speculative rollback through `crop()` is not supported due to the use of a sliding-window cache structure.
 
+#### Compile compatibility
+
+`torch.compile` is supported with `dynamic=False` (the default) and `fullgraph=True`. `dynamic=True` is architecturally excluded and will produce trace errors: SHRAM's token-choice routing produces expert selection indices that are data, not shapes, and dynamic-shape tracing would treat them as symbolic shape values, making every scatter and gather operation data-dependent on shape. This is not a limitation waiting to be lifted — the architecture is structurally incompatible with dynamic-shape tracing.
+
 ### Config reference
 
 This is the control surface. It is written so you do not need to open `configuration.py` just to understand what the fields do.
