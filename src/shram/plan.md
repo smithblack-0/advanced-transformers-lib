@@ -95,6 +95,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 23.A — Compiled inference-style execution: eval, no_grad, mixed-precision coverage
 - [X] Unit 23.B — Fix position ID resolution: replace cumsum with arange + active-token bias
 - [X] Unit 23.C — Documentation: compile-mode constraints and minor documentation gaps
+- [ ] Unit 23.D — Router diagnostics: refactor return signature + add load-balance health scalars
 - [ ] Unit 24 — Final Audit
 
 ---
@@ -2903,6 +2904,48 @@ The compile test suite had historically used `dynamic=True` for the `generate()`
 **Tests:** Documentation content is the artifact. No code tests.
 
 **Preliminary implementation strategy:** Add a "Compile compatibility" subsection to the Important Notes area of `documentation.md` and a corresponding note to `model/README.md`. Keep both brief — the constraint statement and its one-sentence reason are sufficient.
+
+---
+
+### Unit 23.D — Router diagnostics: refactor return signature + add load-balance health scalars
+
+**Responsibility:** Refactor `MoSRAHRouter.forward` to return routing decisions and routing diagnostics as structurally separated outputs, and add load-balance diagnostic scalars that characterize the load-balance mechanism rather than its outcome.
+
+**Context of Correctness:**
+
+Load balancing is failing and the cause is unknown. `max_vio` measures post-selection frequency imbalance — an outcome. Outcome metrics cannot distinguish cause: the same imbalanced routing frequencies are equally consistent with a bias signal that is absent, correctly sized, or overcorrecting. The load-balance mechanism operates by adding `expert_bias` to raw routing logits `xW_r`; failure has two distinct mechanical signatures — insufficient signal (bias too small to redirect routing) and excessive or misdirected signal (bias dominating or reinforcing preferences rather than correcting them). These require opposite interventions and are not distinguishable from frequencies.
+
+The router output currently conflates routing decisions (`selected_heads`, `routing_probs`) with routing feedback (`load_balance_loss`, `max_vio`). Decisions drive downstream computation; feedback informs training and monitoring. These are structurally distinct roles. A return signature that does not reflect this distinction cannot be extended with additional feedback values without losing caller interpretability.
+
+**Invariants:**
+
+1. The router exposes diagnostic feedback sufficient to determine whether the load-balance signal is too weak or too aggressive relative to the routing logit scale, without consulting post-selection routing frequencies.
+2. The diagnostic feedback enables determining whether the bias signal is opposing the routing preference direction (healthy correction) or reinforcing it (runaway feedback).
+3. Routing decisions and routing diagnostics are structurally separated in the router's return — a caller can inspect diagnostic values without decomposing the routing internals.
+4. All diagnostic feedback values carry no gradients. `load_balance_loss` retains its gradient.
+5. Diagnostic values are aggregated from per-layer router outputs to model-level scalars and exposed as fields on `ShramCausalLMOutput`. `load_balance_loss` and `max_vio` preserve their existing aggregation (sum and max respectively).
+6. `selected_heads`, `routing_probs`, `load_balance_loss`, and `max_vio` are numerically identical to their pre-refactor values.
+
+**Tests:**
+
+- Router unit: `load_balance_loss` has grad, all diagnostic scalars do not; diagnostic values have correct ranges; when `expert_bias = 0`, bias magnitude scalar equals zero and combined-logit spread equals raw-logit spread; when bias is constructed to oppose logits, alignment scalar is negative; when bias is constructed to reinforce logits, alignment scalar is positive.
+- Integration: model-level diagnostic scalars equal the per-layer mean across all decoder layers.
+- Regression: existing router tests for `selected_heads`, `routing_probs`, `load_balance_loss`, and `max_vio` pass unchanged.
+
+**Preliminary implementation strategy:**
+
+*Return signature refactoring.* `MoSRAHRouter.forward` currently returns a 4-tuple that conflates decisions and feedback. The proposed structure is `(selected_heads, routing_probs, router_diagnostics)` where `router_diagnostics` is a `dict[str, torch.Tensor]`. This groups all feedback values under a single named container, making the decision/diagnostic boundary explicit at the call site and allowing new diagnostic scalars to be added without changing the positional tuple structure. Keys: `load_balance_loss`, `max_vio`, `bias_std`, `raw_logit_std`, `logit_std`, `bias_alignment`.
+
+*Diagnostic scalars.* Four scalars are proposed to satisfy invariants 1 and 2. All four are computed immediately after `logits = self.routing_projection(x)` and before `balance_capacity` (capacity masking injects `-1e8` sentinels that corrupt std and cosine similarity):
+
+- `bias_std`: `expert_bias.std().detach()`. Std of the `(L,)` bias vector. Near-zero means corrections have not built up (too weak); large means corrections are significant. Interpreted relative to `raw_logit_std`.
+- `raw_logit_std`: mean over `(B, N)` of per-token `logits.std(dim=-1)`, detached. Natural routing preference scale — the reference baseline.
+- `logit_std`: mean over `(B, N)` of per-token `(logits + expert_bias).std(dim=-1)`, detached. Combined signal spread. Lower than `raw_logit_std` indicates the bias is flattening preferences (healthy); higher indicates amplification.
+- `bias_alignment`: mean cosine similarity of `expert_bias` `(L,)` against `logits` `(B, N, L)` per token, averaged over `(B, N)`, detached. Range `[-1, 1]`. Negative: bias opposes routing direction (healthy correction). Positive: runaway feedback.
+
+*Threading and aggregation.* Update call sites through `MoSRAH` → `ShramHybridLayer` → `ShramModel` to pass `router_diagnostics` through. `ShramModel` accumulates one dict per layer and reduces: sum for `load_balance_loss`, max for `max_vio`, mean for all four new scalars.
+
+*Output.* Add `bias_std`, `raw_logit_std`, `logit_std`, `bias_alignment` as fields on `ShramCausalLMOutput`.
 
 ---
 
