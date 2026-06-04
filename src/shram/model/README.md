@@ -10,7 +10,7 @@ tags:
 - sparse-attention
 - mixture-of-experts
 ---
-
+ 
 # SHRAM — Sparse Hybrid Token Routed Attention Mixture
 
 A research baseline implementing the SHRAM architecture from "An Examination of Sparse
