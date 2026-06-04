@@ -306,7 +306,7 @@ class MoSRAHRouter(nn.Module):
         x: torch.Tensor,
         active_mask: torch.Tensor,
         used_capacity: torch.Tensor | None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Route input tokens to K expert heads each and compute routing probabilities.
 
         Args:
@@ -315,17 +315,23 @@ class MoSRAHRouter(nn.Module):
                 True means the token is semantically live. Dead tokens do not
                 contribute to routing frequencies, load_balance_loss, or max_vio.
             used_capacity: Used for capacity management during inference, missing during training.
+
         Returns:
             selected_heads: Head indices I of shape (batch, seq_len, num_selected_heads).
                 Each token's K selected head indices, determined by TopK on biased scores.
             routing_probs: Routing probabilities P of shape (batch, seq_len,
                 num_selected_heads). Gathered from unbiased scores at selected_heads
                 indices and renormalized to sum to 1 per token.
-            load_balance_loss: Scalar load balance imbalance loss for this forward pass.
-                Training loop scales this by a weight and adds it to the main loss.
-            max_vio: Detached scalar routing-imbalance summary for this forward pass.
-                Equal to L · max_l(f_l − 1/L). Zero means perfect balance. Not a loss;
-                never contributes gradients.
+            router_diagnostics: Dict of routing feedback scalars. Keys:
+                - ``load_balance_loss``: scalar load-balance loss with gradient.
+                - ``max_vio``: detached scalar routing-imbalance summary.
+                - ``bias_std``: std of expert_bias; near-zero means corrections have not built up.
+                - ``raw_logit_std``: mean per-token std of unbiased logits; the natural routing scale.
+                - ``logit_std``: mean per-token std of (logits + expert_bias); lower than
+                  raw_logit_std means bias is flattening preferences (healthy correction).
+                - ``bias_alignment``: mean cosine similarity of expert_bias against per-token
+                  logits. Negative means bias opposes routing direction (healthy correction);
+                  positive means runaway reinforcement.
         """
         B, N, _ = x.shape
         L = self.num_mosrah_heads
@@ -334,6 +340,17 @@ class MoSRAHRouter(nn.Module):
         # Unbiased routing scores R = Softmax(xW_r). These are the scores used to
         # compute routing_probs — expert_bias must not influence them.
         logits = self.routing_projection(x)                    # (B, N, L)
+
+        # Diagnostic scalars characterising the load-balance mechanism. Must be
+        # computed here — before balance_capacity injects -1e8 sentinels that
+        # would corrupt std and cosine similarity.
+        bias_std = self.expert_bias.std().detach()
+        raw_logit_std = logits.std(dim=-1).mean().detach()
+        logit_std = (logits + self.expert_bias).std(dim=-1).mean().detach()
+        bias_alignment = F.cosine_similarity(
+            logits, self.expert_bias.expand_as(logits), dim=-1
+        ).mean().detach()
+
         routing_scores = F.softmax(logits, dim=-1)             # R, (B, N, L)
 
         # Biased routing scores R̂ = Softmax(xW_r + b). Used only for TopK head
@@ -389,7 +406,15 @@ class MoSRAHRouter(nn.Module):
         # L · max_l(f_l − 1/L) applied to routing_freqs. Must not contribute gradients.
         max_vio = self._compute_max_vio(routing_freqs, L)
 
-        return selected_heads, routing_probs, load_balance_loss, max_vio
+        router_diagnostics = {
+            "load_balance_loss": load_balance_loss,
+            "max_vio": max_vio,
+            "bias_std": bias_std,
+            "raw_logit_std": raw_logit_std,
+            "logit_std": logit_std,
+            "bias_alignment": bias_alignment,
+        }
+        return selected_heads, routing_probs, router_diagnostics
 
     @staticmethod
     def _compute_max_vio(routing_freqs: torch.Tensor, num_heads: int) -> torch.Tensor:

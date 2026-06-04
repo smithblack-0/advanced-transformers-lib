@@ -33,8 +33,9 @@ class MoSRAHLayer(nn.Module):
 
     The MoSRAH path consumes model-space hidden states together with
     authoritative per-token positions and returns the model-space sparse-path
-    contribution, the router's load-balance loss, and the router's MaxVio
-    routing-imbalance scalar.
+    contribution and a diagnostics dict from the router containing
+    load-balance loss, routing-imbalance scalar, and load-balance health
+    scalars.
     """
 
     def __init__(self, config: ShramConfig) -> None:
@@ -59,7 +60,7 @@ class MoSRAHLayer(nn.Module):
         position_ids: torch.Tensor,
         active_mask: torch.Tensor,
         cache: MoSRAHCache | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Run the full MoSRAH sparse path.
 
         Args:
@@ -75,9 +76,10 @@ class MoSRAHLayer(nn.Module):
 
         Returns:
             sparse_output: Model-space sparse-path output of shape (B, N, d).
-            load_balance_loss: Scalar router load-balance loss.
-            max_vio: Detached scalar routing-imbalance summary. Passed through
-                unchanged from the router; see MoSRAHRouter for semantics.
+            router_diagnostics: Dict of router feedback scalars. Keys:
+                ``load_balance_loss`` (has grad), ``max_vio``, ``bias_std``,
+                ``raw_logit_std``, ``logit_std``, ``bias_alignment`` (all
+                detached). See MoSRAHRouter for semantics.
         """
 
         # -------------------------------------------------------------------
@@ -92,7 +94,7 @@ class MoSRAHLayer(nn.Module):
         # active_mask is rebound to the packed form after this point.
         # -------------------------------------------------------------------
         used_capacity = cache.get_heads_lengths() if cache is not None else None
-        selected_heads, routing_probs, load_balance_loss, max_vio = self.router(
+        selected_heads, routing_probs, router_diagnostics = self.router(
             hidden_states, active_mask, used_capacity
         )
 
@@ -145,4 +147,4 @@ class MoSRAHLayer(nn.Module):
             token_choice_outputs * routing_probs.unsqueeze(-1)
         ).sum(dim=2)
 
-        return final_output, load_balance_loss, max_vio
+        return final_output, router_diagnostics

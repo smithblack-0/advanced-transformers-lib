@@ -16,6 +16,13 @@ Invariants verified:
 - dead outer tokens do not affect load_balance_loss
 - dead outer tokens do not affect max_vio
 - all-live active_mask gives routing frequencies equivalent to the pre-masking formula
+- router_diagnostics separates routing decisions from routing feedback
+- load_balance_loss has gradient; all other diagnostic scalars are detached
+- bias_std is zero when expert_bias is zero
+- logit_std equals raw_logit_std when expert_bias is zero
+- bias_alignment is negative when expert_bias opposes routing logit direction
+- bias_alignment is positive when expert_bias reinforces routing logit direction
+- compiled and eager router diagnostics are numerically identical
 """
 
 import math
@@ -90,7 +97,7 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        selected_heads, _, _, _ = router(x, active_mask, None)
+        selected_heads, _, _ = router(x, active_mask, None)
         assert selected_heads.shape == (2, 8, config.num_selected_heads)
 
     def test_routing_probs_shape(self):
@@ -99,7 +106,7 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, routing_probs, _, _ = router(x, active_mask, None)
+        _, routing_probs, _ = router(x, active_mask, None)
         assert routing_probs.shape == (2, 8, config.num_selected_heads)
 
     def test_load_balance_loss_is_scalar(self):
@@ -108,7 +115,8 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, load_balance_loss, _ = router(x, active_mask, None)
+        _, _, diagnostics = router(x, active_mask, None)
+        load_balance_loss = diagnostics["load_balance_loss"]
         assert load_balance_loss.shape == ()
 
     def test_max_vio_is_scalar(self):
@@ -117,7 +125,8 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, _, max_vio = router(x, active_mask, None)
+        _, _, diagnostics = router(x, active_mask, None)
+        max_vio = diagnostics["max_vio"]
         assert max_vio.shape == ()
 
 
@@ -133,7 +142,7 @@ class TestRoutingProbabilities:
         router = MoSRAHRouter(config)
         x = torch.randn(3, 10, 64)
         active_mask = torch.ones(3, 10, dtype=torch.bool)
-        _, routing_probs, _, _ = router(x, active_mask, None)
+        _, routing_probs, _ = router(x, active_mask, None)
         token_sums = routing_probs.sum(dim=-1)
         assert torch.allclose(token_sums, torch.ones_like(token_sums), atol=1e-5)
 
@@ -143,7 +152,7 @@ class TestRoutingProbabilities:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, routing_probs, _, _ = router(x, active_mask, None)
+        _, routing_probs, _ = router(x, active_mask, None)
         assert (routing_probs >= 0).all()
 
     def test_routing_probs_use_unbiased_scores(self):
@@ -159,7 +168,7 @@ class TestRoutingProbabilities:
         active_mask = torch.ones(2, 8, dtype=torch.bool)
 
         with torch.no_grad():
-            selected_heads, routing_probs, _, _ = router(x, active_mask, None)
+            selected_heads, routing_probs, _ = router(x, active_mask, None)
 
             # Recompute unbiased scores without going through the router's full forward
             logits = router.routing_projection(x)
@@ -181,7 +190,7 @@ class TestSelectedHeads:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        selected_heads, _, _, _ = router(x, active_mask, None)
+        selected_heads, _, _ = router(x, active_mask, None)
         assert (selected_heads >= 0).all()
         assert (selected_heads < config.num_mosrah_heads).all()
 
@@ -195,7 +204,7 @@ class TestSelectedHeads:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        selected_heads, _, _, _ = router(x, active_mask, None)
+        selected_heads, _, _ = router(x, active_mask, None)
         B, N, K = selected_heads.shape
         for b in range(B):
             for n in range(N):
@@ -218,7 +227,7 @@ class TestBiasInfluencesSelectionOnly:
         with torch.no_grad():
             router.expert_bias.zero_()
             router.expert_bias[0] = 100.0
-            selected_heads, _, _, _ = router(x, active_mask, None)
+            selected_heads, _, _ = router(x, active_mask, None)
 
         # Head 0 must be selected for every token when its bias is enormous.
         assert (selected_heads == 0).any(dim=-1).all()
@@ -238,7 +247,7 @@ class TestBiasInfluencesSelectionOnly:
         with torch.no_grad():
             router.expert_bias.zero_()
             router.expert_bias[0] = 100.0
-            selected_heads, routing_probs, _, _ = router(x, active_mask, None)
+            selected_heads, routing_probs, _ = router(x, active_mask, None)
 
             logits = router.routing_projection(x)
             unbiased = torch.softmax(logits, dim=-1)
@@ -259,7 +268,8 @@ class TestGradients:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, load_balance_loss, _ = router(x, active_mask, None)
+        _, _, diagnostics = router(x, active_mask, None)
+        load_balance_loss = diagnostics["load_balance_loss"]
         load_balance_loss.backward()
 
         assert router.expert_bias.grad is not None
@@ -272,12 +282,115 @@ class TestGradients:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, load_balance_loss, _ = router(x, active_mask, None)
+        _, _, diagnostics = router(x, active_mask, None)
+        load_balance_loss = diagnostics["load_balance_loss"]
         load_balance_loss.backward()
 
         # At initialization with zero biases and random weights the routing will be
         # imperfectly balanced, so at least one head's gradient should be non-zero.
         assert router.expert_bias.grad.abs().sum().item() > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Router diagnostics
+# ---------------------------------------------------------------------------
+
+class TestRouterDiagnostics:
+    """Tests for the router_diagnostics dict returned from MoSRAHRouter.forward.
+
+    Verifies that routing decisions and routing feedback are structurally
+    separated, that gradients flow only through load_balance_loss, and that
+    the four load-balance health scalars have the correct relationships.
+    """
+
+    def test_load_balance_loss_has_gradient(self):
+        """load_balance_loss must retain its gradient; it is the training signal."""
+        config = small_config()
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, 64)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+        _, _, diagnostics = router(x, active_mask, None)
+        assert diagnostics["load_balance_loss"].requires_grad
+
+    def test_diagnostic_scalars_are_detached(self):
+        """All diagnostic scalars except load_balance_loss must be detached."""
+        config = small_config()
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, 64)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+        _, _, diagnostics = router(x, active_mask, None)
+        for key in ("max_vio", "bias_std", "raw_logit_std", "logit_std", "bias_alignment"):
+            assert not diagnostics[key].requires_grad, (
+                f"diagnostic scalar '{key}' must be detached but requires_grad is True"
+            )
+
+    def test_bias_std_zero_when_bias_zero(self):
+        """bias_std must be zero when expert_bias is the zero vector."""
+        config = small_config()
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, 64)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+        with torch.no_grad():
+            router.expert_bias.zero_()
+        _, _, diagnostics = router(x, active_mask, None)
+        assert diagnostics["bias_std"].item() == 0.0
+
+    def test_logit_std_equals_raw_logit_std_when_bias_zero(self):
+        """logit_std must equal raw_logit_std when expert_bias is zero.
+
+        With a zero bias, (logits + expert_bias) == logits, so the combined
+        spread is identical to the unbiased spread.
+        """
+        config = small_config()
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, 64)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+        with torch.no_grad():
+            router.expert_bias.zero_()
+        _, _, diagnostics = router(x, active_mask, None)
+        assert torch.allclose(diagnostics["logit_std"], diagnostics["raw_logit_std"], atol=1e-6)
+
+    def test_bias_alignment_negative_when_bias_opposes_logits(self):
+        """bias_alignment must be negative when expert_bias points opposite to logits.
+
+        Computed by measuring the mean logit direction then setting expert_bias
+        to its negation, guaranteeing a negative mean cosine similarity.
+        """
+        config = small_config()
+        router = MoSRAHRouter(config)
+        torch.manual_seed(42)
+        x = torch.randn(1, 8, 64)
+        active_mask = torch.ones(1, 8, dtype=torch.bool)
+        with torch.no_grad():
+            logits = router.routing_projection(x)          # (1, 8, L)
+            mean_logit_direction = logits.mean(dim=(0, 1)) # (L,)
+            router.expert_bias.copy_(-mean_logit_direction)
+        _, _, diagnostics = router(x, active_mask, None)
+        assert diagnostics["bias_alignment"].item() < 0, (
+            f"expected negative bias_alignment for opposing bias, "
+            f"got {diagnostics['bias_alignment'].item()}"
+        )
+
+    def test_bias_alignment_positive_when_bias_reinforces_logits(self):
+        """bias_alignment must be positive when expert_bias reinforces logit direction.
+
+        Computed by setting expert_bias to the mean logit direction, guaranteeing
+        a positive mean cosine similarity.
+        """
+        config = small_config()
+        router = MoSRAHRouter(config)
+        torch.manual_seed(42)
+        x = torch.randn(1, 8, 64)
+        active_mask = torch.ones(1, 8, dtype=torch.bool)
+        with torch.no_grad():
+            logits = router.routing_projection(x)
+            mean_logit_direction = logits.mean(dim=(0, 1))
+            router.expert_bias.copy_(mean_logit_direction)
+        _, _, diagnostics = router(x, active_mask, None)
+        assert diagnostics["bias_alignment"].item() > 0, (
+            f"expected positive bias_alignment for reinforcing bias, "
+            f"got {diagnostics['bias_alignment'].item()}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +483,8 @@ class TestMaxVio:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, _, max_vio = router(x, active_mask, None)
+        _, _, diagnostics = router(x, active_mask, None)
+        max_vio = diagnostics["max_vio"]
         assert not max_vio.requires_grad
 
 
@@ -395,11 +509,13 @@ class TestMaskedContinuationBehavior:
 
         torch.manual_seed(11)
         x = torch.randn(B, N, config.embedding_width)
-        _, _, loss_a, _ = router(x, active_mask, None)
+        _, _, diag_a = router(x, active_mask, None)
+        loss_a = diag_a["load_balance_loss"]
 
         x_modified = x.clone()
         x_modified[0, 3] = torch.randn(config.embedding_width) * 100.0
-        _, _, loss_b, _ = router(x_modified, active_mask, None)
+        _, _, diag_b = router(x_modified, active_mask, None)
+        loss_b = diag_b["load_balance_loss"]
 
         torch.testing.assert_close(loss_a, loss_b)
 
@@ -413,11 +529,13 @@ class TestMaskedContinuationBehavior:
 
         torch.manual_seed(17)
         x = torch.randn(B, N, config.embedding_width)
-        _, _, _, vio_a = router(x, active_mask, None)
+        _, _, diag_a = router(x, active_mask, None)
+        vio_a = diag_a["max_vio"]
 
         x_modified = x.clone()
         x_modified[1, 5] = torch.randn(config.embedding_width) * 100.0
-        _, _, _, vio_b = router(x_modified, active_mask, None)
+        _, _, diag_b = router(x_modified, active_mask, None)
+        vio_b = diag_b["max_vio"]
 
         torch.testing.assert_close(vio_a, vio_b)
 
@@ -438,7 +556,8 @@ class TestMaskedContinuationBehavior:
         x = torch.randn(B, N, config.embedding_width)
 
         with torch.no_grad():
-            selected_heads, _, _, max_vio = router(x, active_mask, None)
+            selected_heads, _, diagnostics = router(x, active_mask, None)
+            max_vio = diagnostics["max_vio"]
             expected_freqs = _reference_routing_freqs(selected_heads, L, config.load_balance_p)
             expected_max_vio = MoSRAHRouter._compute_max_vio(expected_freqs, L)
 
@@ -736,7 +855,7 @@ class TestRouterRealizedCapacityFuzz:
                     device=device,
                 )
 
-                selected_heads, _, _, _ = router(
+                selected_heads, _, _ = router(
                     x,
                     active_mask,
                     used_capacity=None,
@@ -909,13 +1028,13 @@ class TestRouterCompileEquivalenceFuzz:
                 )
 
                 with torch.no_grad():
-                    eager_selected, eager_probs, eager_loss, eager_vio = router(
+                    eager_selected, eager_probs, eager_diag = router(
                         x,
                         active_mask,
                         used_capacity=None,
                     )
 
-                    compiled_selected, compiled_probs, compiled_loss, compiled_vio = (
+                    compiled_selected, compiled_probs, compiled_diag = (
                         compiled_router(
                             x,
                             active_mask,
@@ -950,35 +1069,21 @@ class TestRouterCompileEquivalenceFuzz:
                     ),
                 )
 
-                torch.testing.assert_close(
-                    compiled_loss,
-                    eager_loss,
-                    rtol=1e-5,
-                    atol=1e-6,
-                    msg=(
-                        "compiled router produced different load_balance_loss: "
-                        f"capacity_use={capacity_use}, "
-                        f"actual_capacity_use={actual_capacity_use}, "
-                        f"trial={trial}, "
-                        f"L={num_mosrah_heads}, "
-                        f"K={num_selected_heads}"
-                    ),
-                )
-
-                torch.testing.assert_close(
-                    compiled_vio,
-                    eager_vio,
-                    rtol=1e-5,
-                    atol=1e-6,
-                    msg=(
-                        "compiled router produced different max_vio: "
-                        f"capacity_use={capacity_use}, "
-                        f"actual_capacity_use={actual_capacity_use}, "
-                        f"trial={trial}, "
-                        f"L={num_mosrah_heads}, "
-                        f"K={num_selected_heads}"
-                    ),
-                )
+                for key in eager_diag:
+                    torch.testing.assert_close(
+                        compiled_diag[key],
+                        eager_diag[key],
+                        rtol=1e-5,
+                        atol=1e-6,
+                        msg=(
+                            f"compiled router diagnostic '{key}' differs from eager: "
+                            f"capacity_use={capacity_use}, "
+                            f"actual_capacity_use={actual_capacity_use}, "
+                            f"trial={trial}, "
+                            f"L={num_mosrah_heads}, "
+                            f"K={num_selected_heads}"
+                        ),
+                    )
 
         torch._dynamo.reset()
 

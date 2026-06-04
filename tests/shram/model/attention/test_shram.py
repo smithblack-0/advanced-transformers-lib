@@ -154,19 +154,21 @@ class TestHybridComposition:
             active_mask=active_mask,
             cache=None,
         )
-        sparse_output, sparse_load_balance_loss, _ = layer.sparse_attention(
+        sparse_output, sparse_diagnostics = layer.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        sparse_load_balance_loss = sparse_diagnostics["load_balance_loss"]
 
-        hybrid_output, hybrid_load_balance_loss, _ = layer(
+        hybrid_output, hybrid_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        hybrid_load_balance_loss = hybrid_diagnostics["load_balance_loss"]
 
         torch.testing.assert_close(
             hybrid_output,
@@ -188,18 +190,20 @@ class TestHybridComposition:
 
         zero_module_parameters(layer.local_attention)
 
-        sparse_output, sparse_load_balance_loss, _ = layer.sparse_attention(
+        sparse_output, sparse_diagnostics = layer.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
-        hybrid_output, hybrid_load_balance_loss, _ = layer(
+        sparse_load_balance_loss = sparse_diagnostics["load_balance_loss"]
+        hybrid_output, hybrid_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        hybrid_load_balance_loss = hybrid_diagnostics["load_balance_loss"]
 
         torch.testing.assert_close(
             hybrid_output,
@@ -227,18 +231,20 @@ class TestHybridComposition:
             active_mask=active_mask,
             cache=None,
         )
-        hybrid_output, hybrid_load_balance_loss, _ = layer(
+        hybrid_output, hybrid_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
-        sparse_output, sparse_load_balance_loss, _ = layer.sparse_attention(
+        hybrid_load_balance_loss = hybrid_diagnostics["load_balance_loss"]
+        sparse_output, sparse_diagnostics = layer.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        sparse_load_balance_loss = sparse_diagnostics["load_balance_loss"]
 
         torch.testing.assert_close(
             hybrid_output,
@@ -281,12 +287,14 @@ class TestRealExecution:
         hidden_states, position_ids, active_mask = make_inputs(device, start_position=0)
         layer = make_layer(make_config(rope_mode=rope_mode), device, seed=0)
 
-        hybrid_output, load_balance_loss, max_vio = layer(
+        hybrid_output, router_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        load_balance_loss = router_diagnostics["load_balance_loss"]
+        max_vio = router_diagnostics["max_vio"]
 
         assert hybrid_output.shape == hidden_states.shape
         assert load_balance_loss.ndim == 0
@@ -315,18 +323,20 @@ class TestRealExecution:
         current_position_ids = position_ids[:, 2:]
         current_active_mask = active_mask[:, 2:]
 
-        prefix_output, prefix_load_balance_loss, _ = layer(
+        prefix_output, prefix_diagnostics = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
             active_mask=prefix_active_mask,
             cache=layer_cache,
         )
-        current_output, current_load_balance_loss, _ = layer(
+        prefix_load_balance_loss = prefix_diagnostics["load_balance_loss"]
+        current_output, current_diagnostics = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             active_mask=current_active_mask,
             cache=layer_cache,
         )
+        current_load_balance_loss = current_diagnostics["load_balance_loss"]
 
         assert prefix_output.shape == prefix_hidden_states.shape
         assert current_output.shape == current_hidden_states.shape
@@ -358,7 +368,7 @@ class TestRealExecution:
         current_active_mask = active_mask[:, 2:]
 
         # Legal uncached oracle: the entire sequence starts at zero.
-        full_output, _, _ = layer(
+        full_output, _ = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
@@ -371,18 +381,19 @@ class TestRealExecution:
             batch_size=hidden_states.shape[0],
             device=device,
         )
-        _, _, _ = layer(
+        _, _ = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
             active_mask=prefix_active_mask,
             cache=layer_cache,
         )
-        current_cached_output, current_cached_load_balance_loss, _ = layer(
+        current_cached_output, current_cached_diagnostics = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             active_mask=current_active_mask,
             cache=layer_cache,
         )
+        current_cached_load_balance_loss = current_cached_diagnostics["load_balance_loss"]
 
         torch.testing.assert_close(
             current_cached_output,
@@ -419,13 +430,13 @@ class TestConfigurationResponse:
             seed=0,
         )
 
-        output_a, _, _ = layer_a(
+        output_a, _ = layer_a(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
-        output_b, _, _ = layer_b(
+        output_b, _ = layer_b(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
@@ -487,26 +498,26 @@ class TestConfigurationResponse:
                 device=device,
             )
 
-            _, _, _ = main_sequence_layer(
+            _, _ = main_sequence_layer(
                 hidden_states=prefix_hidden_states,
                 position_ids=prefix_position_ids,
                 active_mask=prefix_active_mask,
                 cache=main_sequence_cache,
             )
-            _, _, _ = semantic_sequence_layer(
+            _, _ = semantic_sequence_layer(
                 hidden_states=prefix_hidden_states,
                 position_ids=prefix_position_ids,
                 active_mask=prefix_active_mask,
                 cache=semantic_sequence_cache,
             )
 
-            main_sequence_output, _, _ = main_sequence_layer(
+            main_sequence_output, _ = main_sequence_layer(
                 hidden_states=current_hidden_states,
                 position_ids=current_position_ids,
                 active_mask=current_active_mask,
                 cache=main_sequence_cache,
             )
-            semantic_sequence_output, _, _ = semantic_sequence_layer(
+            semantic_sequence_output, _ = semantic_sequence_layer(
                 hidden_states=current_hidden_states,
                 position_ids=current_position_ids,
                 active_mask=current_active_mask,
@@ -548,13 +559,13 @@ class TestConfigurationResponse:
             seed=0,
         )
 
-        standard_scale_output, _, _ = standard_scale_layer(
+        standard_scale_output, _ = standard_scale_layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
-        yarn_scaled_output, _, _ = yarn_scaled_layer(
+        yarn_scaled_output, _ = yarn_scaled_layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
@@ -581,13 +592,13 @@ class TestGradientBehavior:
         sparse_output_param = layer.sparse_attention.bea.q_proj
         sparse_balance_param = layer.sparse_attention.router.expert_bias
 
-        hybrid_output, load_balance_loss, _ = layer(
+        hybrid_output, router_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
-        del load_balance_loss
+        del router_diagnostics
 
         hybrid_output.sum().backward()
 
@@ -617,12 +628,13 @@ class TestGradientBehavior:
 
         optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
 
-        hybrid_output, load_balance_loss, _ = layer(
+        hybrid_output, router_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        load_balance_loss = router_diagnostics["load_balance_loss"]
         del hybrid_output
 
         optimizer.zero_grad()

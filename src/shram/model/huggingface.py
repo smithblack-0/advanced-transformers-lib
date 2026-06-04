@@ -51,10 +51,20 @@ class ShramCausalLMOutput(CausalLMOutputWithPast):
     only the SHRAM-specific wrapper outputs.
     """
 
+    ## Python dataclass inheritance violation: CausalLMOutputWithPast defaults all
+    ## fields to None, which forces every subclass field to also carry a default.
+    ## The = None below is a language constraint, not a semantic statement. In
+    ## practice, load_balance_loss, max_vio, bias_std, raw_logit_std, logit_std,
+    ## and bias_alignment are always populated by ShramForCausalLM.forward().
+    ## ce_loss is genuinely optional — present only when labels are supplied.
+
     ce_loss: torch.FloatTensor | None = None
     load_balance_loss: torch.FloatTensor | None = None
     max_vio: torch.FloatTensor | None = None
-
+    bias_std: torch.Tensor | None = None
+    raw_logit_std: torch.Tensor | None = None
+    logit_std: torch.Tensor | None = None
+    bias_alignment: torch.Tensor | None = None
 
 class ShramForCausalLM(PreTrainedModel, GenerationMixin):
     """HuggingFace-facing causal language model wrapper for SHRAM.
@@ -483,6 +493,9 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             output_hidden_states: Whether to return backbone hidden states.
                 Defaults to ``config.output_hidden_states``.
             labels: Optional target token IDs of shape ``(batch, seq_len)``.
+                Pass unshifted labels (same alignment as ``input_ids``). This
+                wrapper shifts internally: ``logits[:, :-1]`` is compared
+                against ``labels[:, 1:]``. Do not pre-shift the caller side.
             return_dict: Must be ``True`` or ``None``.
             ce_weight: Weight applied to the cross-entropy loss when combining with
                 the load-balance loss. Default 1.0.
@@ -499,7 +512,10 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             - ``past_key_values`` as the active ``ShramCache`` or ``None``,
             - ``hidden_states`` when requested,
             - ``load_balance_loss`` — raw unweighted load-balance loss from the backbone,
-            - detached ``max_vio`` from the backbone.
+            - ``max_vio`` — detached worst-case routing imbalance across layers,
+            - ``bias_std``, ``raw_logit_std``, ``logit_std``, ``bias_alignment`` —
+              detached load-balance health scalars averaged across decoder layers;
+              see ``ShramModel`` for interpretation.
         """
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         output_hidden_states = (
@@ -606,4 +622,8 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             hidden_states=backbone_outputs["hidden_states"],
             load_balance_loss=backbone_outputs["load_balance_loss"],
             max_vio=backbone_outputs["max_vio"],
+            bias_std=backbone_outputs["bias_std"],
+            raw_logit_std=backbone_outputs["raw_logit_std"],
+            logit_std=backbone_outputs["logit_std"],
+            bias_alignment=backbone_outputs["bias_alignment"],
         )

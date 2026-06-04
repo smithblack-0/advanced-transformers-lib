@@ -45,7 +45,7 @@ class SHRAMHybridLayer(nn.Module):
         position_ids: torch.Tensor,
         active_mask: torch.Tensor,
         cache: ShramLayerCache | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Apply the SHRAM hybrid attention layer.
 
         Args:
@@ -60,8 +60,7 @@ class SHRAMHybridLayer(nn.Module):
 
         Returns:
             hybrid_output: Model-space hybrid attention output of shape (B, N, d).
-            load_balance_loss: Scalar sparse-path load-balance loss.
-            max_vio: Detached scalar routing-imbalance summary. Passed through
+            router_diagnostics: Dict of router feedback scalars passed through
                 unchanged from MoSRAHLayer; see MoSRAHRouter for semantics.
         """
         # -------------------------------------------------------------------
@@ -89,7 +88,7 @@ class SHRAMHybridLayer(nn.Module):
             active_mask=active_mask,
             cache=sliding_window_cache,
         )
-        sparse_output, load_balance_loss, max_vio = self.sparse_attention(
+        sparse_output, router_diagnostics = self.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
@@ -104,4 +103,4 @@ class SHRAMHybridLayer(nn.Module):
         # -------------------------------------------------------------------
         hybrid_output = local_output + sparse_output
 
-        return hybrid_output, load_balance_loss, max_vio
+        return hybrid_output, router_diagnostics

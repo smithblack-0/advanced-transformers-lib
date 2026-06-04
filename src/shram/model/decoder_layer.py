@@ -4,7 +4,7 @@ Each block applies pre-norm hybrid attention followed by pre-norm MLP, with
 gated residual connections around both sublayers:
 
     normed_attn = RMSNorm(x)
-    attn_out, load_balance_loss, max_vio = SHRAMHybridLayer(normed_attn, ...)
+    attn_out, router_diagnostics = SHRAMHybridLayer(normed_attn, ...)
     h = x + residual_gate * attn_out
 
     normed_mlp = RMSNorm(h)
@@ -66,7 +66,7 @@ class DecoderLayer(nn.Module):
         position_ids: torch.Tensor,
         active_mask: torch.Tensor,
         cache: ShramLayerCache | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Apply one decoder block to the input.
 
         Args:
@@ -80,12 +80,10 @@ class DecoderLayer(nn.Module):
 
         Returns:
             output: Tensor of shape (batch, seq_len, hidden_size).
-            load_balance_loss: Scalar sparse-path load-balance loss propagated
-                from SHRAMHybridLayer.
-            max_vio: Detached scalar routing-imbalance summary. Passed through
+            router_diagnostics: Dict of router feedback scalars passed through
                 unchanged from SHRAMHybridLayer; see MoSRAHRouter for semantics.
         """
-        attn_out, load_balance_loss, max_vio = self.attention(
+        attn_out, router_diagnostics = self.attention(
             hidden_states=self.attn_norm(x),
             position_ids=position_ids,
             active_mask=active_mask,
@@ -93,4 +91,4 @@ class DecoderLayer(nn.Module):
         )
         hidden_states = x + self.residual_gate*attn_out
         output = hidden_states + self.residual_gate*self.mlp(self.mlp_norm(hidden_states))
-        return output, load_balance_loss, max_vio
+        return output, router_diagnostics

@@ -122,6 +122,10 @@ class TestOutputContract:
             "hidden_states",
             "load_balance_loss",
             "max_vio",
+            "bias_std",
+            "raw_logit_std",
+            "logit_std",
+            "bias_alignment",
         }
 
     def test_last_hidden_state_shape_and_load_balance_loss_scalar_are_valid(self, device):

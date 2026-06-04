@@ -7,6 +7,7 @@ Invariants verified:
 - Backward writes L_grad * sign(f_l - 1/L) to expert_bias
 - routing_freqs receives no gradient
 - grad_b scales proportionally with L_grad (training loop loss weighting works correctly)
+- SGD on expert_bias with closed-loop softmax frequencies converges routing toward uniform
 """
 
 import pytest
@@ -129,3 +130,65 @@ class TestLoadBalanceLossBackward:
         assert expert_bias.grad[0].item() > 0.0
         # Head 1 is underloaded: grad_b[1] should be negative.
         assert expert_bias.grad[1].item() < 0.0
+
+
+# ---------------------------------------------------------------------------
+# Stability
+# ---------------------------------------------------------------------------
+
+class TestLoadBalanceStability:
+    """Closed-loop stability test for the load-balance correction mechanism.
+
+    Verifies that the load-balance signal actually drives routing toward uniform
+    frequencies under an optimizer — not just that gradients point in the right
+    direction in isolation.
+    """
+
+    def test_sgd_drives_routing_toward_uniform(self):
+        """The bias correction must measurably reduce routing imbalance under SGD.
+
+        Simulates training dynamics: expert_bias starts at zero; hidden_bias is a
+        fixed scaled-randn representing the underlying routing preference (the mean
+        direction of xW_r across a training batch). Each step computes
+        frequencies = softmax(expert_bias + hidden_bias) and updates expert_bias
+        via SGD on the load-balance loss.
+
+        LoadBalanceLoss.apply blocks gradient through routing_freqs, so expert_bias
+        receives only sign(f_l − 1/L) — the DeepSeek correction signal — not the
+        chain-rule gradient through softmax. This isolates and exercises the custom
+        operator's closed-loop behavior rather than standard autograd.
+
+        At convergence, expert_bias ≈ −hidden_bias, making softmax uniform. The
+        threshold of 10% of initial max_vio is conservative; in practice convergence
+        is much tighter within 300 steps.
+        """
+        torch.manual_seed(99)
+        L = 8
+
+        # Fixed routing preference — simulates the mean direction of routing logits
+        # across a training batch. Fixed here for a deterministic convergence signal;
+        # in production this varies per batch, but the correction dynamics are the same.
+        hidden_bias = torch.randn(L) * 2.0
+
+        expert_bias = torch.zeros(L, requires_grad=True)
+        optimizer = torch.optim.SGD([expert_bias], lr=0.05)
+
+        with torch.no_grad():
+            initial_freqs = torch.softmax(expert_bias + hidden_bias, dim=-1)
+            initial_max_vio = (L * (initial_freqs - 1.0 / L).max()).item()
+
+        for _ in range(300):
+            frequencies = torch.softmax(expert_bias + hidden_bias, dim=-1)
+            loss = LoadBalanceLoss.apply(expert_bias, frequencies)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            final_freqs = torch.softmax(expert_bias + hidden_bias, dim=-1)
+            final_max_vio = (L * (final_freqs - 1.0 / L).max()).item()
+
+        assert final_max_vio < initial_max_vio * 0.1, (
+            f"load-balance mechanism failed to reduce routing imbalance sufficiently: "
+            f"initial_max_vio={initial_max_vio:.4f}, final_max_vio={final_max_vio:.4f}"
+        )
