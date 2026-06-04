@@ -488,6 +488,71 @@ class TestIntegrationCompiledEval:
 
 
 # ---------------------------------------------------------------------------
+# Integration — Router diagnostics
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrationRouterDiagnostics:
+    """Router diagnostic scalars must be present, finite, and live.
+
+    Invariants verified:
+    - All four fields are present, scalar, and finite after every forward pass.
+    - The scalars reflect actual model state and change as training proceeds.
+    """
+
+    def test_diagnostic_fields_present_and_finite(self, device):
+        """All four diagnostic scalars must be non-None, scalar, and finite after a forward pass."""
+        m = ShramForCausalLM(small_config()).eval().to(device)
+        ids = torch.randint(0, 256, (1, 4), device=device)
+
+        with torch.no_grad():
+            out = m(ids, use_cache=False)
+
+        for field in ("bias_std", "raw_logit_std", "logit_std", "bias_alignment"):
+            val = getattr(out, field)
+            assert val is not None, f"{field} is None"
+            assert val.ndim == 0, f"{field} is not a scalar (shape={val.shape})"
+            assert torch.isfinite(val), f"{field} is not finite: {val.item()}"
+
+    def test_diagnostic_scalars_respond_to_training(self, device):
+        """Diagnostic scalars must change after training steps, verifying they are live.
+
+        The default small_config uses K=L (all heads selected), so routing
+        frequencies are exactly 1/L and expert_bias receives no gradient.
+        This test overrides to K=2, L=4 so routing is genuinely sparse:
+        imbalance arises, bias updates, and routing weights evolve.
+
+        Asserts at least one scalar changed — not which one — to remain
+        robust against variation in which diagnostic shifts first.
+        """
+        torch.manual_seed(0)
+        config = small_config(num_selected_heads=2, num_mosrah_heads=4, training_sequence_length=32)
+        m = ShramForCausalLM(config).train().to(device)
+        ids = torch.randint(0, 256, (2, 16), device=device)
+
+        fields = ("bias_std", "raw_logit_std", "logit_std", "bias_alignment")
+
+        with torch.no_grad():
+            before = {f: getattr(m(ids, use_cache=False), f).item() for f in fields}
+
+        optimizer = torch.optim.SGD(m.parameters(), lr=0.1)
+        for _ in range(10):
+            out = m(ids, labels=ids, use_cache=False)
+            optimizer.zero_grad()
+            out.loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            after = {f: getattr(m(ids, use_cache=False), f).item() for f in fields}
+
+        changed = [f for f in fields if before[f] != after[f]]
+        assert changed, (
+            f"No diagnostic scalar changed after 10 training steps. "
+            f"before={before}, after={after}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Hub constants
 # ---------------------------------------------------------------------------
 

@@ -87,12 +87,14 @@ class TestRealExecution:
         layer = MoSRAHLayer(config).to(device)
         hidden_states, position_ids, active_mask = make_inputs(device)
 
-        sparse_output, load_balance_loss, max_vio = layer(
+        sparse_output, router_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        load_balance_loss = router_diagnostics["load_balance_loss"]
+        max_vio = router_diagnostics["max_vio"]
 
         assert sparse_output.shape == hidden_states.shape
         assert load_balance_loss.ndim == 0
@@ -119,28 +121,31 @@ class TestRealExecution:
 
         cache = make_cache(config, batch_size=hidden_states.shape[0], device=device)
 
-        prefix_output, prefix_load_balance_loss, _ = layer(
+        prefix_output, prefix_diagnostics = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
             active_mask=prefix_active_mask,
             cache=cache,
         )
+        prefix_load_balance_loss = prefix_diagnostics["load_balance_loss"]
         lengths_after_prefix = cache.get_heads_lengths().clone()
 
-        current_output, current_load_balance_loss, _ = layer(
+        current_output, current_diagnostics = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             active_mask=current_active_mask,
             cache=cache,
         )
+        current_load_balance_loss = current_diagnostics["load_balance_loss"]
         lengths_after_current = cache.get_heads_lengths().clone()
 
-        uncached_current_output, uncached_current_load_balance_loss, _ = layer(
+        uncached_current_output, uncached_current_diagnostics = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             active_mask=current_active_mask,
             cache=None,
         )
+        uncached_current_load_balance_loss = uncached_current_diagnostics["load_balance_loss"]
 
         assert prefix_output.shape == prefix_hidden_states.shape
         assert current_output.shape == current_hidden_states.shape
@@ -178,27 +183,30 @@ class TestRealExecution:
         current_position_ids = position_ids[:, 2:]
         current_active_mask = active_mask[:, 2:]
 
-        full_output, full_load_balance_loss, _ = layer(
+        full_output, full_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        full_load_balance_loss = full_diagnostics["load_balance_loss"]
 
         cache = make_cache(config, batch_size=hidden_states.shape[0], device=device)
 
-        _, prefix_load_balance_loss, _ = layer(
+        _, prefix_diagnostics = layer(
             hidden_states=prefix_hidden_states,
             position_ids=prefix_position_ids,
             active_mask=prefix_active_mask,
             cache=cache,
         )
-        current_output, current_load_balance_loss, _ = layer(
+        prefix_load_balance_loss = prefix_diagnostics["load_balance_loss"]
+        current_output, current_diagnostics = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             active_mask=current_active_mask,
             cache=cache,
         )
+        current_load_balance_loss = current_diagnostics["load_balance_loss"]
 
         torch.testing.assert_close(
             current_output,
@@ -232,12 +240,13 @@ class TestGradientFlow:
         layer = MoSRAHLayer(config).to(device)
         hidden_states, position_ids, active_mask = make_inputs(device, requires_grad=True)
 
-        sparse_output, load_balance_loss, _ = layer(
+        sparse_output, router_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        load_balance_loss = router_diagnostics["load_balance_loss"]
         del load_balance_loss
 
         sparse_output.sum().backward()
@@ -266,12 +275,13 @@ class TestGradientFlow:
         layer = MoSRAHLayer(config).to(device)
         hidden_states, position_ids, active_mask = make_inputs(device, requires_grad=True)
 
-        sparse_output, load_balance_loss, _ = layer(
+        sparse_output, router_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
+        load_balance_loss = router_diagnostics["load_balance_loss"]
         del sparse_output
 
         load_balance_loss.backward()

@@ -95,7 +95,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 23.A — Compiled inference-style execution: eval, no_grad, mixed-precision coverage
 - [X] Unit 23.B — Fix position ID resolution: replace cumsum with arange + active-token bias
 - [X] Unit 23.C — Documentation: compile-mode constraints and minor documentation gaps
-- [ ] Unit 23.D — Router diagnostics: refactor return signature + add load-balance health scalars
+- [X] Unit 23.D — Router diagnostics: refactor return signature + add load-balance health scalars
 - [ ] Unit 24 — Final Audit
 
 ---

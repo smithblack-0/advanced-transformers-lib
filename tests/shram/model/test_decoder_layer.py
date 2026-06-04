@@ -118,12 +118,14 @@ class TestRuntimeSmoke:
         layer = make_layer(config, device, seed=0)
         x, position_ids, active_mask = make_input(config, device, batch=2, seq=4, seed=1)
 
-        output, load_balance_loss, max_vio = layer(
+        output, router_diagnostics = layer(
             x,
             position_ids,
             active_mask,
             cache=None,
         )
+        load_balance_loss = router_diagnostics["load_balance_loss"]
+        max_vio = router_diagnostics["max_vio"]
 
         assert output.shape == x.shape
         assert load_balance_loss.ndim == 0
@@ -139,22 +141,24 @@ class TestRuntimeSmoke:
         layer = make_layer(config, device, seed=0)
         x, position_ids, active_mask = make_input(config, device, batch=1, seq=4, seed=2)
 
-        baseline_output, baseline_load_balance_loss, _ = layer(
+        baseline_output, baseline_diagnostics = layer(
             x,
             position_ids,
             active_mask,
             cache=None,
         )
+        baseline_load_balance_loss = baseline_diagnostics["load_balance_loss"]
 
         perturbed_x = x.clone()
         perturbed_x[:, 2, :] += 0.5
 
-        perturbed_output, perturbed_load_balance_loss, _ = layer(
+        perturbed_output, perturbed_diagnostics = layer(
             perturbed_x,
             position_ids,
             active_mask,
             cache=None,
         )
+        perturbed_load_balance_loss = perturbed_diagnostics["load_balance_loss"]
 
         assert not torch.allclose(
             baseline_output,
@@ -183,13 +187,13 @@ class TestRuntimeSmoke:
         for input_seed in input_seeds:
             x, _, active_mask = make_input(config, device, batch=1, seq=4, seed=input_seed)
 
-            output_a, _, _ = layer(
+            output_a, _ = layer(
                 x,
                 position_ids_a,
                 active_mask,
                 cache=None,
             )
-            output_b, _, _ = layer(
+            output_b, _ = layer(
                 x,
                 position_ids_b,
                 active_mask,
@@ -228,18 +232,20 @@ class TestRuntimeSmoke:
             device=device,
         )
 
-        prefix_output, prefix_load_balance_loss, _ = layer(
+        prefix_output, prefix_diagnostics = layer(
             prefix_x,
             prefix_position_ids,
             prefix_active_mask,
             cache=layer_cache,
         )
-        current_output, current_load_balance_loss, _ = layer(
+        prefix_load_balance_loss = prefix_diagnostics["load_balance_loss"]
+        current_output, current_diagnostics = layer(
             current_x,
             current_position_ids,
             current_active_mask,
             cache=layer_cache,
         )
+        current_load_balance_loss = current_diagnostics["load_balance_loss"]
 
         assert prefix_output.shape == prefix_x.shape
         assert current_output.shape == current_x.shape
