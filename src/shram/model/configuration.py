@@ -187,7 +187,7 @@ class ShramConfig(PretrainedConfig):
                 f"load_balance_loss_type must be one of {supported}, "
                 f"got {load_balance_loss_type!r}."
             )
-        if load_balance_loss_type == "ce" and "load_balance_p" != 1.0:
+        if load_balance_loss_type == "ce" and load_balance_p != 1.0:
             raise ValueError("In cross entropy mode, aggregation of "
                              "frequencies must be with mean 1.0")
 
