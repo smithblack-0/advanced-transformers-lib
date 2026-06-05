@@ -96,7 +96,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 23.B — Fix position ID resolution: replace cumsum with arange + active-token bias
 - [X] Unit 23.C — Documentation: compile-mode constraints and minor documentation gaps
 - [X] Unit 23.D — Router diagnostics: refactor return signature + add load-balance health scalars
-- [ ] Unit 24 — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
+- [X] Unit 24 — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
 - [ ] Unit 25 — Final Audit
 
 ---
