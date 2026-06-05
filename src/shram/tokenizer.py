@@ -26,22 +26,28 @@ MODEL_DIR = Path(__file__).parent / "model"
 # -----------------------------------------------------------------------------
 
 
-def prepare_tokenizer(dest: Path = MODEL_DIR) -> None:
-    """Download GPT-NeoX tokenizer and write files to dest.
+def prepare_tokenizer(dest: Path = MODEL_DIR, source: Path | str = MODEL_DIR) -> None:
+    """Load GPT-NeoX tokenizer from source and write files to dest.
 
-    Fetches the tokenizer from HuggingFace Hub, saves all tokenizer files
-    to dest, and corrects tokenizer_config.json to ensure AutoTokenizer
-    loads the fast implementation.
+    Loads the tokenizer from source (a local directory or Hub repo ID), saves
+    all tokenizer files to dest, and corrects tokenizer_config.json to ensure
+    AutoTokenizer loads the fast implementation.
 
-    Idempotent: safe to run multiple times. Existing files are overwritten
-    with the current upstream version.
+    Idempotent: safe to run multiple times. Existing files are overwritten.
+
+    The default source is MODEL_DIR (the committed tokenizer files in
+    src/shram/model/), so staging during upload requires no network access.
+    To refresh the committed files from upstream, run this module directly
+    (python src/shram/tokenizer.py), which passes SOURCE_REPO as the source.
 
     Args:
         dest: Directory to write tokenizer files into. Defaults to
             src/shram/model/ — the Hub distribution folder.
+        source: Local directory or Hub repo ID to load the tokenizer from.
+            Defaults to MODEL_DIR (committed local files).
     """
-    print(f"Fetching tokenizer from {SOURCE_REPO}...")
-    tokenizer = AutoTokenizer.from_pretrained(SOURCE_REPO)
+    print(f"Loading tokenizer from {source}...")
+    tokenizer = AutoTokenizer.from_pretrained(source)
 
     dest.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(dest)
@@ -72,4 +78,4 @@ def _ensure_fast_tokenizer_class(model_dir: Path) -> None:
 
 
 if __name__ == "__main__":
-    prepare_tokenizer()
+    prepare_tokenizer(source=SOURCE_REPO)
