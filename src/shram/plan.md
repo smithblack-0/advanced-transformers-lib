@@ -96,7 +96,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 23.B — Fix position ID resolution: replace cumsum with arange + active-token bias
 - [X] Unit 23.C — Documentation: compile-mode constraints and minor documentation gaps
 - [X] Unit 23.D — Router diagnostics: refactor return signature + add load-balance health scalars
-- [ ] Unit 24 — Final Audit
+- [X] Unit 24 — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
+- [ ] Unit 25 — Final Audit
 
 ---
 
@@ -2949,7 +2950,46 @@ The router output currently conflates routing decisions (`selected_heads`, `rout
 
 ---
 
-### Unit 24 — Final Audit
+### Unit 24 — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
+
+**Responsibility:** Replace the DeepSeek auxiliary-loss-free load balance mechanism with a standard log-probability auxiliary loss that scales correction magnitude with violation severity, while preserving gradient isolation to `expert_bias` only.
+
+**Context of Correctness**
+
+Telemetry shows load balance correction could not keep up as routing imbalance escalated. The structural cause is the DeepSeek mechanism's use of fixed-magnitude steps to update `expert_bias`: step magnitude is independent of violation severity. When routing imbalance escalates faster than the fixed step can correct, the deficit grows.
+
+GShard-style linear losses share this weakness in a different form. A load balance signal whose gradient magnitude does not scale with violation severity can be outrun by routing concentrations that diverge nonlinearly. The correctness lesson from cross-entropy training is that log-probability signals grow as the distribution deviates from target — gradient magnitude is not constant but scales with deviation. Additionally, load balance losses that carry gradients to routing projection weights contaminate task performance learning.
+
+The DeepSeek mechanism preserved one correct property: load balance updates reach `expert_bias` only, not routing projection weights. The correct direction preserves this isolation while replacing fixed-magnitude steps with log-probability training signals that scale with severity.
+
+**Invariants this unit must satisfy:**
+
+1. A factory accepting `gshard`, `ce`, and `bce` is placed in `load_balance_loss.py`. When it is invoked, it returns a loss function of the given type; all such functions have the same external contract.
+2. The factory is used in `router.py` to intialize a loss function that is then used. The type of loss function is chosen from config, and is `ce` by default. 
+3. The assignment probabilities are always computed by a pathway that detached logit gradients, allowing load balancing feedback to only affect the load balancing biases.
+4. The `gshard` formulation computes loss as `(1/L) * Σ_i f_i * p_i`, where L is `num_mosrah_heads`, `f_i` is the detached realised routing frequency for expert i, and `p_i` is the detached-logit assignment probability for expert i.
+5. The `ce` formulation computes loss as `-(1/(L-1)) * Σ_i (1 - f_i) * log(p_i)`, with `f_i` and `p_i` as above.
+6. The `bce` formulation computes loss as `-(1/L) * Σ_i [(1 - f_i) * log(p_i) + f_i * log(1 - p_i)]`, with `f_i` and `p_i` as above.
+
+**Tests**
+
+- For each of the three formulations, verify the computed loss equals the formula numerically on known `f` and `p` values.
+- Verify the factory returns a callable for each of the three valid type strings and raises for an invalid type.
+- Verify `routing_projection.weight.grad` is None after backward through `load_balance_loss`.
+- Verify `load_balance_loss_type` roundtrips through `to_dict`/`from_dict`; verify invalid value raises `ValueError` at config construction.
+- Verify existing tests for `selected_heads`, `routing_probs`, `max_vio`, and router diagnostics pass unchanged.
+
+**Preliminary implementation strategy (research notes — non-binding):**
+
+- `ShramConfig` gains `load_balance_loss_type: str`, default `"ce"`, validated at construction against the supported values.
+- `load_balance_loss.py` contains the three loss functions and the factory that dispatches among them.
+- The router constructs the loss callable once at `__init__` via the factory and calls it during `forward`.
+- `p` is computed via `softmax` applied after detaching the logit tensor, so the only differentiable path into `p` is through `expert_bias`.
+- `LoadBalanceLoss` custom autograd function is removed.
+- `log(1-p)` must be implemented using torch.log1p for safety.
+---
+
+### Unit 25 — Final Audit
 
 **What:** Review every audit note in plan.md and, if not overridden, ensure compliance. Crosscheck with papers/main.tex and verify whether or not paper is still complaint.
 

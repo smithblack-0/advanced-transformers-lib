@@ -94,6 +94,11 @@ class ShramConfig(PretrainedConfig):
             cases are not expected under normal training. The bound exists as a
             correctness guard — exhausting it raises ``RuntimeError``. Must be >= 1.
             Default 10.
+        load_balance_loss_type: Formula used for the load-balance auxiliary loss.
+            One of ``"gshard"``, ``"ce"``, or ``"bce"``. ``"ce"`` (cross-entropy)
+            is the default; its log-probability signal scales with violation severity
+            and makes correction magnitude proportional to routing imbalance.
+            Default ``"ce"``.
     """
 
     model_type = "shram"
@@ -127,8 +132,9 @@ class ShramConfig(PretrainedConfig):
         output_hidden_states: bool = False,
         tie_word_embeddings: bool = False,
         mosrah_overallocation_factor: float = 2.0,
-        load_balance_p: float = 2.0,
+        load_balance_p: float = 1.0,
         max_bid_rounds: int = 10,
+        load_balance_loss_type: str = "ce",
         **kwargs
     ):
         if head_dim % 2 != 0:
@@ -174,6 +180,17 @@ class ShramConfig(PretrainedConfig):
                 f"max_bid_rounds must be at least 1, got {max_bid_rounds}."
             )
 
+        _supported_loss_types = {"gshard", "ce", "bce"}
+        if load_balance_loss_type not in _supported_loss_types:
+            supported = ", ".join(f'"{t}"' for t in sorted(_supported_loss_types))
+            raise ValueError(
+                f"load_balance_loss_type must be one of {supported}, "
+                f"got {load_balance_loss_type!r}."
+            )
+        if load_balance_loss_type == "ce" and load_balance_p != 1.0:
+            raise ValueError("In cross entropy mode, aggregation of "
+                             "frequencies must be with mean 1.0")
+
         self.vocab_size = vocab_size
         self.embedding_width = embedding_width
         self.mlp_width = mlp_width
@@ -194,6 +211,7 @@ class ShramConfig(PretrainedConfig):
         self.mosrah_overallocation_factor = mosrah_overallocation_factor
         self.load_balance_p = load_balance_p
         self.max_bid_rounds = max_bid_rounds
+        self.load_balance_loss_type = load_balance_loss_type
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
 
