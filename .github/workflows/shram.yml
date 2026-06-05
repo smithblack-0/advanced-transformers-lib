@@ -39,6 +39,7 @@ jobs:
       - name: Upload to dev Hub
         env:
           SHRAM_HF_TOKEN: ${{ secrets.SHRAM_DEV_HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.SHRAM_DEV_HF_TOKEN }}
         run: python -m shram.upload_to_hub dev
       - name: Wait for Hub propagation
         run: sleep 60
@@ -54,6 +55,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r src/shram/requirements-dev.txt && pip install -e src/shram/[dev]
       - name: Run E2E tests against dev repository
+        env:
+          HF_TOKEN: ${{ secrets.SHRAM_DEV_HF_TOKEN }}
         run: pytest tests/shram/ -m network --hub=dev
 
   upload_main:
@@ -69,6 +72,7 @@ jobs:
       - name: Upload to production repository
         env:
           SHRAM_HF_TOKEN: ${{ secrets.SHRAM_HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.SHRAM_HF_TOKEN }}
         run: python -m shram.upload_to_hub main
 
   publish_release:
