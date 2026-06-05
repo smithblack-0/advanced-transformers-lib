@@ -585,7 +585,7 @@ def hub_config(hub_repo):
     config = AutoConfig.from_pretrained(
         hub_repo,
         trust_remote_code=True,
-        force_download=True,
+        force_download=False,
     )
     module = type(config).__module__
     assert "transformers_modules" in module, (
