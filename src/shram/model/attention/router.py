@@ -13,9 +13,10 @@ This separation is architecturally critical: expert_bias drives selection (and t
 balancing) but does not corrupt the gradient path from the output through routing_probs
 back to the routing projection weights.
 
-The router also computes and returns the load balance loss via the LoadBalanceLoss custom
-autograd operator (see load_balance_loss.py). This loss is a scalar that the training
-loop can weight and add to the language modeling loss.
+The router also computes and returns the load balance loss via a log-probability auxiliary
+loss (see load_balance_loss.py). The loss formulation is selected by config; the default
+is cross-entropy. Gradients flow only to expert_bias — routing_projection.weight is
+isolated by detaching logits before computing assignment probabilities.
 
 The router additionally computes and returns MaxVio, a detached scalar summarising
 routing imbalance for the current forward pass:
@@ -33,7 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..configuration import ShramConfig
-from .load_balance_loss import LoadBalanceLoss
+from .load_balance_loss import make_load_balance_loss
 
 from typing import Optional
 
@@ -65,6 +66,7 @@ class MoSRAHRouter(nn.Module):
             self.capacity = config.mosrah_packed_length
 
         self.max_bid_rounds = config.max_bid_rounds
+        self._load_balance_loss = make_load_balance_loss(config.load_balance_loss_type)
 
         # W_r: routing projection, no bias (paper specifies xW_r, no additional term).
         self.routing_projection = nn.Linear(
@@ -351,12 +353,13 @@ class MoSRAHRouter(nn.Module):
             logits, self.expert_bias.expand_as(logits), dim=-1
         ).mean().detach()
 
+        # Routing scores. Direct.
         routing_scores = F.softmax(logits, dim=-1)             # R, (B, N, L)
 
         # Biased routing scores R̂ = Softmax(xW_r + b). Used only for TopK head
         # selection. expert_bias is added to logits before softmax so that the bias
         # shifts selection probability without rescaling the unbiased distribution.
-        biased_logits = logits + self.expert_bias
+        biased_logits = logits.detach() + self.expert_bias
         biased_logits = self.balance_capacity(
             biased_logits,
             used_capacity,
@@ -397,10 +400,14 @@ class MoSRAHRouter(nn.Module):
         p = self.load_balance_p
         routing_freqs = (per_item_freqs ** p).mean(dim=0) ** (1.0 / p)  # (L,)
 
-        # Load balance loss via custom autograd. expert_bias is an input so PyTorch
-        # registers it as a graph node; the custom backward writes the DeepSeek-style
-        # correction gradient to expert_bias.grad for the optimizer to consume.
-        load_balance_loss = LoadBalanceLoss.apply(self.expert_bias, routing_freqs)
+        # Active-token mean softmax probabilities. Detaching logits before softmax
+        # ensures the only differentiable path into p is through expert_bias — the
+        # load balance loss cannot reach routing_projection.weight.
+        biased_probs = biased_routing_scores                                   # (B, N, L)
+        active_float = active_mask.float().unsqueeze(-1)                       # (B, N, 1)
+        assignment_probs = (biased_probs * active_float).sum(dim=(0, 1))       # (L,) unnorm
+        assignment_probs = assignment_probs / active_mask.float().sum()        # (L,) norm
+        load_balance_loss = self._load_balance_loss(routing_freqs, assignment_probs)
 
         # MaxVio is a detached monitoring scalar following the paper's formula
         # L · max_l(f_l − 1/L) applied to routing_freqs. Must not contribute gradients.

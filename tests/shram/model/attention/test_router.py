@@ -290,6 +290,24 @@ class TestGradients:
         # imperfectly balanced, so at least one head's gradient should be non-zero.
         assert router.expert_bias.grad.abs().sum().item() > 0.0
 
+    def test_routing_projection_weight_grad_is_none_after_load_balance_loss_backward(self):
+        """Backward on load_balance_loss must not populate routing_projection.weight.grad.
+
+        Gradient isolation invariant: assignment probabilities are computed via
+        softmax(logits.detach() + expert_bias), so there is no autograd path from
+        load_balance_loss back to routing_projection.weight.
+        """
+        torch.manual_seed(0)
+        config = small_config()
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, config.embedding_width)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+
+        _, _, diagnostics = router(x, active_mask, None)
+        diagnostics["load_balance_loss"].backward()
+
+        assert router.routing_projection.weight.grad is None
+
 
 # ---------------------------------------------------------------------------
 # Router diagnostics

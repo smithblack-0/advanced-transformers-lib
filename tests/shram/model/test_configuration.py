@@ -394,3 +394,25 @@ class TestMaxBidRounds:
         config = small_config(max_bid_rounds=25)
         restored = ShramConfig.from_dict(config.to_dict())
         assert restored.max_bid_rounds == 25
+
+
+# ---------------------------------------------------------------------------
+# load_balance_loss_type
+# ---------------------------------------------------------------------------
+
+class TestLoadBalanceLossType:
+    def test_default_is_ce(self):
+        """load_balance_loss_type must default to 'ce'."""
+        config = ShramConfig()
+        assert config.load_balance_loss_type == "ce"
+
+    def test_roundtrip(self):
+        """load_balance_loss_type must survive to_dict/from_dict serialisation."""
+        config = small_config(load_balance_loss_type="bce")
+        restored = ShramConfig.from_dict(config.to_dict())
+        assert restored.load_balance_loss_type == "bce"
+
+    def test_invalid_type_raises(self):
+        """An unrecognised load_balance_loss_type must raise ValueError at construction."""
+        with pytest.raises(ValueError, match="load_balance_loss_type"):
+            small_config(load_balance_loss_type="invalid")

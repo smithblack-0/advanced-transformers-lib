@@ -1,194 +1,205 @@
-"""Tests for LoadBalanceLoss custom autograd Function.
+"""Tests for the load-balance loss factory and the three loss formulations.
 
 Invariants verified:
-- Forward loss formula: sum_l |f_l - 1/L|
-- Forward output is a scalar
-- Loss is zero when routing is perfectly balanced
-- Backward writes L_grad * sign(f_l - 1/L) to expert_bias
-- routing_freqs receives no gradient
-- grad_b scales proportionally with L_grad (training loop loss weighting works correctly)
-- SGD on expert_bias with closed-loop softmax frequencies converges routing toward uniform
+- Factory returns a callable for each of the three valid type strings
+- Factory raises ValueError for an invalid type string
+- gshard_loss computes (1/L) * Σ_i f_i * p_i on known inputs
+- ce_loss computes -(1/(L-1)) * Σ_i (1 - f_i) * log(p_i) on known inputs
+- bce_loss computes -(1/L) * Σ_i [(1-f_i)*log(p_i) + f_i*log1p(-p_i)] on known inputs
+- All three formulations return a scalar (zero-dimensional tensor)
+- assignment_probs receives gradient after backward through any formulation
+- routing_freqs (passed detached) receives no gradient
 """
+
+import math
 
 import pytest
 import torch
 
-from src.shram.model.attention.load_balance_loss import LoadBalanceLoss
+from src.shram.model.attention.load_balance_loss import make_load_balance_loss
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def apply_loss(
-    routing_freqs: torch.Tensor,
-    bias_requires_grad: bool = True,
-    freqs_requires_grad: bool = False,
+# Shared test vectors. f sums to 1 (valid routing frequencies). p is a
+# valid probability distribution (all positive, sums to 1).
+_F = [0.4, 0.3, 0.2, 0.1]
+_P = [0.25, 0.35, 0.25, 0.15]
+
+
+def make_tensors(
+    f: list[float] = _F,
+    p: list[float] = _P,
+    p_requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Construct expert_bias and apply LoadBalanceLoss.apply, returning (loss, bias)."""
-    expert_bias = torch.zeros(routing_freqs.shape[0], requires_grad=bias_requires_grad)
-    routing_freqs = routing_freqs.clone()
-    if freqs_requires_grad:
-        routing_freqs.requires_grad_(True)
-    loss = LoadBalanceLoss.apply(expert_bias, routing_freqs)
-    return loss, expert_bias
+    """Construct routing_freqs and assignment_probs tensors for testing."""
+    routing_freqs = torch.tensor(f, dtype=torch.float32)
+    assignment_probs = torch.tensor(p, dtype=torch.float32, requires_grad=p_requires_grad)
+    return routing_freqs, assignment_probs
+
+
+def expected_gshard(f: list[float], p: list[float]) -> float:
+    """Reference implementation of the gshard formula."""
+    L = len(f)
+    return sum(f[i] * p[i] for i in range(L)) / L
+
+
+def expected_ce(f: list[float], p: list[float]) -> float:
+    """Reference implementation of the ce formula."""
+    L = len(f)
+    return -sum((1.0 - f[i]) * math.log(p[i]) for i in range(L)) / (L - 1)
+
+
+def expected_bce(f: list[float], p: list[float]) -> float:
+    """Reference implementation of the bce formula using log1p(-p) for safety."""
+    L = len(f)
+    return -sum(
+        (1.0 - f[i]) * math.log(p[i]) + f[i] * math.log1p(-p[i])
+        for i in range(L)
+    ) / L
 
 
 # ---------------------------------------------------------------------------
-# Forward
+# Factory
 # ---------------------------------------------------------------------------
 
-class TestLoadBalanceLossForward:
-    def test_loss_formula(self):
-        """Forward must compute sum_l |f_l - 1/L|."""
-        routing_freqs = torch.tensor([0.4, 0.3, 0.2, 0.1])
-        loss, _ = apply_loss(routing_freqs)
+class TestFactory:
+    def test_returns_callable_for_gshard(self):
+        """Factory must return a callable for loss_type='gshard'."""
+        fn = make_load_balance_loss("gshard")
+        assert callable(fn)
 
-        L = routing_freqs.shape[0]
-        expected = float(sum(abs(f - 1.0 / L) for f in routing_freqs.tolist()))
-        assert loss.item() == pytest.approx(expected, abs=1e-6)
+    def test_returns_callable_for_ce(self):
+        """Factory must return a callable for loss_type='ce'."""
+        fn = make_load_balance_loss("ce")
+        assert callable(fn)
 
-    def test_loss_is_scalar(self):
-        """Forward must return a zero-dimensional tensor."""
-        routing_freqs = torch.ones(4) / 4
-        loss, _ = apply_loss(routing_freqs)
-        assert loss.shape == ()
+    def test_returns_callable_for_bce(self):
+        """Factory must return a callable for loss_type='bce'."""
+        fn = make_load_balance_loss("bce")
+        assert callable(fn)
 
-    def test_loss_is_zero_when_balanced(self):
-        """Loss must be exactly zero when all heads have equal frequency 1/L."""
-        L = 8
-        routing_freqs = torch.ones(L) / L
-        loss, _ = apply_loss(routing_freqs)
-        assert loss.item() == pytest.approx(0.0, abs=1e-7)
-
-    def test_loss_is_nonnegative(self):
-        """Sum of absolute values is always non-negative."""
-        routing_freqs = torch.tensor([0.6, 0.1, 0.2, 0.1])
-        loss, _ = apply_loss(routing_freqs)
-        assert loss.item() >= 0.0
+    def test_raises_for_invalid_type(self):
+        """Factory must raise ValueError for an unrecognised loss_type."""
+        with pytest.raises(ValueError, match="load_balance_loss_type"):
+            make_load_balance_loss("invalid_type")
 
 
 # ---------------------------------------------------------------------------
-# Backward
+# Formula correctness and output shape
 # ---------------------------------------------------------------------------
 
-class TestLoadBalanceLossBackward:
-    def test_grad_b_formula(self):
-        """Backward must write L_grad * sign(f_l - 1/L) to expert_bias.grad."""
-        routing_freqs = torch.tensor([0.4, 0.3, 0.2, 0.1])
-        loss, expert_bias = apply_loss(routing_freqs)
-        loss.backward()
+class TestFormulas:
+    """Verify each formulation against a Python reference on known inputs.
 
-        L = routing_freqs.shape[0]
-        expected_grad = torch.sign(routing_freqs - 1.0 / L)
-        assert torch.allclose(expert_bias.grad, expected_grad)
-
-    def test_routing_freqs_receives_no_gradient(self):
-        """routing_freqs must not receive a gradient — its origin is discrete TopK."""
-        routing_freqs = torch.tensor([0.4, 0.3, 0.2, 0.1], requires_grad=True)
-        expert_bias = torch.zeros(4, requires_grad=True)
-        loss = LoadBalanceLoss.apply(expert_bias, routing_freqs)
-        loss.backward()
-
-        assert routing_freqs.grad is None
-
-    def test_grad_b_scales_with_l_grad(self):
-        """Multiplying the loss by a scalar must multiply grad_b by the same scalar.
-
-        This is the 'behaves like a normal auxiliary loss under scaling' invariant:
-        a training loop that applies loss_weight * load_balance_loss must see
-        loss_weight * grad_b, not just grad_b.
-        """
-        routing_freqs = torch.tensor([0.4, 0.3, 0.2, 0.1])
-        L = routing_freqs.shape[0]
-
-        # Unscaled backward
-        b1 = torch.zeros(L, requires_grad=True)
-        loss1 = LoadBalanceLoss.apply(b1, routing_freqs.clone())
-        loss1.backward()
-        grad_unscaled = b1.grad.clone()
-
-        # Scaled by 3.0
-        b2 = torch.zeros(L, requires_grad=True)
-        loss2 = LoadBalanceLoss.apply(b2, routing_freqs.clone())
-        (3.0 * loss2).backward()
-        grad_scaled = b2.grad.clone()
-
-        assert torch.allclose(3.0 * grad_unscaled, grad_scaled, atol=1e-6)
-
-    def test_grad_direction_matches_imbalance(self):
-        """sign(f_l - 1/L) points toward correction: overloaded heads get positive
-        grad_b so the optimizer decreases their bias, reducing future selection."""
-        routing_freqs = torch.tensor([0.6, 0.1, 0.2, 0.1])  # head 0 overloaded
-        loss, expert_bias = apply_loss(routing_freqs)
-        loss.backward()
-
-        L = routing_freqs.shape[0]
-        # Head 0 is overloaded: f_0 - 1/L > 0, so grad_b[0] should be positive.
-        # AdamW will subtract a positive gradient from b[0], reducing head 0's bias,
-        # which reduces its future selection probability.
-        assert expert_bias.grad[0].item() > 0.0
-        # Head 1 is underloaded: grad_b[1] should be negative.
-        assert expert_bias.grad[1].item() < 0.0
-
-
-# ---------------------------------------------------------------------------
-# Stability
-# ---------------------------------------------------------------------------
-
-class TestLoadBalanceStability:
-    """Closed-loop stability test for the load-balance correction mechanism.
-
-    Verifies that the load-balance signal actually drives routing toward uniform
-    frequencies under an optimizer — not just that gradients point in the right
-    direction in isolation.
+    The reference functions (expected_gshard, expected_ce, expected_bce) are
+    direct Python translations of the formulas in the plan entry. Comparing
+    the tensor output against these references certifies the PyTorch
+    implementation matches the intended formula.
     """
 
-    def test_sgd_drives_routing_toward_uniform(self):
-        """The bias correction must measurably reduce routing imbalance under SGD.
+    def _verify_formula(
+        self,
+        loss_type: str,
+        f: list[float],
+        p: list[float],
+        expected: float,
+    ) -> None:
+        """Call loss_fn and assert output matches expected to 1e-6."""
+        routing_freqs, assignment_probs = make_tensors(f, p)
+        loss_fn = make_load_balance_loss(loss_type)
+        loss = loss_fn(routing_freqs, assignment_probs)
 
-        Simulates training dynamics: expert_bias starts at zero; hidden_bias is a
-        fixed scaled-randn representing the underlying routing preference (the mean
-        direction of xW_r across a training batch). Each step computes
-        frequencies = softmax(expert_bias + hidden_bias) and updates expert_bias
-        via SGD on the load-balance loss.
-
-        LoadBalanceLoss.apply blocks gradient through routing_freqs, so expert_bias
-        receives only sign(f_l − 1/L) — the DeepSeek correction signal — not the
-        chain-rule gradient through softmax. This isolates and exercises the custom
-        operator's closed-loop behavior rather than standard autograd.
-
-        At convergence, expert_bias ≈ −hidden_bias, making softmax uniform. The
-        threshold of 10% of initial max_vio is conservative; in practice convergence
-        is much tighter within 300 steps.
-        """
-        torch.manual_seed(99)
-        L = 8
-
-        # Fixed routing preference — simulates the mean direction of routing logits
-        # across a training batch. Fixed here for a deterministic convergence signal;
-        # in production this varies per batch, but the correction dynamics are the same.
-        hidden_bias = torch.randn(L) * 2.0
-
-        expert_bias = torch.zeros(L, requires_grad=True)
-        optimizer = torch.optim.SGD([expert_bias], lr=0.05)
-
-        with torch.no_grad():
-            initial_freqs = torch.softmax(expert_bias + hidden_bias, dim=-1)
-            initial_max_vio = (L * (initial_freqs - 1.0 / L).max()).item()
-
-        for _ in range(300):
-            frequencies = torch.softmax(expert_bias + hidden_bias, dim=-1)
-            loss = LoadBalanceLoss.apply(expert_bias, frequencies)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        with torch.no_grad():
-            final_freqs = torch.softmax(expert_bias + hidden_bias, dim=-1)
-            final_max_vio = (L * (final_freqs - 1.0 / L).max()).item()
-
-        assert final_max_vio < initial_max_vio * 0.1, (
-            f"load-balance mechanism failed to reduce routing imbalance sufficiently: "
-            f"initial_max_vio={initial_max_vio:.4f}, final_max_vio={final_max_vio:.4f}"
+        assert loss.shape == (), (
+            f"{loss_type}: expected scalar output, got shape {loss.shape}"
         )
+        assert loss.item() == pytest.approx(expected, abs=1e-6), (
+            f"{loss_type}: expected {expected:.8f}, got {loss.item():.8f} "
+            f"with f={f}, p={p}"
+        )
+
+    # gshard ----------------------------------------------------------------
+
+    def test_gshard_formula_on_known_inputs(self):
+        """gshard_loss must compute (1/L) * Σ_i f_i * p_i."""
+        f, p = _F, _P
+        self._verify_formula("gshard", f, p, expected_gshard(f, p))
+
+    def test_gshard_formula_at_balanced_routing(self):
+        """gshard_loss must equal (1/L^2) when f_i = p_i = 1/L for all i."""
+        L = 4
+        f = [1.0 / L] * L
+        p = [1.0 / L] * L
+        self._verify_formula("gshard", f, p, expected_gshard(f, p))
+
+    # ce --------------------------------------------------------------------
+
+    def test_ce_formula_on_known_inputs(self):
+        """ce_loss must compute -(1/(L-1)) * Σ_i (1 - f_i) * log(p_i)."""
+        f, p = _F, _P
+        self._verify_formula("ce", f, p, expected_ce(f, p))
+
+    def test_ce_formula_at_balanced_routing(self):
+        """ce_loss must equal log(L) when f_i = p_i = 1/L for all i."""
+        L = 4
+        f = [1.0 / L] * L
+        p = [1.0 / L] * L
+        self._verify_formula("ce", f, p, expected_ce(f, p))
+
+    # bce -------------------------------------------------------------------
+
+    def test_bce_formula_on_known_inputs(self):
+        """bce_loss must compute -(1/L) * Σ_i [(1-f_i)*log(p_i) + f_i*log1p(-p_i)]."""
+        f, p = _F, _P
+        self._verify_formula("bce", f, p, expected_bce(f, p))
+
+    def test_bce_formula_at_balanced_routing(self):
+        """bce_loss must equal the expected symmetric value when f_i = p_i = 1/L."""
+        L = 4
+        f = [1.0 / L] * L
+        p = [1.0 / L] * L
+        self._verify_formula("bce", f, p, expected_bce(f, p))
+
+
+# ---------------------------------------------------------------------------
+# Gradient isolation
+# ---------------------------------------------------------------------------
+
+class TestGradientIsolation:
+    """Verify that gradients flow to assignment_probs but not routing_freqs.
+
+    This is the core isolation property: routing_freqs comes from discrete TopK
+    selections (no gradient path), and logits are detached before softmax in the
+    caller. So the only differentiable path into the loss is through assignment_probs
+    → expert_bias.
+    """
+
+    def _test_isolation(self, loss_type: str) -> None:
+        routing_freqs, assignment_probs = make_tensors(p_requires_grad=True)
+        loss_fn = make_load_balance_loss(loss_type)
+        loss = loss_fn(routing_freqs, assignment_probs)
+        loss.backward()
+
+        assert assignment_probs.grad is not None, (
+            f"{loss_type}: assignment_probs must receive gradient"
+        )
+        assert torch.isfinite(assignment_probs.grad).all(), (
+            f"{loss_type}: assignment_probs gradient must be finite"
+        )
+        assert routing_freqs.grad is None, (
+            f"{loss_type}: routing_freqs must not receive gradient"
+        )
+
+    def test_gshard_gradient_flows_to_assignment_probs_only(self):
+        """gshard_loss must propagate gradient to assignment_probs; routing_freqs is blocked."""
+        self._test_isolation("gshard")
+
+    def test_ce_gradient_flows_to_assignment_probs_only(self):
+        """ce_loss must propagate gradient to assignment_probs; routing_freqs is blocked."""
+        self._test_isolation("ce")
+
+    def test_bce_gradient_flows_to_assignment_probs_only(self):
+        """bce_loss must propagate gradient to assignment_probs; routing_freqs is blocked."""
+        self._test_isolation("bce")

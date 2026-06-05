@@ -2986,7 +2986,7 @@ The DeepSeek mechanism preserved one correct property: load balance updates reac
 - The router constructs the loss callable once at `__init__` via the factory and calls it during `forward`.
 - `p` is computed via `softmax` applied after detaching the logit tensor, so the only differentiable path into `p` is through `expert_bias`.
 - `LoadBalanceLoss` custom autograd function is removed.
-
+- `log(1-p)` must be implemented using torch.log1p for safety.
 ---
 
 ### Unit 25 — Final Audit
