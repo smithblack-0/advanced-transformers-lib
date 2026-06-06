@@ -102,8 +102,8 @@ class ShramConfig(PretrainedConfig):
         router_init_scale: Initial standard deviation for the ``routing_scale``
             scalar gate on routing logits. Brings routing logit magnitude to
             ``expert_bias`` scale at initialisation so load balancing is operative
-            from step one. Must be positive. Default ``1e-3``. Note lower values
-            may require more bidding rounds to converge.
+            from step one. Must be positive. Default ``1e-4``. Note lower values
+            may require more bidding rounds to converge and more overcapacity to support.
     """
 
     model_type = "shram"
@@ -140,7 +140,7 @@ class ShramConfig(PretrainedConfig):
         load_balance_p: float = 1.0,
         max_bid_rounds: int = 10,
         load_balance_loss_type: str = "ce",
-        router_init_scale: float = 1e-3,
+        router_init_scale: float = 1e-4,
         **kwargs
     ):
         if head_dim % 2 != 0:

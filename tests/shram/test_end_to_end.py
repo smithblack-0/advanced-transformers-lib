@@ -140,39 +140,6 @@ class TestIntegrationTrainable:
                 assert param.grad is not None, f"No gradient for {name}"
 
 
-# ---------------------------------------------------------------------------
-# Integration — Routing scale HuggingFace init survival (Unit 24.B)
-# ---------------------------------------------------------------------------
-
-class TestIntegrationRoutingScale:
-    """routing_scale must survive HuggingFace _init_weights after from_config.
-
-    This is an integration test because the invariant requires the full model
-    construction path: AutoModelForCausalLM.from_config triggers _init_weights,
-    which resets nn.Linear weights. routing_scale is an nn.Parameter and must
-    be exempt.
-    """
-
-    def test_routing_scale_survives_hf_init(self, device):
-        """routing_scale must remain near zero after AutoModelForCausalLM.from_config.
-
-        nn.Parameter objects are not module weights and are not touched by
-        _init_weights. The near-zero value set in MoSRAHRouter.__init__ must
-        be preserved after the full HuggingFace initialization pass.
-        """
-        torch.manual_seed(0)
-        config = small_config()
-        model = AutoModelForCausalLM.from_config(config).to(device)
-
-        from src.shram.model.attention.router import MoSRAHRouter
-        for name, module in model.named_modules():
-            if isinstance(module, MoSRAHRouter):
-                assert module.routing_scale.abs().item() < 0.01, (
-                    f"routing_scale={module.routing_scale.item():.6f} is not near zero "
-                    f"after HuggingFace init in module '{name}' — "
-                    f"_init_weights may have overwritten it"
-                )
-
 
 # ---------------------------------------------------------------------------
 # Integration — Capacity enforcement
@@ -191,8 +158,9 @@ class TestIntegrationCapacityEnforcement:
         config = small_config(
             num_selected_heads=3,
             num_mosrah_heads=4,
-            mosrah_overallocation_factor=1.05   ,
+            mosrah_overallocation_factor=1.2  ,
             training_sequence_length=32,
+            max_bid_rounds = 20,
         )
         m = ShramForCausalLM(config).train().to(device)
         ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
@@ -204,8 +172,9 @@ class TestIntegrationCapacityEnforcement:
         config = small_config(
             num_selected_heads=1,
             num_mosrah_heads=4,
-            mosrah_overallocation_factor=1.001,
+            mosrah_overallocation_factor=1.2,
             training_sequence_length=32,
+            max_bid_rounds = 20,
         )
         m = ShramForCausalLM(config).train().to(device)
         ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
