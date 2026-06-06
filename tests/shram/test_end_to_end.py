@@ -158,8 +158,9 @@ class TestIntegrationCapacityEnforcement:
         config = small_config(
             num_selected_heads=3,
             num_mosrah_heads=4,
-            mosrah_overallocation_factor=1.05   ,
+            mosrah_overallocation_factor=1.2  ,
             training_sequence_length=32,
+            max_bid_rounds = 20,
         )
         m = ShramForCausalLM(config).train().to(device)
         ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
@@ -171,8 +172,9 @@ class TestIntegrationCapacityEnforcement:
         config = small_config(
             num_selected_heads=1,
             num_mosrah_heads=4,
-            mosrah_overallocation_factor=1.001,
+            mosrah_overallocation_factor=1.2,
             training_sequence_length=32,
+            max_bid_rounds = 20,
         )
         m = ShramForCausalLM(config).train().to(device)
         ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
