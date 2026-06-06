@@ -4,11 +4,15 @@ Invariants verified:
 - Output shapes: selected_heads (B, N, K), routing_probs (B, N, K), loss scalar,
   max_vio scalar
 - routing_probs sum to 1 per token and are non-negative
-- routing_probs are computed from unbiased scores, not biased scores
+- routing_probs incorporate expert_bias via semantic_logits (logits * routing_scale + expert_bias.detach())
 - selected_heads are valid indices in [0, L-1] and are distinct per token
-- expert_bias influences selection but not routing_probs
+- expert_bias influences both selection and routing_probs via the semantic gradient channel
 - expert_bias receives a gradient through load_balance_loss
 - routing_projection has no bias parameter
+- routing_scale is a near-zero nn.Parameter that survives HuggingFace _init_weights
+- task loss backward populates routing_projection.weight.grad, not expert_bias.grad
+- load balance loss backward populates expert_bias.grad, not routing_projection.weight.grad
+- assignment_probs are computed before balance_capacity, preventing -1e8 contamination
 - max_vio is exactly 0 for perfectly uniform routing frequencies
 - max_vio is exactly 1 when the most overloaded head receives double its fair share
 - max_vio produces the correct value for a known intermediate routing imbalance
@@ -155,12 +159,12 @@ class TestRoutingProbabilities:
         _, routing_probs, _ = router(x, active_mask, None)
         assert (routing_probs >= 0).all()
 
-    def test_routing_probs_use_unbiased_scores(self):
-        """routing_probs must match manually recomputed P from unbiased routing_scores.
+    def test_routing_probs_use_semantic_logits(self):
+        """routing_probs must match P recomputed from semantic_logits.
 
-        This is the critical invariant that separates selection (which uses expert_bias)
-        from reduction weighting (which must not). Verified by recomputing P independently
-        from the unbiased softmax at the returned selected_heads indices.
+        Routing_probs are gathered from softmax(semantic_logits) = softmax(logits *
+        routing_scale + expert_bias.detach()) at selected_heads indices and renormalized.
+        Verified by recomputing independently using the same biased values.
         """
         config = small_config()
         router = MoSRAHRouter(config)
@@ -170,10 +174,11 @@ class TestRoutingProbabilities:
         with torch.no_grad():
             selected_heads, routing_probs, _ = router(x, active_mask, None)
 
-            # Recompute unbiased scores without going through the router's full forward
-            logits = router.routing_projection(x)
-            unbiased_scores = torch.softmax(logits, dim=-1)
-            gathered = unbiased_scores.gather(dim=-1, index=selected_heads)
+            # Recompute routing_probs through the semantic pathway
+            logits = router.routing_projection(x) * router.routing_scale
+            semantic_logits = logits + router.expert_bias
+            semantic_scores = torch.softmax(semantic_logits, dim=-1)
+            gathered = semantic_scores.gather(dim=-1, index=selected_heads)
             expected_routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)
 
         assert torch.allclose(routing_probs, expected_routing_probs, atol=1e-6)
@@ -212,13 +217,13 @@ class TestSelectedHeads:
 
 
 # ---------------------------------------------------------------------------
-# Bias influences selection only
+# Bias routing behavior
 # ---------------------------------------------------------------------------
 
-class TestBiasInfluencesSelectionOnly:
+class TestBiasRoutingBehavior:
     def test_large_bias_forces_head_selection(self):
         """A large expert_bias on head 0 must cause head 0 to appear in every token's
-        selection — demonstrating that expert_bias drives selection."""
+        selection — demonstrating that expert_bias drives selection via semantic_logits."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(1, 6, 64)
@@ -232,29 +237,32 @@ class TestBiasInfluencesSelectionOnly:
         # Head 0 must be selected for every token when its bias is enormous.
         assert (selected_heads == 0).any(dim=-1).all()
 
-    def test_bias_does_not_affect_routing_probs_at_same_indices(self):
-        """Given the same selected_heads, routing_probs must be identical regardless of
-        expert_bias — because P is computed from unbiased routing_scores only.
+    def test_bias_incorporated_in_routing_probs(self):
+        """With non-zero expert_bias, routing_probs must differ from the zero-bias case.
 
-        Verified by fixing selected_heads via a large bias, then recomputing P from
-        unbiased scores at those indices and confirming it matches.
+        Under the two-pathway architecture, routing_probs are gathered from
+        softmax(semantic_logits) = softmax(logits + expert_bias.detach()). A large
+        bias on one head shifts the softmax distribution, producing different routing_probs
+        than the zero-bias baseline.
         """
         config = small_config()
         router = MoSRAHRouter(config)
+        torch.manual_seed(42)
         x = torch.randn(1, 4, 64)
         active_mask = torch.ones(1, 4, dtype=torch.bool)
 
         with torch.no_grad():
             router.expert_bias.zero_()
+            _, routing_probs_zero_bias, _ = router(x, active_mask, None)
+
+            router.expert_bias.zero_()
             router.expert_bias[0] = 100.0
-            selected_heads, routing_probs, _ = router(x, active_mask, None)
+            _, routing_probs_biased, _ = router(x, active_mask, None)
 
-            logits = router.routing_projection(x)
-            unbiased = torch.softmax(logits, dim=-1)
-            gathered = unbiased.gather(dim=-1, index=selected_heads)
-            expected = gathered / gathered.sum(dim=-1, keepdim=True)
-
-        assert torch.allclose(routing_probs, expected, atol=1e-6)
+        assert not torch.allclose(routing_probs_zero_bias, routing_probs_biased, atol=1e-4), (
+            "routing_probs must differ when expert_bias is non-zero — bias must be "
+            "incorporated via the semantic gradient channel"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +315,101 @@ class TestGradients:
         diagnostics["load_balance_loss"].backward()
 
         assert router.routing_projection.weight.grad is None
+
+
+# ---------------------------------------------------------------------------
+# Two-pathway gradient isolation (Unit 24.C)
+# ---------------------------------------------------------------------------
+
+class TestGradientIsolationTwoPathway:
+    """Tests certifying the two-pathway gradient architecture of Unit 24.C.
+
+    semantic_logits = logits + expert_bias.detach() drives selection and routing_probs.
+    load_balancing_logits = logits.detach() + expert_bias drives assignment_probs.
+    Each pathway isolates one parameter set from the other's loss.
+    """
+
+    def test_task_loss_does_not_reach_expert_bias(self):
+        """Backward on task loss must not populate expert_bias.grad.
+
+        semantic_logits uses expert_bias.detach() — there is no autograd path
+        from routing_probs or selected_heads back to expert_bias.
+        """
+        torch.manual_seed(0)
+        config = small_config()
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, config.embedding_width)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+
+        _, routing_probs, _ = router(x, active_mask, None)
+        routing_probs.sum().backward()
+
+        assert router.routing_projection.weight.grad is not None
+        assert router.expert_bias.grad is None
+
+    def test_load_balance_loss_does_not_reach_routing_projection(self):
+        """Backward on load_balance_loss must not populate routing_projection.weight.grad.
+
+        load_balancing_logits uses logits.detach() — there is no autograd path
+        from assignment_probs back to routing_projection.weight.
+        """
+        torch.manual_seed(0)
+        config = small_config()
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, config.embedding_width)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+
+        _, _, diagnostics = router(x, active_mask, None)
+        diagnostics["load_balance_loss"].backward()
+
+        assert router.expert_bias.grad is not None
+        assert router.routing_projection.weight.grad is None
+
+    def test_assignment_probs_not_contaminated_by_capacity_masking(self):
+        """Load balance gradients must be finite when a preferred expert is over capacity.
+
+        Post-capacity bug: softmax over -1e8-masked logits gives p_0 = exp(-1e8) / sum,
+        which underflows to 0.0 in float32. CE loss computes log(0) = -inf, producing
+        inf/NaN gradients through expert_bias.
+
+        Pre-capacity fix (correct): softmax(load_balancing_logits) is computed before
+        balance_capacity. With expert_bias[0] = 50, p_0 ≈ 1.0 and log(p_0) ≈ 0 —
+        gradient is bounded.
+        """
+        torch.manual_seed(0)
+        # Sparse routing so one expert can be genuinely over capacity in inference mode.
+        config = small_config(
+            num_mosrah_heads=4,
+            num_selected_heads=2,
+            training_sequence_length=8,
+            inference_sequence_length=8,
+            mosrah_overallocation_factor=2.0,
+        )
+        router = MoSRAHRouter(config)
+
+        capacity = config.mosrah_cache_length
+        B, N, L = 1, 2, 4
+        used_capacity = torch.zeros(B, L, dtype=torch.long)
+        used_capacity[0, 0] = capacity  # expert 0 fully at capacity
+
+        # Large positive bias toward expert 0 (already at capacity).
+        with torch.no_grad():
+            router.expert_bias.zero_()
+            router.expert_bias[0] = 50.0
+
+        x = torch.randn(B, N, config.embedding_width)
+        active_mask = torch.ones(B, N, dtype=torch.bool)
+
+        _, _, diagnostics = router(x, active_mask, used_capacity)
+        diagnostics["load_balance_loss"].backward()
+
+        # Post-capacity bug: p_0 = 0.0 (float32 underflow) → log(0) = -inf → inf grad.
+        # Pre-capacity fix: p_0 ≈ 1.0 (from bias=50) → log(1) ≈ 0 → bounded grad.
+        assert torch.isfinite(router.expert_bias.grad).all(), (
+            "expert_bias.grad is non-finite — assignment_probs may have been computed "
+            "post-balance_capacity, producing log(0) from the -1e8 sentinel"
+        )
+        assert router.expert_bias.grad.abs().max().item() < 1e6
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +537,31 @@ class TestArchitectureInvariants:
         config = small_config()
         router = MoSRAHRouter(config)
         assert isinstance(router.expert_bias, torch.nn.Parameter)
+
+
+# ---------------------------------------------------------------------------
+# Routing scale (Unit 24.B)
+# ---------------------------------------------------------------------------
+
+class TestRoutingScale:
+    """Tests certifying the routing_scale scalar gate of Unit 24.B.
+
+    HuggingFace init survival is tested in test_end_to_end.py
+    (TestIntegrationRoutingScale) — that invariant requires the full model
+    construction path and does not belong at unit level.
+    """
+
+    def test_routing_scale_is_scalar(self):
+        """routing_scale must have shape (1,) — a single scalar gate."""
+        config = small_config()
+        router = MoSRAHRouter(config)
+        assert router.routing_scale.shape == (1,)
+
+    def test_routing_scale_is_parameter(self):
+        """routing_scale must be an nn.Parameter so the optimizer can update it."""
+        config = small_config()
+        router = MoSRAHRouter(config)
+        assert isinstance(router.routing_scale, torch.nn.Parameter)
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1136,17 @@ class TestRouterCompileEquivalenceFuzz:
             config = self._make_config(num_mosrah_heads, num_selected_heads)
 
             router = MoSRAHRouter(config).eval().to(device)
+
+            # routing_scale is initialized near-zero (1e-4) to equalize logit
+            # magnitude with expert_bias at training start. At that scale, logit
+            # differences at the TopK boundary fall within floating-point rounding
+            # noise, causing implementation-dependent tie-breaking that differs
+            # between eager and compiled execution paths. This test certifies
+            # compiled/eager equivalence under a well-separated routing signal,
+            # not the load-balance initialization regime. Resetting to 1.0
+            # restores logit separability and makes TopK deterministic.
+            router.routing_scale.data.fill_(1.0)
+
             compiled_router = torch.compile(
                 router,
                 fullgraph=True,
@@ -1059,7 +1198,8 @@ class TestRouterCompileEquivalenceFuzz:
                             None,
                         )
                     )
-
+                assert eager_selected.dtype == compiled_selected.dtype
+                assert eager_selected.device == compiled_selected.device
                 assert torch.equal(eager_selected, compiled_selected), (
                     "compiled router selected different heads: "
                     f"capacity_use={capacity_use}, "
@@ -1088,6 +1228,8 @@ class TestRouterCompileEquivalenceFuzz:
                 )
 
                 for key in eager_diag:
+                    assert compiled_diag[key].device == eager_diag[key].device
+                    assert eager_diag[key].dtype == eager_diag[key].dtype
                     torch.testing.assert_close(
                         compiled_diag[key],
                         eager_diag[key],

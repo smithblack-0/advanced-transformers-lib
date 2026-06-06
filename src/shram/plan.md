@@ -96,7 +96,9 @@ is being achieved, one verified unit at a time.
 - [X] Unit 23.B — Fix position ID resolution: replace cumsum with arange + active-token bias
 - [X] Unit 23.C — Documentation: compile-mode constraints and minor documentation gaps
 - [X] Unit 23.D — Router diagnostics: refactor return signature + add load-balance health scalars
-- [X] Unit 24 — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
+- [X] Unit 24.A — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
+- [X] Unit 24.B — Routing logit variance reduction: near-zero scalar gate
+- [X] Unit 24.C — Biased routing probabilities: incorporate expert_bias into P
 - [ ] Unit 25 — Final Audit
 
 ---
@@ -2950,7 +2952,7 @@ The router output currently conflates routing decisions (`selected_heads`, `rout
 
 ---
 
-### Unit 24 — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
+### Unit 24.A — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
 
 **Responsibility:** Replace the DeepSeek auxiliary-loss-free load balance mechanism with a standard log-probability auxiliary loss that scales correction magnitude with violation severity, while preserving gradient isolation to `expert_bias` only.
 
@@ -2987,6 +2989,79 @@ The DeepSeek mechanism preserved one correct property: load balance updates reac
 - `p` is computed via `softmax` applied after detaching the logit tensor, so the only differentiable path into `p` is through `expert_bias`.
 - `LoadBalanceLoss` custom autograd function is removed.
 - `log(1-p)` must be implemented using torch.log1p for safety.
+---
+
+### Unit 24.B — Routing logit variance reduction: near-zero scalar gate
+
+**Responsibility:** Establish competitive magnitude between routing logits and expert_bias at initialization so the load balance mechanism is operative from step one.
+
+**Context of Correctness**
+
+The load balance mechanism is a competition between two magnitude scales: routing logit spread and load balance correction magnitude. expert_bias can redirect selection only when its corrections are comparable in magnitude to the logit differences that determine selection ranking. HuggingFace initialization applies standard initialization to all module parameters. `nn.Parameter` objects are exempt — they are not module weights and are not touched. After construction, `routing_projection` produces logit std ~0.4 while `expert_bias` sits at zero. The scales are orders of magnitude apart from initialization. Routing concentrates by task gradient before expert_bias builds any leverage to correct it. Unit 24.A improved the loss formulation; this asymmetry is the remaining structural cause.
+
+A scalar `nn.Parameter` initialized near zero multiplies all routing logits before any downstream use. Because it is a Parameter, HuggingFace initialization does not override it. Near-zero initialization brings routing logit magnitude to the same scale as expert_bias at step zero. Both scales are near zero; routing starts near-uniform; load balance is effective from the first batch. The shape is scalar rather than per-head: a per-head parameter receives gradient proportional to expert usage. Underused experts receive less gradient, their scale stays suppressed, and they are excluded from routing permanently — the mechanism designed to ensure all experts contribute would instead structurally kill underused ones.
+
+The initialization magnitude governs the timescale over which routing develops and is an architectural parameter belonging in config.
+
+**Invariants:**
+1. `MoSRAHRouter` has a scalar `nn.Parameter` `routing_scale` whose value at initialization is negligibly small relative to a standard-initialized routing projection output.
+2. `routing_scale` is not a module weight and is not overridden by HuggingFace `_init_weights`.
+3. `routing_scale` is applied to routing logits before all downstream use — there is no concept of logits without it.
+4. `ShramConfig` has `router_init_scale: float` with a sensible positive default; invalid (non-positive) values raise `ValueError` at construction.
+5. `router_init_scale` survives `to_dict` / `from_dict` roundtrip.
+
+**Tests:**
+- After constructing via `AutoModelForCausalLM.from_config` (which triggers HuggingFace init), `routing_scale` is still near zero.
+- `routing_scale` is scalar (shape `(1,)`).
+- `router_init_scale` roundtrips serialization.
+- Non-positive `router_init_scale` raises `ValueError` at construction.
+
+**Preliminary implementation strategy (non-binding):**
+- Add `router_init_scale: float = 1e-4` to `ShramConfig` with `> 0` validation.
+- In `MoSRAHRouter.__init__`: `self.routing_scale = nn.Parameter(torch.randn(1) * config.router_init_scale)`.
+- In `forward`: `logits = self.routing_projection(x) * self.routing_scale` as the first logit line.
+
+---
+
+### Unit 24.C — Two-pathway routing architecture: semantic and load-balancing channels
+
+**Responsibility:** Restructure the router forward pass so that expert_bias governs both selection and output contribution, eliminating the mechanism by which a selected expert can be semantically absent from the output, and separating routing computation into two explicitly named gradient channels.
+
+**Context of Correctness**
+
+A selected expert contributes nothing to the MoSRAH output when its routing_prob is near zero. Under the current design this is structurally possible: selection is driven by biased logits while routing_probs are gathered from unbiased logits. An expert with low unbiased preference is underloaded because the model weakly prefers it; when expert_bias redirects tokens to it, the unbiased preference and the gathered routing_prob remain low, and the expert's output contribution remains suppressed regardless of selection frequency.
+
+Both selection and routing_probs must incorporate expert_bias. The gradient conflict — task loss must not train expert_bias, load balance loss must not train routing_projection — is resolved by two numerically identical biased logit values with complementary detach points. `semantic_logits = logits + expert_bias.detach()` drives selection and routing_probs; task gradients reach routing_projection and expert_bias is isolated from task loss. `load_balancing_logits = logits.detach() + expert_bias` drives assignment_probs; load balance gradients reach expert_bias and routing_projection is isolated from load balance loss. The router's biased/unbiased split — two numerically different values for two different computations — is replaced by two numerically identical values serving two gradient paths. All routing computation uses biased values; no unbiased routing computation exists.
+
+`balance_capacity` injects -1e8 into over-capacity expert positions as a hard allocation constraint, not a preference signal. An over-capacity expert has high routing preference; after masking its softmax probability is near zero. Assignment_probs derived from post-capacity logits produce an inverted load balance signal, increasing expert_bias for an already-overloaded expert. Assignment_probs must be computed from `load_balancing_logits` before capacity masking.
+
+**Invariants:**
+1. `semantic_logits` incorporates expert_bias with expert_bias detached, and is the sole source for both selection and routing_probs. Expert_bias carries no gradient from task loss through this path.
+2. `load_balancing_logits` incorporates expert_bias with logits detached, and is the sole source for assignment_probs. Routing_projection carries no gradient from load_balance_loss through this path.
+3. `semantic_logits` and `load_balancing_logits` are numerically identical at every forward pass.
+4. `selected_heads` is determined by TopK over capacity-balanced `semantic_logits`.
+5. `routing_probs` is gathered from `softmax(semantic_logits)` at `selected_heads` positions and renormalized to sum to 1 per token.
+6. `assignment_probs` is computed from `softmax(load_balancing_logits)` before `balance_capacity` is applied.
+7. No softmax over unbiased logits exists in the router forward pass.
+8. After backward on task loss only: `routing_projection.weight.grad` is not None; `expert_bias.grad` is None.
+9. After backward on `load_balance_loss` only: `expert_bias.grad` is not None; `routing_projection.weight.grad` is None.
+10. Module docstring and class docstring describe the two-pathway gradient architecture; all references to unbiased routing scores are removed.
+
+**Tests:**
+- Gradient isolation (task): backward on task loss only; `routing_projection.weight.grad` not None, `expert_bias.grad` is None.
+- Gradient isolation (load balance): backward on `load_balance_loss` only; `expert_bias.grad` not None, `routing_projection.weight.grad` is None.
+- Bias incorporated: with non-zero expert_bias, `routing_probs` differs from the zero-bias case.
+- Normalization: `routing_probs` sums to 1 per token.
+- Assignment_probs pre-capacity: in an inference scenario with over-capacity experts, `assignment_probs` for those experts is non-negligible — confirming no -1e8 contamination from capacity masking.
+
+**Preliminary implementation strategy (non-binding):**
+- Rename `biased_logits` → `load_balancing_logits`; introduce `semantic_logits = logits + self.expert_bias.detach()`.
+- Replace `routing_scores = F.softmax(logits)` with `routing_scores = F.softmax(semantic_logits)`.
+- Feed `semantic_logits` to `balance_capacity`.
+- Compute `assignment_probs` from `F.softmax(load_balancing_logits)` before the `balance_capacity` call.
+- `logit_std` diagnostic is numerically `semantic_logits.std()` — derivable without change.
+- Update module docstring and class docstring.
+
 ---
 
 ### Unit 25 — Final Audit
