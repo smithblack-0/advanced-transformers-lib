@@ -1,14 +1,21 @@
 """Tests for the load-balance loss factory and the three loss formulations.
 
 Invariants verified:
+- reduce_frequency_tokens produces correct per-batch-item routing frequencies, is detached,
+  excludes dead tokens, and returns zeros on the all-dead-tokens edge case
+- reduce_probability_tokens produces correct per-batch-item mean softmax probabilities,
+  carries gradient from logits, excludes dead tokens, and returns zeros on the
+  all-dead-tokens edge case
 - Factory returns a callable for each of the three valid type strings
 - Factory raises ValueError for an invalid type string
-- gshard_loss computes (1/L) * Σ_i f_i * p_i on known inputs
-- ce_loss computes -(1/(L-1)) * Σ_i (1 - f_i) * log(p_i) on known inputs
-- bce_loss computes -(1/L) * Σ_i [(1-f_i)*log(p_i) + f_i*log1p(-p_i)] on known inputs
+- gshard_loss computes (1/L) * Σ_l f_bl * p_bl per batch item, averaged over B
+- ce_loss computes -(1/(L-1)) * Σ_l (1-f_bl) * log(p_bl) per batch item, averaged over B
+- bce_loss computes -(1/L) * Σ_l [(1-f_bl)*log(p_bl) + f_bl*log(1-p_bl)] per batch item,
+  averaged over B
 - All three formulations return a scalar (zero-dimensional tensor)
-- assignment_probs receives gradient after backward through any formulation
-- routing_freqs (passed detached) receives no gradient
+- Per-batch-item computation: complementary imbalances across batch items are penalised
+  independently and do not cancel before the loss signal is formed
+- logits receives gradient after backward through any formulation; assignment_mask does not
 """
 
 import math
@@ -16,190 +23,414 @@ import math
 import pytest
 import torch
 
-from src.shram.model.attention.load_balance_loss import make_load_balance_loss
+from src.shram.model.attention.load_balance_loss import (
+    make_load_balance_loss,
+    reduce_frequency_tokens,
+    reduce_probability_tokens,
+)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Reference implementations
 # ---------------------------------------------------------------------------
 
-# Shared test vectors. f sums to 1 (valid routing frequencies). p is a
-# valid probability distribution (all positive, sums to 1).
-_F = [0.4, 0.3, 0.2, 0.1]
-_P = [0.25, 0.35, 0.25, 0.15]
+def reference_softmax(logits: list[float]) -> list[float]:
+    """Numerically stable softmax for Python reference calculations."""
+    max_l = max(logits)
+    exps = [math.exp(x - max_l) for x in logits]
+    s = sum(exps)
+    return [e / s for e in exps]
 
 
-def make_tensors(
-    f: list[float] = _F,
-    p: list[float] = _P,
-    p_requires_grad: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Construct routing_freqs and assignment_probs tensors for testing."""
-    routing_freqs = torch.tensor(f, dtype=torch.float32)
-    assignment_probs = torch.tensor(p, dtype=torch.float32, requires_grad=p_requires_grad)
-    return routing_freqs, assignment_probs
+def reference_frequencies(am_row: list[float]) -> list[float]:
+    """Routing frequencies for a B=1, N=1 input: f_l = am_l / sum(am)."""
+    total = max(sum(am_row), 1.0)
+    return [v / total for v in am_row]
 
 
-def expected_gshard(f: list[float], p: list[float]) -> float:
-    """Reference implementation of the gshard formula."""
+def reference_gshard(f: list[float], p: list[float]) -> float:
+    """gshard formula: (1/L) * Σ_l f_l * p_l."""
     L = len(f)
-    return sum(f[i] * p[i] for i in range(L)) / L
+    return sum(fi * pi for fi, pi in zip(f, p)) / L
 
 
-def expected_ce(f: list[float], p: list[float]) -> float:
-    """Reference implementation of the ce formula."""
+def reference_ce(f: list[float], p: list[float]) -> float:
+    """CE formula: -(1/(L-1)) * Σ_l (1-f_l) * log(p_l)."""
     L = len(f)
-    return -sum((1.0 - f[i]) * math.log(p[i]) for i in range(L)) / (L - 1)
+    return -sum((1.0 - fi) * math.log(pi) for fi, pi in zip(f, p)) / (L - 1)
 
 
-def expected_bce(f: list[float], p: list[float]) -> float:
-    """Reference implementation of the bce formula using log1p(-p) for safety."""
+def reference_bce(f: list[float], p: list[float]) -> float:
+    """BCE formula: -(1/L) * Σ_l [(1-f_l)*log(p_l) + f_l*log1p(-p_l)]."""
     L = len(f)
     return -sum(
-        (1.0 - f[i]) * math.log(p[i]) + f[i] * math.log1p(-p[i])
-        for i in range(L)
+        (1.0 - fi) * math.log(pi) + fi * math.log1p(-pi)
+        for fi, pi in zip(f, p)
     ) / L
 
 
 # ---------------------------------------------------------------------------
-# Factory
+# Input constructors
+# ---------------------------------------------------------------------------
+
+# Shared test inputs: L=4, heads 0 and 1 selected, known logits.
+_LOGITS_ROW: list[float] = [1.0, 2.0, -1.0, 0.5]
+_AM_ROW:     list[float] = [1.0, 1.0, 0.0, 0.0]
+
+
+def make_single_token_inputs(
+    logits_row: list[float] = _LOGITS_ROW,
+    am_row: list[float] = _AM_ROW,
+    active: bool = True,
+    logits_requires_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construct B=1, N=1 tensors for single-token numerical tests.
+
+    Returns:
+        logits:          shape (1, 1, L), raw pre-softmax routing values
+        assignment_mask: shape (1, 1, L), head-assignment indicators
+        active_mask:     shape (1, 1), dtype bool
+    """
+    logits = torch.tensor(
+        [[logits_row]], dtype=torch.float32, requires_grad=logits_requires_grad,
+    )
+    assignment_mask = torch.tensor([[am_row]], dtype=torch.float32)
+    active_mask = torch.tensor([[active]], dtype=torch.bool)
+    return logits, assignment_mask, active_mask
+
+
+# ---------------------------------------------------------------------------
+# TestReduceFrequency
+# ---------------------------------------------------------------------------
+
+class TestReduceFrequency:
+    """Verify reduce_frequency_tokens produces correct per-batch-item routing frequencies."""
+
+    def test_single_active_token(self) -> None:
+        """Must compute f_bl as the fraction of active assignments going to each head."""
+        _, assignment_mask, active_mask = make_single_token_inputs()
+
+        f_bl = reduce_frequency_tokens(assignment_mask, active_mask)
+
+        # am=[1,1,0,0]: 2 total assignments → f=[0.5, 0.5, 0, 0].
+        expected = torch.tensor([[0.5, 0.5, 0.0, 0.0]])
+        assert f_bl.shape == (1, 4)
+        assert torch.allclose(f_bl, expected, atol=1e-6)
+
+    def test_multi_token_pools_across_tokens(self) -> None:
+        """Must sum assignments across all active tokens before normalising."""
+        # B=1, N=2: token 0 → heads 0,1; token 1 → heads 2,3.
+        assignment_mask = torch.tensor([[[1.0, 1.0, 0.0, 0.0],
+                                         [0.0, 0.0, 1.0, 1.0]]])  # (1, 2, 4)
+        active_mask = torch.ones(1, 2, dtype=torch.bool)
+
+        f_bl = reduce_frequency_tokens(assignment_mask, active_mask)
+
+        # 4 total assignments, one each → f=[0.25, 0.25, 0.25, 0.25].
+        expected = torch.tensor([[0.25, 0.25, 0.25, 0.25]])
+        assert torch.allclose(f_bl, expected, atol=1e-6)
+
+    def test_dead_tokens_excluded(self) -> None:
+        """Must not count inactive tokens' assignments in routing frequency statistics."""
+        # B=1, N=2: token 0 is dead, token 1 → heads 0 and 2.
+        assignment_mask = torch.tensor([[[1.0, 1.0, 0.0, 0.0],
+                                         [1.0, 0.0, 1.0, 0.0]]])  # (1, 2, 4)
+        active_mask = torch.tensor([[False, True]], dtype=torch.bool)
+
+        f_bl = reduce_frequency_tokens(assignment_mask, active_mask)
+
+        # Only token 1 is active: am=[1,0,1,0] → f=[0.5, 0, 0.5, 0].
+        expected = torch.tensor([[0.5, 0.0, 0.5, 0.0]])
+        assert torch.allclose(f_bl, expected, atol=1e-6)
+
+    def test_output_is_detached(self) -> None:
+        """Must return a detached tensor — routing frequencies carry no gradient."""
+        _, assignment_mask, active_mask = make_single_token_inputs()
+
+        f_bl = reduce_frequency_tokens(assignment_mask, active_mask)
+
+        assert not f_bl.requires_grad
+
+    def test_all_dead_tokens_returns_zeros(self) -> None:
+        """Must return zeros (not NaN) when all tokens in a batch item are inactive."""
+        _, assignment_mask, _ = make_single_token_inputs()
+        all_dead = torch.tensor([[False]], dtype=torch.bool)
+
+        f_bl = reduce_frequency_tokens(assignment_mask, all_dead)
+
+        assert f_bl.shape == (1, 4)
+        assert torch.all(f_bl == 0.0)
+        assert not f_bl.isnan().any()
+
+
+# ---------------------------------------------------------------------------
+# TestReduceProbability
+# ---------------------------------------------------------------------------
+
+class TestReduceProbability:
+    """Verify reduce_probability_tokens produces correct per-batch-item mean softmax probs."""
+
+    def test_single_active_token(self) -> None:
+        """Must equal softmax of the single token's logits when N=1."""
+        logits, _, active_mask = make_single_token_inputs()
+
+        p_bl = reduce_probability_tokens(logits, active_mask)
+
+        # With a single active token the mean is just that token's softmax.
+        expected_p = reference_softmax(_LOGITS_ROW)
+        assert p_bl.shape == (1, 4)
+        for l, exp_val in enumerate(expected_p):
+            assert p_bl[0, l].item() == pytest.approx(exp_val, abs=1e-6), (
+                f"head {l}: expected {exp_val:.8f}, got {p_bl[0, l].item():.8f}"
+            )
+
+    def test_multi_token_mean(self) -> None:
+        """Must return the mean softmax probability over all active tokens per batch item."""
+        # B=1, N=2: two active tokens with known distinct logits.
+        logits = torch.tensor([[[1.0, 0.0, 0.0, 0.0],
+                                 [0.0, 1.0, 0.0, 0.0]]])  # (1, 2, 4)
+        active_mask = torch.ones(1, 2, dtype=torch.bool)
+
+        p_bl = reduce_probability_tokens(logits, active_mask)
+
+        p0 = reference_softmax([1.0, 0.0, 0.0, 0.0])
+        p1 = reference_softmax([0.0, 1.0, 0.0, 0.0])
+        expected = [(p0[l] + p1[l]) / 2.0 for l in range(4)]
+        for l, exp_val in enumerate(expected):
+            assert p_bl[0, l].item() == pytest.approx(exp_val, abs=1e-6), (
+                f"head {l}: expected {exp_val:.8f}, got {p_bl[0, l].item():.8f}"
+            )
+
+    def test_dead_tokens_excluded(self) -> None:
+        """Must compute the mean over active tokens only, ignoring inactive positions."""
+        # B=1, N=2: token 0 is dead with extreme logits; token 1 has the test logits.
+        # If token 0 were included it would dominate the mean and make the test fail.
+        logits = torch.tensor([[[9.0, -9.0, 0.0, 0.0],
+                                 [1.0, 2.0, -1.0, 0.5]]])  # (1, 2, 4)
+        active_mask = torch.tensor([[False, True]], dtype=torch.bool)
+
+        p_bl = reduce_probability_tokens(logits, active_mask)
+
+        # Only token 1 is active; its softmax is the full per-item result.
+        expected_p = reference_softmax([1.0, 2.0, -1.0, 0.5])
+        for l, exp_val in enumerate(expected_p):
+            assert p_bl[0, l].item() == pytest.approx(exp_val, abs=1e-6), (
+                f"head {l}: expected {exp_val:.8f}, got {p_bl[0, l].item():.8f}"
+            )
+
+    def test_gradient_flows_through_output(self) -> None:
+        """Must preserve the gradient path from logits through the output tensor."""
+        logits, _, active_mask = make_single_token_inputs(logits_requires_grad=True)
+
+        p_bl = reduce_probability_tokens(logits, active_mask)
+
+        assert p_bl.requires_grad
+
+    def test_all_dead_tokens_returns_zeros(self) -> None:
+        """Must return zeros (not NaN) when all tokens in a batch item are inactive."""
+        logits, _, _ = make_single_token_inputs()
+        all_dead = torch.tensor([[False]], dtype=torch.bool)
+
+        p_bl = reduce_probability_tokens(logits, all_dead)
+
+        assert p_bl.shape == (1, 4)
+        assert torch.all(p_bl == 0.0)
+        assert not p_bl.isnan().any()
+
+
+# ---------------------------------------------------------------------------
+# TestFactory
 # ---------------------------------------------------------------------------
 
 class TestFactory:
-    def test_returns_callable_for_gshard(self):
+    """Verify the make_load_balance_loss factory returns the correct callable or raises."""
+
+    def test_returns_callable_for_gshard(self) -> None:
         """Factory must return a callable for loss_type='gshard'."""
         fn = make_load_balance_loss("gshard")
         assert callable(fn)
 
-    def test_returns_callable_for_ce(self):
+    def test_returns_callable_for_ce(self) -> None:
         """Factory must return a callable for loss_type='ce'."""
         fn = make_load_balance_loss("ce")
         assert callable(fn)
 
-    def test_returns_callable_for_bce(self):
+    def test_returns_callable_for_bce(self) -> None:
         """Factory must return a callable for loss_type='bce'."""
         fn = make_load_balance_loss("bce")
         assert callable(fn)
 
-    def test_raises_for_invalid_type(self):
+    def test_raises_for_invalid_type(self) -> None:
         """Factory must raise ValueError for an unrecognised loss_type."""
         with pytest.raises(ValueError, match="load_balance_loss_type"):
             make_load_balance_loss("invalid_type")
 
 
 # ---------------------------------------------------------------------------
-# Formula correctness and output shape
+# TestFormulas
 # ---------------------------------------------------------------------------
 
 class TestFormulas:
-    """Verify each formulation against a Python reference on known inputs.
+    """Verify each formulation against a Python reference on known B=1, N=1 inputs.
 
-    The reference functions (expected_gshard, expected_ce, expected_bce) are
-    direct Python translations of the formulas in the plan entry. Comparing
-    the tensor output against these references certifies the PyTorch
-    implementation matches the intended formula.
+    Uses B=1, N=1 so f and p are determined directly by the single token's assignment_mask
+    and the softmax of its logits. Reference functions are direct Python translations of
+    the plan-entry formulas.
     """
 
     def _verify_formula(
         self,
         loss_type: str,
-        f: list[float],
-        p: list[float],
+        logits_row: list[float],
+        am_row: list[float],
         expected: float,
     ) -> None:
-        """Call loss_fn and assert output matches expected to 1e-6."""
-        routing_freqs, assignment_probs = make_tensors(f, p)
+        """Call the loss function and assert the output matches expected to 1e-5."""
+        logits, assignment_mask, active_mask = make_single_token_inputs(
+            logits_row=logits_row, am_row=am_row,
+        )
         loss_fn = make_load_balance_loss(loss_type)
-        loss = loss_fn(routing_freqs, assignment_probs)
+        loss = loss_fn(logits, assignment_mask, active_mask)
 
         assert loss.shape == (), (
             f"{loss_type}: expected scalar output, got shape {loss.shape}"
         )
-        assert loss.item() == pytest.approx(expected, abs=1e-6), (
+        assert loss.item() == pytest.approx(expected, abs=1e-5), (
             f"{loss_type}: expected {expected:.8f}, got {loss.item():.8f} "
-            f"with f={f}, p={p}"
+            f"with logits={logits_row}, am={am_row}"
         )
 
-    # gshard ----------------------------------------------------------------
+    # gshard -----------------------------------------------------------------
 
-    def test_gshard_formula_on_known_inputs(self):
-        """gshard_loss must compute (1/L) * Σ_i f_i * p_i."""
-        f, p = _F, _P
-        self._verify_formula("gshard", f, p, expected_gshard(f, p))
+    def test_gshard_formula_on_known_inputs(self) -> None:
+        """gshard_loss must compute (1/L) * Σ_l f_l * p_l on known inputs."""
+        f = reference_frequencies(_AM_ROW)
+        p = reference_softmax(_LOGITS_ROW)
+        self._verify_formula("gshard", _LOGITS_ROW, _AM_ROW, reference_gshard(f, p))
 
-    def test_gshard_formula_at_balanced_routing(self):
-        """gshard_loss must equal (1/L^2) when f_i = p_i = 1/L for all i."""
-        L = 4
-        f = [1.0 / L] * L
-        p = [1.0 / L] * L
-        self._verify_formula("gshard", f, p, expected_gshard(f, p))
+    def test_gshard_formula_at_balanced_routing(self) -> None:
+        """gshard_loss must equal 1/L^2 when all heads have equal frequency and uniform logits."""
+        # K=L=4: every head selected; zero logits → uniform softmax → f=p=1/L.
+        am  = [1.0, 1.0, 1.0, 1.0]
+        lgs = [0.0, 0.0, 0.0, 0.0]
+        f = reference_frequencies(am)
+        p = reference_softmax(lgs)
+        self._verify_formula("gshard", lgs, am, reference_gshard(f, p))
 
-    # ce --------------------------------------------------------------------
+    # ce ---------------------------------------------------------------------
 
-    def test_ce_formula_on_known_inputs(self):
-        """ce_loss must compute -(1/(L-1)) * Σ_i (1 - f_i) * log(p_i)."""
-        f, p = _F, _P
-        self._verify_formula("ce", f, p, expected_ce(f, p))
+    def test_ce_formula_on_known_inputs(self) -> None:
+        """ce_loss must compute -(1/(L-1)) * Σ_l (1-f_l)*log(p_l) on known inputs."""
+        f = reference_frequencies(_AM_ROW)
+        p = reference_softmax(_LOGITS_ROW)
+        self._verify_formula("ce", _LOGITS_ROW, _AM_ROW, reference_ce(f, p))
 
-    def test_ce_formula_at_balanced_routing(self):
-        """ce_loss must equal log(L) when f_i = p_i = 1/L for all i."""
-        L = 4
-        f = [1.0 / L] * L
-        p = [1.0 / L] * L
-        self._verify_formula("ce", f, p, expected_ce(f, p))
+    def test_ce_formula_at_balanced_routing(self) -> None:
+        """ce_loss must produce the correct symmetric value when f_l = p_l = 1/L."""
+        am  = [1.0, 1.0, 1.0, 1.0]
+        lgs = [0.0, 0.0, 0.0, 0.0]
+        f = reference_frequencies(am)
+        p = reference_softmax(lgs)
+        self._verify_formula("ce", lgs, am, reference_ce(f, p))
 
-    # bce -------------------------------------------------------------------
+    # bce --------------------------------------------------------------------
 
-    def test_bce_formula_on_known_inputs(self):
-        """bce_loss must compute -(1/L) * Σ_i [(1-f_i)*log(p_i) + f_i*log1p(-p_i)]."""
-        f, p = _F, _P
-        self._verify_formula("bce", f, p, expected_bce(f, p))
+    def test_bce_formula_on_known_inputs(self) -> None:
+        """bce_loss must compute -(1/L)*Σ_l[(1-f_l)*log(p_l)+f_l*log(1-p_l)] on known inputs."""
+        f = reference_frequencies(_AM_ROW)
+        p = reference_softmax(_LOGITS_ROW)
+        self._verify_formula("bce", _LOGITS_ROW, _AM_ROW, reference_bce(f, p))
 
-    def test_bce_formula_at_balanced_routing(self):
-        """bce_loss must equal the expected symmetric value when f_i = p_i = 1/L."""
-        L = 4
-        f = [1.0 / L] * L
-        p = [1.0 / L] * L
-        self._verify_formula("bce", f, p, expected_bce(f, p))
+    def test_bce_formula_at_balanced_routing(self) -> None:
+        """bce_loss must produce the correct symmetric value when f_l = p_l = 1/L."""
+        am  = [1.0, 1.0, 1.0, 1.0]
+        lgs = [0.0, 0.0, 0.0, 0.0]
+        f = reference_frequencies(am)
+        p = reference_softmax(lgs)
+        self._verify_formula("bce", lgs, am, reference_bce(f, p))
 
 
 # ---------------------------------------------------------------------------
-# Gradient isolation
+# TestBatchCorrectness
+# ---------------------------------------------------------------------------
+
+class TestBatchCorrectness:
+    """Verify that loss is computed per batch item so complementary imbalances do not cancel.
+
+    Uses B=2, N=1, L=4, K=1 where item 0 routes to head 0 and item 1 routes to head 3.
+    Each item has extreme per-item imbalance. A global-frequency implementation would
+    produce f=[0.5,0,0,0.5] and suppress the CE signal; per-item computation preserves
+    the imbalance from each item independently.
+
+    The two items are mirror-symmetric (reversed routing + reversed logits), so per-item
+    CE values are equal and the expected mean equals either item computed individually.
+    """
+
+    def test_ce_per_batch_item_numerical(self) -> None:
+        """ce_loss must compute per-item CE and average over B, not flatten B*N first."""
+        assignment_mask = torch.tensor([
+            [[1.0, 0.0, 0.0, 0.0]],   # item 0: token routed to head 0
+            [[0.0, 0.0, 0.0, 1.0]],   # item 1: token routed to head 3
+        ])  # (2, 1, 4)
+        logits = torch.tensor([
+            [[0.4, 0.3, 0.2, 0.1]],
+            [[0.1, 0.2, 0.3, 0.4]],   # mirror of item 0
+        ])  # (2, 1, 4)
+        active_mask = torch.ones(2, 1, dtype=torch.bool)
+
+        loss_fn = make_load_balance_loss("ce")
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        # Item 0: f=[1,0,0,0], p=softmax([0.4,0.3,0.2,0.1]).
+        # Mirror symmetry: CE(item 1) == CE(item 0), so expected = CE(item 0).
+        f0 = reference_frequencies([1.0, 0.0, 0.0, 0.0])
+        p0 = reference_softmax([0.4, 0.3, 0.2, 0.1])
+        expected = reference_ce(f0, p0)
+
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(expected, abs=1e-5), (
+            f"ce batch: expected {expected:.8f}, got {loss.item():.8f}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestGradientIsolation
 # ---------------------------------------------------------------------------
 
 class TestGradientIsolation:
-    """Verify that gradients flow to assignment_probs but not routing_freqs.
+    """Verify that gradients flow to logits but not assignment_mask.
 
-    This is the core isolation property: routing_freqs comes from discrete TopK
-    selections (no gradient path), and logits are detached before softmax in the
-    caller. So the only differentiable path into the loss is through assignment_probs
-    → expert_bias.
+    logits is constructed by the caller as logits.detach() + expert_bias, so the
+    only differentiable path into the loss is through expert_bias. assignment_mask
+    comes from discrete TopK selections and carries no gradient.
     """
 
     def _test_isolation(self, loss_type: str) -> None:
-        routing_freqs, assignment_probs = make_tensors(p_requires_grad=True)
+        logits, assignment_mask, active_mask = make_single_token_inputs(
+            logits_requires_grad=True,
+        )
         loss_fn = make_load_balance_loss(loss_type)
-        loss = loss_fn(routing_freqs, assignment_probs)
+        loss = loss_fn(logits, assignment_mask, active_mask)
         loss.backward()
 
-        assert assignment_probs.grad is not None, (
-            f"{loss_type}: assignment_probs must receive gradient"
+        assert logits.grad is not None, (
+            f"{loss_type}: logits must receive gradient"
         )
-        assert torch.isfinite(assignment_probs.grad).all(), (
-            f"{loss_type}: assignment_probs gradient must be finite"
+        assert torch.isfinite(logits.grad).all(), (
+            f"{loss_type}: logits gradient must be finite"
         )
-        assert routing_freqs.grad is None, (
-            f"{loss_type}: routing_freqs must not receive gradient"
+        assert assignment_mask.grad is None, (
+            f"{loss_type}: assignment_mask must not receive gradient"
         )
 
-    def test_gshard_gradient_flows_to_assignment_probs_only(self):
-        """gshard_loss must propagate gradient to assignment_probs; routing_freqs is blocked."""
+    def test_gshard_gradient_flows_to_logits_only(self) -> None:
+        """gshard_loss must propagate gradient to logits; assignment_mask is blocked."""
         self._test_isolation("gshard")
 
-    def test_ce_gradient_flows_to_assignment_probs_only(self):
-        """ce_loss must propagate gradient to assignment_probs; routing_freqs is blocked."""
+    def test_ce_gradient_flows_to_logits_only(self) -> None:
+        """ce_loss must propagate gradient to logits; assignment_mask is blocked."""
         self._test_isolation("ce")
 
-    def test_bce_gradient_flows_to_assignment_probs_only(self):
-        """bce_loss must propagate gradient to assignment_probs; routing_freqs is blocked."""
+    def test_bce_gradient_flows_to_logits_only(self) -> None:
+        """bce_loss must propagate gradient to logits; assignment_mask is blocked."""
         self._test_isolation("bce")

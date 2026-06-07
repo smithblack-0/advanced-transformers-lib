@@ -419,27 +419,29 @@ class TestLoadBalanceLossType:
 
 
 # ---------------------------------------------------------------------------
-# router_init_scale (Unit 24.B)
+# routing_mode
 # ---------------------------------------------------------------------------
 
-class TestRouterInitScale:
-    def test_default_is_positive(self):
-        """router_init_scale must default to a positive value (1e-4)."""
+class TestRoutingMode:
+    def test_routing_mode_default_is_integral(self):
+        """routing_mode must default to 'integral' — integral routing is on by default."""
         config = ShramConfig()
-        assert config.router_init_scale > 0.0
+        assert config.routing_mode == "integral"
 
-    def test_roundtrip(self):
-        """router_init_scale must survive to_dict/from_dict serialisation."""
-        config = small_config(router_init_scale=1e-3)
+    def test_routing_mode_integral_roundtrips_serialization(self):
+        """routing_mode='integral' must survive to_dict/from_dict serialisation."""
+        config = small_config(routing_mode="integral")
         restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.router_init_scale == 1e-3
+        assert restored.routing_mode == "integral"
 
-    def test_non_positive_raises(self):
-        """Non-positive router_init_scale must raise ValueError at construction."""
-        with pytest.raises(ValueError, match="router_init_scale"):
-            small_config(router_init_scale=0.0)
+    def test_routing_mode_default_roundtrips_serialization(self):
+        """routing_mode='default' must survive to_dict/from_dict serialisation."""
+        config = small_config(routing_mode="default")
+        restored = ShramConfig.from_dict(config.to_dict())
+        assert restored.routing_mode == "default"
 
-    def test_negative_raises(self):
-        """Negative router_init_scale must raise ValueError at construction."""
-        with pytest.raises(ValueError, match="router_init_scale"):
-            small_config(router_init_scale=-1e-4)
+    def test_routing_mode_invalid_raises(self):
+        """An unrecognised routing_mode must raise ValueError at construction."""
+        with pytest.raises(ValueError, match="routing_mode"):
+            small_config(routing_mode="invalid")
+
