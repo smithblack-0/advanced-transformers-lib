@@ -84,10 +84,6 @@ class ShramConfig(PretrainedConfig):
             num_selected_heads / num_mosrah_heads * mosrah_overallocation_factor).
             Must be > 1.0 to guarantee a buffer larger than the balanced-routing
             baseline. Default 2.0.
-        load_balance_p: Exponent p for the p-mean aggregation of per-item routing
-            frequencies into the load balance signal. Higher p weights aggregation
-            toward the worst-case batch item, making the correction signal more
-            sensitive to per-item allocation spikes. Must be positive. Default 2.0.
         max_bid_rounds: Maximum bidding rounds for the deferred-acceptance capacity
             solver in ``balance_capacity``. 10 covers convergence at approximately
             the 98th percentile of routing densities; the top 2% of extreme-density
@@ -99,11 +95,6 @@ class ShramConfig(PretrainedConfig):
             is the default; its log-probability signal scales with violation severity
             and makes correction magnitude proportional to routing imbalance.
             Default ``"ce"``.
-        router_init_scale: Initial standard deviation for the ``routing_scale``
-            scalar gate on routing logits. Brings routing logit magnitude to
-            ``expert_bias`` scale at initialisation so load balancing is operative
-            from step one. Must be positive. Default ``1e-4``. Note lower values
-            may require more bidding rounds to converge and more overcapacity to support.
     """
 
     model_type = "shram"
@@ -137,10 +128,8 @@ class ShramConfig(PretrainedConfig):
         output_hidden_states: bool = False,
         tie_word_embeddings: bool = False,
         mosrah_overallocation_factor: float = 2.0,
-        load_balance_p: float = 1.0,
         max_bid_rounds: int = 10,
         load_balance_loss_type: str = "ce",
-        router_init_scale: float = 1e-4,
         **kwargs
     ):
         if head_dim % 2 != 0:
@@ -176,11 +165,6 @@ class ShramConfig(PretrainedConfig):
                 f"Got {mosrah_overallocation_factor}."
             )
 
-        if load_balance_p <= 0.0:
-            raise ValueError(
-                f"load_balance_p must be positive, got {load_balance_p}."
-            )
-
         if max_bid_rounds < 1:
             raise ValueError(
                 f"max_bid_rounds must be at least 1, got {max_bid_rounds}."
@@ -193,15 +177,6 @@ class ShramConfig(PretrainedConfig):
                 f"load_balance_loss_type must be one of {supported}, "
                 f"got {load_balance_loss_type!r}."
             )
-        if load_balance_loss_type == "ce" and load_balance_p != 1.0:
-            raise ValueError("In cross entropy mode, aggregation of "
-                             "frequencies must be with mean 1.0")
-
-        if router_init_scale <= 0.0:
-            raise ValueError(
-                f"router_init_scale must be positive, got {router_init_scale}."
-            )
-
         self.vocab_size = vocab_size
         self.embedding_width = embedding_width
         self.mlp_width = mlp_width
@@ -220,10 +195,8 @@ class ShramConfig(PretrainedConfig):
         self.alpha = alpha
         self.beta = beta
         self.mosrah_overallocation_factor = mosrah_overallocation_factor
-        self.load_balance_p = load_balance_p
         self.max_bid_rounds = max_bid_rounds
         self.load_balance_loss_type = load_balance_loss_type
-        self.router_init_scale = router_init_scale
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
 

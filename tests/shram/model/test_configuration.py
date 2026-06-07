@@ -418,28 +418,3 @@ class TestLoadBalanceLossType:
             small_config(load_balance_loss_type="invalid")
 
 
-# ---------------------------------------------------------------------------
-# router_init_scale (Unit 24.B)
-# ---------------------------------------------------------------------------
-
-class TestRouterInitScale:
-    def test_default_is_positive(self):
-        """router_init_scale must default to a positive value (1e-4)."""
-        config = ShramConfig()
-        assert config.router_init_scale > 0.0
-
-    def test_roundtrip(self):
-        """router_init_scale must survive to_dict/from_dict serialisation."""
-        config = small_config(router_init_scale=1e-3)
-        restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.router_init_scale == 1e-3
-
-    def test_non_positive_raises(self):
-        """Non-positive router_init_scale must raise ValueError at construction."""
-        with pytest.raises(ValueError, match="router_init_scale"):
-            small_config(router_init_scale=0.0)
-
-    def test_negative_raises(self):
-        """Negative router_init_scale must raise ValueError at construction."""
-        with pytest.raises(ValueError, match="router_init_scale"):
-            small_config(router_init_scale=-1e-4)

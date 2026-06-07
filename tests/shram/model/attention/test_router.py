@@ -4,12 +4,11 @@ Invariants verified:
 - Output shapes: selected_heads (B, N, K), routing_probs (B, N, K), loss scalar,
   max_vio scalar
 - routing_probs sum to 1 per token and are non-negative
-- routing_probs incorporate expert_bias via semantic_logits (logits * routing_scale + expert_bias.detach())
+- routing_probs incorporate expert_bias via semantic_logits (logits + expert_bias.detach())
 - selected_heads are valid indices in [0, L-1] and are distinct per token
 - expert_bias influences both selection and routing_probs via the semantic gradient channel
 - expert_bias receives a gradient through load_balance_loss
 - routing_projection has no bias parameter
-- routing_scale is a near-zero nn.Parameter that survives HuggingFace _init_weights
 - task loss backward populates routing_projection.weight.grad, not expert_bias.grad
 - load balance loss backward populates expert_bias.grad, not routing_projection.weight.grad
 - assignment_probs are computed before balance_capacity, preventing -1e8 contamination
@@ -19,13 +18,14 @@ Invariants verified:
 - max_vio is detached from the autograd graph
 - dead outer tokens do not affect load_balance_loss
 - dead outer tokens do not affect max_vio
-- all-live active_mask gives routing frequencies equivalent to the pre-masking formula
+- router forward max_vio matches _compute_max_vio called directly on all-live inputs
 - router_diagnostics separates routing decisions from routing feedback
 - load_balance_loss has gradient; all other diagnostic scalars are detached
 - bias_std is zero when expert_bias is zero
 - logit_std equals raw_logit_std when expert_bias is zero
 - bias_alignment is negative when expert_bias opposes routing logit direction
 - bias_alignment is positive when expert_bias reinforces routing logit direction
+- _compute_bias_diagnostics returns exactly {bias_std, raw_logit_std, logit_std, bias_alignment}, all detached
 - compiled and eager router diagnostics are numerically identical
 """
 
@@ -57,37 +57,6 @@ def small_config(**kwargs) -> ShramConfig:
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
-
-
-def _reference_routing_freqs(
-    selected_heads: torch.Tensor,
-    num_heads: int,
-    p: float,
-) -> torch.Tensor:
-    """Reference p-mean routing frequencies with no masking.
-
-    Counts every token unconditionally, divides by N*K per batch item, then
-    applies p-mean over the batch dimension. Trivially correct by inspection;
-    used to verify the production masked path degenerates correctly when all
-    tokens are live.
-
-    Args:
-        selected_heads: Head indices of shape (B, N, K).
-        num_heads: Total number of heads L.
-        p: p-mean exponent.
-
-    Returns:
-        p-mean aggregated routing frequencies of shape (L,).
-    """
-    B, N, K = selected_heads.shape
-    per_item_freqs = torch.zeros(B, num_heads)
-    for b in range(B):
-        counts = torch.zeros(num_heads)
-        for n in range(N):
-            for k in range(K):
-                counts[selected_heads[b, n, k]] += 1
-        per_item_freqs[b] = counts / (N * K)
-    return (per_item_freqs ** p).mean(dim=0) ** (1.0 / p)
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +131,8 @@ class TestRoutingProbabilities:
     def test_routing_probs_use_semantic_logits(self):
         """routing_probs must match P recomputed from semantic_logits.
 
-        Routing_probs are gathered from softmax(semantic_logits) = softmax(logits *
-        routing_scale + expert_bias.detach()) at selected_heads indices and renormalized.
+        Routing_probs are gathered from softmax(semantic_logits) = softmax(logits +
+        expert_bias.detach()) at selected_heads indices and renormalized.
         Verified by recomputing independently using the same biased values.
         """
         config = small_config()
@@ -175,7 +144,7 @@ class TestRoutingProbabilities:
             selected_heads, routing_probs, _ = router(x, active_mask, None)
 
             # Recompute routing_probs through the semantic pathway
-            logits = router.routing_projection(x) * router.routing_scale
+            logits = router.routing_projection(x)
             semantic_logits = logits + router.expert_bias
             semantic_scores = torch.softmax(semantic_logits, dim=-1)
             gathered = semantic_scores.gather(dim=-1, index=selected_heads)
@@ -515,6 +484,84 @@ class TestRouterDiagnostics:
 
 
 # ---------------------------------------------------------------------------
+# Bias diagnostics (static method)
+# ---------------------------------------------------------------------------
+
+class TestBiasDiagnostics:
+    """Tests for MoSRAHRouter._compute_bias_diagnostics called directly as a static method.
+
+    TestRouterDiagnostics verifies the same scalars through the router forward pass.
+    This class certifies the static method contract independently, without routing.
+    """
+
+    def _make_inputs(
+        self,
+        B: int,
+        N: int,
+        L: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Construct (logits, semantic_logits, expert_bias) for static method tests."""
+        logits = torch.randn(B, N, L)
+        expert_bias = torch.randn(L)
+        semantic_logits = logits + expert_bias
+        return logits, semantic_logits, expert_bias
+
+    def test_returns_expected_keys(self):
+        """_compute_bias_diagnostics must return a dict with exactly the four expected keys."""
+        logits, semantic_logits, expert_bias = self._make_inputs(2, 8, 4)
+        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
+        assert set(result.keys()) == {"bias_std", "raw_logit_std", "logit_std", "bias_alignment"}
+
+    def test_all_values_detached(self):
+        """All four diagnostic scalars must be detached from the autograd graph."""
+        logits = torch.randn(2, 8, 4, requires_grad=True)
+        expert_bias = torch.randn(4, requires_grad=True)
+        semantic_logits = logits + expert_bias
+        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
+        for key, val in result.items():
+            assert not val.requires_grad, (
+                f"{key} must be detached but requires_grad is True"
+            )
+
+    def test_bias_std_zero_when_bias_is_uniform(self):
+        """bias_std must be exactly 0 when all expert_bias entries are equal."""
+        L = 6
+        logits = torch.randn(1, 4, L)
+        expert_bias = torch.full((L,), 2.5)
+        semantic_logits = logits + expert_bias
+        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
+        assert result["bias_std"].item() == 0.0
+
+    def test_alignment_negative_when_bias_opposes_logits(self):
+        """bias_alignment must be negative when expert_bias is set to -mean_logit_direction."""
+        torch.manual_seed(7)
+        B, N, L = 1, 8, 4
+        logits = torch.randn(B, N, L)
+        mean_direction = logits.mean(dim=(0, 1))              # (L,)
+        expert_bias = -mean_direction
+        semantic_logits = logits + expert_bias
+        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
+        assert result["bias_alignment"].item() < 0, (
+            f"expected negative alignment for opposing bias, "
+            f"got {result['bias_alignment'].item()}"
+        )
+
+    def test_alignment_positive_when_bias_reinforces_logits(self):
+        """bias_alignment must be positive when expert_bias is set to +mean_logit_direction."""
+        torch.manual_seed(7)
+        B, N, L = 1, 8, 4
+        logits = torch.randn(B, N, L)
+        mean_direction = logits.mean(dim=(0, 1))              # (L,)
+        expert_bias = mean_direction
+        semantic_logits = logits + expert_bias
+        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
+        assert result["bias_alignment"].item() > 0, (
+            f"expected positive alignment for reinforcing bias, "
+            f"got {result['bias_alignment'].item()}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Architecture invariants
 # ---------------------------------------------------------------------------
 
@@ -540,83 +587,60 @@ class TestArchitectureInvariants:
 
 
 # ---------------------------------------------------------------------------
-# Routing scale (Unit 24.B)
-# ---------------------------------------------------------------------------
-
-class TestRoutingScale:
-    """Tests certifying the routing_scale scalar gate of Unit 24.B.
-
-    HuggingFace init survival is tested in test_end_to_end.py
-    (TestIntegrationRoutingScale) — that invariant requires the full model
-    construction path and does not belong at unit level.
-    """
-
-    def test_routing_scale_is_scalar(self):
-        """routing_scale must have shape (1,) — a single scalar gate."""
-        config = small_config()
-        router = MoSRAHRouter(config)
-        assert router.routing_scale.shape == (1,)
-
-    def test_routing_scale_is_parameter(self):
-        """routing_scale must be an nn.Parameter so the optimizer can update it."""
-        config = small_config()
-        router = MoSRAHRouter(config)
-        assert isinstance(router.routing_scale, torch.nn.Parameter)
-
-
-# ---------------------------------------------------------------------------
 # MaxVio
 # ---------------------------------------------------------------------------
 
 class TestMaxVio:
     """Tests for the _compute_max_vio helper and the max_vio forward output.
 
-    The helper is tested directly with synthetic routing_freqs tensors, bypassing
+    The helper is tested directly with synthetic assignment_mask tensors, bypassing
     TopK entirely. This avoids the tie-breaking ambiguity that arises when all
     routing scores are equal and makes the expected values exact and analytical.
 
-    All three test cases use L=4 heads and analytically derived expected values.
+    All three numerical tests use B=1, L=4, K=1 and analytically derived expected
+    values. assignment_mask is constructed via scatter from known head selections so
+    that reduce_frequency_tokens produces known f_bl values.
     """
 
     def test_max_vio_zero_for_uniform_frequencies(self):
         """MaxVio must be exactly 0 when all heads receive equal routing frequency.
 
-        With perfectly balanced routing (f_l = 1/L for all l), every term
-        (f_l - 1/L) is zero, so L * max(f_l - 1/L) = 0.
+        With L=4 and one token per head (N=4, K=1), each head gets f=0.25.
+        Every term (f_l - 1/L) is zero, so L * max(f_l - 1/L) = 0.
         """
         L = 4
-        routing_freqs = torch.full((L,), 1.0 / L)
-        max_vio = MoSRAHRouter._compute_max_vio(routing_freqs, L)
+        # Token i selects head i: f_bl = [0.25, 0.25, 0.25, 0.25]
+        assignment_mask = torch.eye(L).unsqueeze(0)        # (1, 4, 4)
+        active_mask = torch.ones(1, L, dtype=torch.bool)
+        max_vio = MoSRAHRouter._compute_max_vio(assignment_mask, active_mask, L)
         assert torch.isclose(max_vio, torch.tensor(0.0), atol=1e-6)
 
     def test_max_vio_one_for_double_fair_share(self):
         """MaxVio must be exactly 1 when one head receives double its fair share.
 
-        With L=4, fair share is 0.25. Head 0 gets 0.5 (= 2/L); the remaining
-        three heads share the rest equally. MaxVio = 4 * (0.5 - 0.25) = 1.0.
+        With L=4, N=6, K=1: 3 tokens to head 0, 1 each to heads 1-3.
+        f_bl = [3/6, 1/6, 1/6, 1/6] = [0.5, 1/6, 1/6, 1/6].
+        MaxVio = 4 * (0.5 - 0.25) = 1.0.
         """
-        L = 4
-        overloaded_freq = 2.0 / L                          # 0.5
-        remainder = (1.0 - overloaded_freq) / (L - 1)     # 1/6 each
-        routing_freqs = torch.tensor(
-            [overloaded_freq] + [remainder] * (L - 1)
-        )
-        max_vio = MoSRAHRouter._compute_max_vio(routing_freqs, L)
+        L, N = 4, 6
+        heads_selected = torch.tensor([[0, 0, 0, 1, 2, 3]]).unsqueeze(-1)  # (1, 6, 1)
+        assignment_mask = torch.zeros(1, N, L).scatter_(-1, heads_selected, 1.0)
+        active_mask = torch.ones(1, N, dtype=torch.bool)
+        max_vio = MoSRAHRouter._compute_max_vio(assignment_mask, active_mask, L)
         assert torch.isclose(max_vio, torch.tensor(1.0), atol=1e-6)
 
     def test_max_vio_intermediate_value(self):
         """MaxVio must equal 0.5 when one head receives 1.5× its fair share.
 
-        With L=4, fair share is 0.25. Head 0 gets 0.375 (= 1.5/L); the remaining
-        three heads share the rest equally. MaxVio = 4 * (0.375 - 0.25) = 0.5.
+        With L=4, N=8, K=1: 3 tokens to head 0, then 2/2/1 to heads 1/2/3.
+        f_bl = [3/8, 2/8, 2/8, 1/8] = [0.375, 0.25, 0.25, 0.125].
+        MaxVio = 4 * (0.375 - 0.25) = 0.5.
         """
-        L = 4
-        overloaded_freq = 1.5 / L                          # 0.375
-        remainder = (1.0 - overloaded_freq) / (L - 1)     # 0.625 / 3
-        routing_freqs = torch.tensor(
-            [overloaded_freq] + [remainder] * (L - 1)
-        )
-        max_vio = MoSRAHRouter._compute_max_vio(routing_freqs, L)
+        L, N = 4, 8
+        heads_selected = torch.tensor([[0, 0, 0, 1, 2, 3, 1, 2]]).unsqueeze(-1)  # (1, 8, 1)
+        assignment_mask = torch.zeros(1, N, L).scatter_(-1, heads_selected, 1.0)
+        active_mask = torch.ones(1, N, dtype=torch.bool)
+        max_vio = MoSRAHRouter._compute_max_vio(assignment_mask, active_mask, L)
         assert torch.isclose(max_vio, torch.tensor(0.5), atol=1e-6)
 
     def test_max_vio_is_detached(self):
@@ -685,12 +709,11 @@ class TestMaskedContinuationBehavior:
 
         torch.testing.assert_close(vio_a, vio_b)
 
-    def test_all_live_mask_gives_routing_freqs_equivalent_to_pre_masking_formula(self):
-        """With all tokens live, max_vio must match the no-masking reference implementation.
+    def test_all_live_mask_gives_max_vio_matching_direct_static_call(self):
+        """With all tokens live, router forward max_vio must match _compute_max_vio called directly.
 
-        Uses _reference_routing_freqs — a trivially correct no-masking stub — as an
-        independent oracle. Agreement confirms the masked production path degenerates
-        correctly to the simple all-live case.
+        Builds assignment_mask from selected_heads via scatter and calls the static method
+        independently, confirming the router forward correctly wires to _compute_max_vio.
         """
         config = small_config()
         router = MoSRAHRouter(config)
@@ -704,8 +727,11 @@ class TestMaskedContinuationBehavior:
         with torch.no_grad():
             selected_heads, _, diagnostics = router(x, active_mask, None)
             max_vio = diagnostics["max_vio"]
-            expected_freqs = _reference_routing_freqs(selected_heads, L, config.load_balance_p)
-            expected_max_vio = MoSRAHRouter._compute_max_vio(expected_freqs, L)
+
+            # Build assignment_mask from selected_heads via scatter and call directly.
+            assignment_mask = torch.zeros(B, N, L)
+            assignment_mask.scatter_(-1, selected_heads, 1.0)
+            expected_max_vio = MoSRAHRouter._compute_max_vio(assignment_mask, active_mask, L)
 
         torch.testing.assert_close(max_vio, expected_max_vio)
 
@@ -1136,16 +1162,6 @@ class TestRouterCompileEquivalenceFuzz:
             config = self._make_config(num_mosrah_heads, num_selected_heads)
 
             router = MoSRAHRouter(config).eval().to(device)
-
-            # routing_scale is initialized near-zero (1e-4) to equalize logit
-            # magnitude with expert_bias at training start. At that scale, logit
-            # differences at the TopK boundary fall within floating-point rounding
-            # noise, causing implementation-dependent tie-breaking that differs
-            # between eager and compiled execution paths. This test certifies
-            # compiled/eager equivalence under a well-separated routing signal,
-            # not the load-balance initialization regime. Resetting to 1.0
-            # restores logit separability and makes TopK deterministic.
-            router.routing_scale.data.fill_(1.0)
 
             compiled_router = torch.compile(
                 router,

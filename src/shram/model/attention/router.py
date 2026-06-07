@@ -35,10 +35,11 @@ is cross-entropy.
 The router additionally computes and returns MaxVio, a detached scalar summarising
 routing imbalance for the current forward pass:
 
-    MaxVio = L · max_l(f_l − 1/L)
+    MaxVio = mean_b( L · max_l(f_bl − 1/L) )
 
-where f_l is the realised routing frequency of head l and 1/L is the perfectly balanced
-target. MaxVio is a monitoring quantity only; it never contributes gradients.
+where f_bl is the per-batch-item realised routing frequency of head l and 1/L is the
+perfectly balanced target. MaxVio is averaged over batch items and is a monitoring
+quantity only; it never contributes gradients.
 
 Paper ref: Appendix A.Routing, Appendix A.Load Balancing, §MaxVio.
 """
@@ -48,7 +49,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..configuration import ShramConfig
-from .load_balance_loss import make_load_balance_loss
+from .load_balance_loss import make_load_balance_loss, reduce_frequency_tokens
 
 from typing import Optional
 
@@ -73,7 +74,6 @@ class MoSRAHRouter(nn.Module):
         super().__init__()
         self.num_mosrah_heads = config.num_mosrah_heads
         self.num_selected_heads = config.num_selected_heads
-        self.load_balance_p = config.load_balance_p
         if config.use_cache:
             self.capacity = config.mosrah_cache_length
         else:
@@ -85,14 +85,6 @@ class MoSRAHRouter(nn.Module):
         # W_r: routing projection, no bias (paper specifies xW_r, no additional term).
         self.routing_projection = nn.Linear(
             config.embedding_width, config.num_mosrah_heads, bias=False
-        )
-
-        # Scalar gate on routing logits. As an nn.Parameter it is exempt from
-        # HuggingFace _init_weights, so its near-zero initial value is preserved
-        # after from_config construction. Near-zero initialization ensures routing
-        # starts near-uniform and expert_bias has leverage over logits from step one.
-        self.routing_scale = nn.Parameter(
-            torch.full((1,), config.router_init_scale)
         )
 
         # b: learned per-head bias for load balancing. Initialized to zero so that all
@@ -362,10 +354,7 @@ class MoSRAHRouter(nn.Module):
         L = self.num_mosrah_heads
         K = self.num_selected_heads
 
-        # Scaled logits. routing_scale is a near-zero nn.Parameter exempt from
-        # HuggingFace _init_weights, so routing starts near-uniform and expert_bias
-        # has leverage from step one.
-        logits = self.routing_projection(x) * self.routing_scale    # (B, N, L)
+        logits = self.routing_projection(x)    # (B, N, L)
 
         # Two gradient-isolated pathways over numerically identical biased values.
         # semantic_logits: task gradients reach routing_projection; expert_bias isolated.
@@ -373,23 +362,13 @@ class MoSRAHRouter(nn.Module):
         semantic_logits       = logits + self.expert_bias.detach()   # (B, N, L)
         load_balancing_logits = logits.detach() + self.expert_bias   # (B, N, L)
 
-        # Diagnostic scalars characterising the load-balance mechanism. Must be
-        # computed here — before balance_capacity injects -1e8 sentinels that
-        # would corrupt std and cosine similarity.
-        bias_std       = self.expert_bias.std().detach()
-        raw_logit_std  = logits.std(dim=-1).mean().detach()
-        logit_std      = semantic_logits.std(dim=-1).mean().detach()
-        bias_alignment = F.cosine_similarity(
-            logits, self.expert_bias.expand_as(logits), dim=-1
-        ).mean().detach()
-
-        # Assignment probabilities for load balance loss. Computed from load_balancing_logits
-        # before balance_capacity so that -1e8 sentinels do not invert the load balance
-        # gradient for over-capacity experts. active_float is reused below for routing freqs.
-        active_float     = active_mask.float().unsqueeze(-1)                          # (B, N, 1)
-        lb_softmax        = F.softmax(load_balancing_logits, dim=-1)                  # (B, N, L)
-        assignment_probs  = (lb_softmax * active_float).sum(dim=(0, 1))               # (L,) unnorm
-        assignment_probs  = assignment_probs / active_mask.float().sum()              # (L,) norm
+        # Diagnostic scalars characterising the load-balance mechanism. Must be computed
+        # before balance_capacity injects -1e8 sentinels that would corrupt std and
+        # cosine similarity. Extracted to _compute_bias_diagnostics to keep the forward
+        # body free of non-(B,N,L) reduction logic.
+        bias_diagnostics = self._compute_bias_diagnostics(
+            logits, semantic_logits, self.expert_bias
+        )
 
         # Pre-capacity semantic softmax for gathering routing_probs. Computed before
         # balance_capacity so that gathered probabilities reflect genuine preference
@@ -415,58 +394,93 @@ class MoSRAHRouter(nn.Module):
         gathered      = routing_scores.gather(dim=-1, index=selected_heads)    # (B, N, K)
         routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)          # P, (B, N, K)
 
-        # Per-item routing frequencies f_{b,l}: for each batch item b and head l, what
-        # fraction of that item's active K assignments over all tokens go to head l.
-        # Dead tokens are excluded before reduction. Normalization is per batch item so
-        # each item's frequencies sum to 1 independently of other items in the batch.
+        # assignment_mask: (B, N, L) float — 1.0 at each token's K selected heads, 0 elsewhere.
+        # The discrete routing decision; no gradient flows through it. Passed alongside
+        # load_balancing_logits and active_mask to the loss and max_vio methods, which
+        # own all frequency aggregation and reduction internally.
         assignment_mask = torch.zeros(B, N, L, device=x.device, dtype=x.dtype)
         assignment_mask.scatter_(-1, selected_heads, 1.0)
-        active_assignments = assignment_mask * active_mask.unsqueeze(-1)
-        per_item_counts = active_assignments.sum(dim=1)              # (B, L)
-        per_item_total  = active_mask.sum(dim=1, keepdim=True) * K  # (B, 1)
-        per_item_freqs  = per_item_counts / per_item_total           # (B, L)
 
-        # p-mean of per_item_freqs over the batch dimension produces routing_freqs (L,).
-        # p-mean weights aggregation toward the worst-case batch item relative to
-        # arithmetic mean, making the load balance signal sensitive to per-item spikes
-        # that cause packing overflow.
-        p = self.load_balance_p
-        routing_freqs = (per_item_freqs ** p).mean(dim=0) ** (1.0 / p)  # (L,)
+        load_balance_loss = self._load_balance_loss(
+            load_balancing_logits, assignment_mask, active_mask
+        )
 
-        load_balance_loss = self._load_balance_loss(routing_freqs, assignment_probs)
-
-        # MaxVio is a detached monitoring scalar following the paper's formula
-        # L · max_l(f_l − 1/L) applied to routing_freqs. Must not contribute gradients.
-        max_vio = self._compute_max_vio(routing_freqs, L)
+        # MaxVio: detached monitoring scalar averaged over batch items. Computed from
+        # the same (B, N, L) assignment_mask so frequencies are consistent with the loss.
+        max_vio = self._compute_max_vio(assignment_mask, active_mask, L)
 
         router_diagnostics = {
             "load_balance_loss": load_balance_loss,
             "max_vio": max_vio,
-            "bias_std": bias_std,
-            "raw_logit_std": raw_logit_std,
-            "logit_std": logit_std,
-            "bias_alignment": bias_alignment,
+            **bias_diagnostics,
         }
         return selected_heads, routing_probs, router_diagnostics
 
     @staticmethod
-    def _compute_max_vio(routing_freqs: torch.Tensor, num_heads: int) -> torch.Tensor:
-        """Compute the MaxVio routing-imbalance scalar.
+    def _compute_bias_diagnostics(
+        logits: torch.Tensor,
+        semantic_logits: torch.Tensor,
+        expert_bias: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute detached diagnostic scalars characterising the load-balance mechanism.
 
-        MaxVio = L · max_l(f_l − 1/L), where f_l is the realised routing frequency of
-        head l and 1/L is the perfectly balanced target. Follows the paper's definition
-        (Wang et al.) applied to routing_freqs. A value of zero indicates perfect
-        balance; a value of 0.5 means the most overloaded head received 50% more routed
-        tokens than ideal.
-
-        The result is detached from the autograd graph — MaxVio is a monitoring scalar
-        and must never contribute gradients to any parameter.
+        All four scalars must be computed before balance_capacity applies -1e8 sentinels,
+        which would corrupt std and cosine similarity. Extracted from forward to keep the
+        main body free of non-(B,N,L) reduction logic.
 
         Args:
-            routing_freqs: Per-head routing frequencies of shape (L,).
-            num_heads: Total number of MoSRAH heads L.
+            logits:          Scaled routing logits before expert_bias, shape (B, N, L).
+            semantic_logits: Biased logits used for selection, shape (B, N, L).
+            expert_bias:     Learned per-head load-balance bias, shape (L,).
+
+        Returns:
+            Dict with keys:
+            - ``bias_std``:       Std of expert_bias. Near-zero means corrections have
+                                  not built up relative to routing logit scale.
+            - ``raw_logit_std``:  Mean per-token std of logits. Natural routing preference
+                                  scale; reference baseline for interpreting bias_std.
+            - ``logit_std``:      Mean per-token std of semantic_logits. Lower than
+                                  raw_logit_std indicates bias is flattening preferences
+                                  (healthy correction signal).
+            - ``bias_alignment``: Mean cosine similarity of expert_bias against per-token
+                                  logits. Negative means bias opposes routing direction
+                                  (healthy correction); positive means runaway reinforcement.
+        """
+        return {
+            "bias_std":       expert_bias.std().detach(),
+            "raw_logit_std":  logits.std(dim=-1).mean().detach(),
+            "logit_std":      semantic_logits.std(dim=-1).mean().detach(),
+            "bias_alignment": F.cosine_similarity(
+                logits, expert_bias.expand_as(logits), dim=-1
+            ).mean().detach(),
+        }
+
+    @staticmethod
+    def _compute_max_vio(
+        assignment_mask: torch.Tensor,
+        active_mask: torch.Tensor,
+        num_heads: int,
+    ) -> torch.Tensor:
+        """Compute the MaxVio routing-imbalance scalar.
+
+        MaxVio = mean_b( L · max_l(f_bl − 1/L) ), where f_bl is the per-batch-item
+        realised routing frequency of head l. Uses reduce_frequency_tokens for consistent
+        per-batch-item frequency computation with dead tokens excluded, matching how the
+        load balance loss computes frequencies. A value of zero indicates perfect balance;
+        a value of 0.5 means the most overloaded head in the average batch item received
+        50% more routed tokens than ideal.
+
+        The result is detached — MaxVio is a monitoring scalar and must not contribute
+        gradients to any parameter.
+
+        Args:
+            assignment_mask: Per-token head-assignment indicators, shape (B, N, L).
+            active_mask:     Boolean active-token mask, shape (B, N).
+            num_heads:       Total number of MoSRAH heads L.
 
         Returns:
             Detached scalar MaxVio tensor.
         """
-        return (num_heads * (routing_freqs - 1.0 / num_heads).max()).detach()
+        f_bl = reduce_frequency_tokens(assignment_mask, active_mask)                   # (B, L)
+        per_item_max_vio = num_heads * (f_bl - 1.0 / num_heads).max(dim=-1).values    # (B,)
+        return per_item_max_vio.mean().detach()

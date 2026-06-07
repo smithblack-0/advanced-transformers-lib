@@ -1,31 +1,101 @@
 """Log-probability auxiliary loss functions for MoSRAH load balancing.
 
-This module provides three load-balance loss formulations and a factory that selects
-among them. All formulations share the same external contract and the same gradient
-isolation property: assignment probabilities are computed from detached logits plus
-expert_bias, so only expert_bias receives gradients from the loss signal. The routing
-projection weights are not reachable from any returned loss.
+This module provides three load-balance loss formulations, two token-reduction
+helpers, and a factory that selects among the formulations. All formulations
+share the same external contract:
 
-The factory is the intended entry point. The caller (MoSRAHRouter) constructs the
-loss callable once at init and invokes it each forward pass.
+    loss_fn(
+        logits:          Tensor[B, N, L],
+        assignment_mask: Tensor[B, N, L],
+        active_mask:     Tensor[B, N],
+    ) -> scalar Tensor
 
-Log-probability formulations (ce, bce) are preferred over linear ones (gshard) because
-their gradient magnitude scales with how far the distribution deviates from the target.
-A linear signal can be outrun by routing concentrations that diverge nonlinearly; a
-log-probability signal cannot.
+    logits:          Load-balancing logits, shape (B, N, L). These are the raw
+                     pre-softmax scores from logits.detach() + expert_bias.
+                     Gradient flows to expert_bias through this tensor.
+    assignment_mask: Per-token head-assignment indicators. assignment_mask[b, n, l]
+                     is 1.0 if token (b, n) was assigned to head l. Dead tokens
+                     should carry zero entries.
+    active_mask:     Boolean mask, shape (B, N). True means the token is
+                     semantically live.
 
-The external contract for all returned callables is:
+Token reduction is split into two helpers with distinct roles:
 
-    loss_fn(routing_freqs, assignment_probs) -> scalar Tensor
+    reduce_frequency_tokens — produces per-batch-item routing frequencies f_bl (B, L).
+        Called by all three formulations. Output is detached; f_bl carries no gradient.
 
-    routing_freqs:    (L,) realized routing frequencies f_i, detached.
-    assignment_probs: (L,) soft assignment probabilities p_i with gradient through
-                      expert_bias. Caller must compute these via
-                      softmax(logits.detach() + expert_bias) to preserve isolation.
+    reduce_probability_tokens — produces per-batch-item mean assignment probabilities
+        p_bl (B, L). Called only by gshard and bce. Gradient flows to expert_bias
+        through the internal softmax over logits.
+
+CE delegates probability computation to F.cross_entropy, which handles its own
+log_softmax and operates directly on the raw (B, N, L) logits.
+
+The factory is the intended entry point. MoSRAHRouter constructs the loss callable
+once at init and invokes it each forward pass.
 """
 
 import torch
+import torch.nn.functional as F
 from typing import Callable
+
+
+# ---------------------------------------------------------------------------
+# Token-reduction helpers
+# ---------------------------------------------------------------------------
+
+def reduce_frequency_tokens(
+    assignment_mask: torch.Tensor,
+    active_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Reduce per-token head assignments to per-batch-item routing frequencies.
+
+    f_bl[b, l] is the fraction of active-token assignments in batch item b going
+    to head l. Values sum to 1 per batch item when routing is valid.
+
+    The output is detached from the autograd graph: routing frequencies are
+    derived from discrete TopK selections and must not carry gradients.
+
+    Denominators are clamped to 1 to handle the all-dead-tokens edge case.
+
+    Args:
+        assignment_mask: Per-token head-assignment indicators, shape (B, N, L).
+        active_mask:     Boolean active-token mask, shape (B, N).
+
+    Returns:
+        f_bl: Per-batch-item routing frequencies, shape (B, L). Detached.
+    """
+    active_float = active_mask.float().unsqueeze(-1)                               # (B, N, 1)
+    active_assignments = assignment_mask * active_float                             # (B, N, L)
+    assignment_totals = (
+        active_assignments.sum(dim=(1, 2)).clamp(min=1.0).unsqueeze(-1)            # (B, 1)
+    )
+    return (active_assignments.sum(dim=1) / assignment_totals).detach()            # (B, L)
+
+
+def reduce_probability_tokens(
+    logits: torch.Tensor,
+    active_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Reduce per-token load-balancing logits to per-batch-item assignment probabilities.
+
+    p_bl[b, l] is the mean softmax probability for head l over active tokens in
+    batch item b. Values sum to 1 per batch item. Gradient flows to expert_bias
+    through the internal softmax.
+
+    Denominators are clamped to 1 to handle the all-dead-tokens edge case.
+
+    Args:
+        logits:      Load-balancing logits, shape (B, N, L). Gradient flows through.
+        active_mask: Boolean active-token mask, shape (B, N).
+
+    Returns:
+        p_bl: Per-batch-item mean assignment probabilities, shape (B, L).
+    """
+    per_token_probs = F.softmax(logits, dim=-1)                                    # (B, N, L)
+    active_float = active_mask.float().unsqueeze(-1)                               # (B, N, 1)
+    active_count = active_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)     # (B, 1)
+    return (per_token_probs * active_float).sum(dim=1) / active_count              # (B, L)
 
 
 # ---------------------------------------------------------------------------
@@ -33,97 +103,125 @@ from typing import Callable
 # ---------------------------------------------------------------------------
 
 def gshard_loss(
-    routing_freqs: torch.Tensor,
-    assignment_probs: torch.Tensor,
+    logits: torch.Tensor,
+    assignment_mask: torch.Tensor,
+    active_mask: torch.Tensor,
 ) -> torch.Tensor:
     """GShard-style linear load-balance loss.
 
-    Computes (1/L) * Σ_i f_i * p_i, where L is the number of expert heads,
-    f_i is the realized routing frequency for head i, and p_i is the soft
-    assignment probability for head i.
+    Computes (1/L) * Σ_l f_bl * p_bl per batch item, averaged over B, where
+    f_bl comes from reduce_frequency_tokens and p_bl from reduce_probability_tokens.
 
-    The fixed point of this loss under gradient descent is uniform routing:
-    when p_i = 1/L for all i, the loss is minimized at 1/L (independent of f_i).
-    The linear signal is the weakest of the three formulations — gradient magnitude
-    does not grow with deviation from the target. Provided for comparison.
+    The linear signal is the weakest of the three formulations; gradient magnitude
+    does not grow with violation severity. Provided for comparison.
 
     Args:
-        routing_freqs: Realized routing frequencies f_i, shape (L,). Detached.
-        assignment_probs: Soft assignment probabilities p_i, shape (L,). Gradient
-            flows to expert_bias through this tensor.
+        logits:          Load-balancing logits, shape (B, N, L).
+        assignment_mask: Per-token head-assignment indicators, shape (B, N, L).
+        active_mask:     Boolean active-token mask, shape (B, N).
 
     Returns:
         Scalar loss tensor.
     """
-    L = routing_freqs.shape[0]
-    return (routing_freqs * assignment_probs).sum() / L
+    L = logits.shape[-1]
+    f_bl = reduce_frequency_tokens(assignment_mask, active_mask)
+    p_bl = reduce_probability_tokens(logits, active_mask)
+    return (f_bl * p_bl).sum(dim=-1).mean() / L
 
 
 def ce_loss(
-    routing_freqs: torch.Tensor,
-    assignment_probs: torch.Tensor,
+    logits: torch.Tensor,
+    assignment_mask: torch.Tensor,
+    active_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Cross-entropy load-balance loss.
 
-    Computes -(1/(L-1)) * Σ_i (1 - f_i) * log(p_i), where the weight (1 - f_i)
-    suppresses the signal for overloaded heads (high f_i → weight near zero) and
-    amplifies it for underloaded heads (low f_i → weight near 1). This makes the
-    loss push probability mass toward under-utilized experts.
+    Constructs per-batch-item soft target distributions from routing frequencies
+    and delegates to F.cross_entropy operating directly on (B, N, L) logits.
+    Inactive tokens receive all-zero targets, producing zero loss and zero gradient.
 
-    The (1/(L-1)) normalization makes the coefficient interpretable as a controller
-    strength independent of expert count. The log-probability signal grows as p_i
-    deviates from the target, providing correction that scales with violation severity.
+    The soft target for head l in batch item b is (1 - f_bl) / (L - 1). This
+    distribution sums to 1 per batch item (since Σ_l (1 - f_bl) = L - 1) and
+    weights underloaded heads (low f_bl → high target) more strongly than
+    overloaded ones.
+
+    The total CE over active tokens is normalised by the active token count rather
+    than B*N to avoid dilution from inactive positions.
 
     Args:
-        routing_freqs: Realized routing frequencies f_i, shape (L,). Detached.
-        assignment_probs: Soft assignment probabilities p_i, shape (L,). Gradient
-            flows to expert_bias through this tensor.
+        logits:          Load-balancing logits, shape (B, N, L).
+        assignment_mask: Per-token head-assignment indicators, shape (B, N, L).
+        active_mask:     Boolean active-token mask, shape (B, N).
 
     Returns:
         Scalar loss tensor.
     """
-    L = routing_freqs.shape[0]
-    # Numerical stability: torch.log is safe here because softmax outputs are
-    # strictly positive. The (1 - f_i) weight goes to zero exactly when f_i = 1,
-    # which can only occur with a single head, so the 0 * (-inf) degenerate case
-    # does not arise in practice.
-    return -(((1.0 - routing_freqs) * torch.log(assignment_probs)).sum()) / (L - 1)
+    B, N, L = logits.shape
+    f_bl = reduce_frequency_tokens(assignment_mask, active_mask)               # (B, L)
+    active_count = active_mask.float().sum().clamp(min=1.0)
+
+    # Soft target: (1 - f_bl) / (L - 1) for active tokens, zeros for inactive.
+    # Zeros give zero CE loss and zero gradient at inactive positions.
+    target = (1.0 - f_bl) / (L - 1)                                           # (B, L)
+    target_per_token = (
+        target.unsqueeze(1).expand(-1, N, -1)                                  # (B, N, L)
+        * active_mask.float().unsqueeze(-1)                                    # zero inactive
+    )
+
+    # F.cross_entropy requires the class dimension to be dim 1.
+    # Permute (B, N, L) → (B, L, N) to satisfy the (N, C, d) contract.
+    return F.cross_entropy(
+        logits.permute(0, 2, 1),             # (B, L, N)
+        target_per_token.permute(0, 2, 1),   # (B, L, N)
+        reduction='sum',
+    ) / active_count
 
 
 def bce_loss(
-    routing_freqs: torch.Tensor,
-    assignment_probs: torch.Tensor,
+    logits: torch.Tensor,
+    assignment_mask: torch.Tensor,
+    active_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Binary cross-entropy load-balance loss.
 
-    Computes -(1/L) * Σ_i [(1 - f_i) * log(p_i) + f_i * log(1 - p_i)], where
-    each head is treated as an independent binary target. Unlike CE, BCE maintains
-    a repulsion signal from saturated experts: when f_i → 1, the weight on
-    log(1 - p_i) drives p_i away from 1, preventing runaway concentration.
+    Treats each head as an independent binary target with label (1 - f_bl).
+    Uses reduce_probability_tokens to produce per-batch-item probabilities,
+    then delegates to F.binary_cross_entropy over (B, L) tensors.
 
-    log(1 - p_i) is computed as log1p(-p_i) for numerical safety near p_i = 1.
+    Unlike CE, BCE maintains a repulsion signal from saturated experts: when
+    f_bl → 1 the target → 0, driving p_bl away from 1 and preventing runaway
+    concentration.
+
+    Active masking is handled inside reduce_frequency_tokens and
+    reduce_probability_tokens, so the (B, L) output tensors already exclude
+    inactive tokens from both frequencies and probabilities.
 
     Args:
-        routing_freqs: Realized routing frequencies f_i, shape (L,). Detached.
-        assignment_probs: Soft assignment probabilities p_i, shape (L,). Gradient
-            flows to expert_bias through this tensor.
+        logits:          Load-balancing logits, shape (B, N, L).
+        assignment_mask: Per-token head-assignment indicators, shape (B, N, L).
+        active_mask:     Boolean active-token mask, shape (B, N).
 
     Returns:
         Scalar loss tensor.
     """
-    L = routing_freqs.shape[0]
-    positive_term = (1.0 - routing_freqs) * torch.log(assignment_probs)
-    # log1p(-p) instead of log(1-p): avoids catastrophic cancellation when p is
-    # close to 1, where (1 - p) loses precision and log produces large errors.
-    negative_term = routing_freqs * torch.log1p(-assignment_probs)
-    return -(positive_term + negative_term).sum() / L
+    f_bl = reduce_frequency_tokens(assignment_mask, active_mask)
+    p_bl = reduce_probability_tokens(logits, active_mask)
+    # Clamp p_bl for numerical safety: F.binary_cross_entropy requires input in
+    # (0, 1) and will produce inf for exactly 0 or 1. Softmax outputs are
+    # strictly positive in normal operation; the clamp guards the all-dead-tokens
+    # edge case where the mean defaults to zero.
+    return F.binary_cross_entropy(
+        p_bl.clamp(min=1e-7, max=1.0 - 1e-7),
+        1.0 - f_bl,
+        reduction='mean',
+    )
 
 
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-_LOSS_REGISTRY: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
+_LOSS_REGISTRY: dict[str, Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]] = {
     "gshard": gshard_loss,
     "ce": ce_loss,
     "bce": bce_loss,
@@ -132,15 +230,19 @@ _LOSS_REGISTRY: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] 
 
 def make_load_balance_loss(
     loss_type: str,
-) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """Return a load-balance loss callable for the requested formulation.
 
-    All returned callables share the same external contract:
+    All returned callables share the external contract:
 
-        loss_fn(routing_freqs: Tensor, assignment_probs: Tensor) -> scalar Tensor
+        loss_fn(
+            logits:          Tensor[B, N, L],
+            assignment_mask: Tensor[B, N, L],
+            active_mask:     Tensor[B, N],
+        ) -> scalar Tensor
 
-    The caller is responsible for computing assignment_probs via
-    softmax(logits.detach() + expert_bias) to ensure gradient isolation.
+    The caller is responsible for computing logits as logits.detach() + expert_bias
+    to ensure gradient isolation to expert_bias.
 
     Args:
         loss_type: One of ``"gshard"``, ``"ce"``, or ``"bce"``.
