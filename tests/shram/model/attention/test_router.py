@@ -19,12 +19,12 @@ Invariants verified:
 - router forward max_vio matches _compute_max_vio called directly on all-live inputs
 - router_diagnostics separates routing decisions from routing feedback
 - load_balance_loss has gradient; all other diagnostic scalars are detached
-- balance_logit_std is zero when balance_weight is zero
-- semantic_logit_std equals routing_logit_std when balance_weight is zero
-- balance_alignment is negative when balance_weight opposes routing_weight direction
-- balance_alignment is positive when balance_weight reinforces routing_weight direction
-- _compute_bias_diagnostics returns exactly {routing_logit_std, balance_logit_std,
-  semantic_logit_std, balance_alignment}, all detached
+- bias_std is zero when balance_weight is zero
+- logit_std equals raw_logit_std when balance_weight is zero
+- bias_alignment is negative when balance_weight opposes routing_weight direction
+- bias_alignment is positive when balance_weight reinforces routing_weight direction
+- _compute_bias_diagnostics returns exactly {raw_logit_std, bias_std, logit_std,
+  bias_alignment}, all detached
 - compiled and eager router diagnostics are numerically identical
 """
 
@@ -395,14 +395,14 @@ class TestRouterDiagnostics:
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
         _, _, diagnostics = router(x, active_mask, None)
-        for key in ("max_vio", "routing_logit_std", "balance_logit_std",
-                    "semantic_logit_std", "balance_alignment"):
+        for key in ("max_vio", "raw_logit_std", "bias_std",
+                    "logit_std", "bias_alignment"):
             assert not diagnostics[key].requires_grad, (
                 f"diagnostic scalar '{key}' must be detached but requires_grad is True"
             )
 
-    def test_balance_logit_std_zero_when_balance_weight_zero(self):
-        """balance_logit_std must be zero when balance_weight is zero.
+    def test_bias_std_zero_when_balance_weight_zero(self):
+        """bias_std must be zero when balance_weight is zero.
 
         With balance_weight zeroed, B·x = 0 for any x, so per-token std of
         balance_logits is identically zero.
@@ -414,10 +414,10 @@ class TestRouterDiagnostics:
         with torch.no_grad():
             router.balance_weight.zero_()
         _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["balance_logit_std"].item() == 0.0
+        assert diagnostics["bias_std"].item() == 0.0
 
-    def test_semantic_logit_std_equals_routing_logit_std_when_balance_weight_zero(self):
-        """semantic_logit_std must equal routing_logit_std when balance_weight is zero.
+    def test_logit_std_equals_raw_logit_std_when_balance_weight_zero(self):
+        """logit_std must equal raw_logit_std when balance_weight is zero.
 
         With balance_weight zeroed, B·x = 0, so semantic_logits = A·x + 0 = A·x,
         and both stds are computed over the same values.
@@ -430,11 +430,11 @@ class TestRouterDiagnostics:
             router.balance_weight.zero_()
         _, _, diagnostics = router(x, active_mask, None)
         assert torch.allclose(
-            diagnostics["semantic_logit_std"], diagnostics["routing_logit_std"], atol=1e-6
+            diagnostics["logit_std"], diagnostics["raw_logit_std"], atol=1e-6
         )
 
-    def test_balance_alignment_negative_when_balance_opposes_routing(self):
-        """balance_alignment must be negative when balance_weight = -routing_weight.
+    def test_bias_alignment_negative_when_balance_opposes_routing(self):
+        """bias_alignment must be negative when balance_weight = -routing_weight.
 
         Setting balance_weight = -routing_weight guarantees balance_logits = -routing_logits
         for any x, so cosine similarity between the two is -1 for every token.
@@ -447,13 +447,13 @@ class TestRouterDiagnostics:
         with torch.no_grad():
             router.balance_weight.copy_(-router.routing_weight)
         _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["balance_alignment"].item() < 0, (
-            f"expected negative balance_alignment for opposing balance_weight, "
-            f"got {diagnostics['balance_alignment'].item()}"
+        assert diagnostics["bias_alignment"].item() < 0, (
+            f"expected negative bias_alignment for opposing balance_weight, "
+            f"got {diagnostics['bias_alignment'].item()}"
         )
 
-    def test_balance_alignment_positive_when_balance_reinforces_routing(self):
-        """balance_alignment must be positive when balance_weight = routing_weight.
+    def test_bias_alignment_positive_when_balance_reinforces_routing(self):
+        """bias_alignment must be positive when balance_weight = routing_weight.
 
         Setting balance_weight = routing_weight guarantees balance_logits = routing_logits
         for any x, so cosine similarity between the two is 1 for every token.
@@ -466,9 +466,9 @@ class TestRouterDiagnostics:
         with torch.no_grad():
             router.balance_weight.copy_(router.routing_weight)
         _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["balance_alignment"].item() > 0, (
-            f"expected positive balance_alignment for reinforcing balance_weight, "
-            f"got {diagnostics['balance_alignment'].item()}"
+        assert diagnostics["bias_alignment"].item() > 0, (
+            f"expected positive bias_alignment for reinforcing balance_weight, "
+            f"got {diagnostics['bias_alignment'].item()}"
         )
 
 
@@ -500,7 +500,7 @@ class TestBiasDiagnostics:
         routing_logits, balance_logits, semantic_logits = self._make_inputs(2, 8, 4)
         result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
         assert set(result.keys()) == {
-            "routing_logit_std", "balance_logit_std", "semantic_logit_std", "balance_alignment"
+            "raw_logit_std", "bias_std", "logit_std", "bias_alignment"
         }
 
     def test_all_values_detached(self):
@@ -514,40 +514,40 @@ class TestBiasDiagnostics:
                 f"{key} must be detached but requires_grad is True"
             )
 
-    def test_balance_logit_std_zero_when_balance_is_uniform(self):
-        """balance_logit_std must be exactly 0 when balance_logits are constant across L."""
+    def test_bias_std_zero_when_balance_is_uniform(self):
+        """bias_std must be exactly 0 when balance_logits are constant across L."""
         B, N, L = 1, 4, 6
         routing_logits = torch.randn(B, N, L)
         # Constant across the L dimension → per-token std = 0.
         balance_logits = torch.full((B, N, L), 2.5)
         semantic_logits = routing_logits + balance_logits
         result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
-        assert result["balance_logit_std"].item() == 0.0
+        assert result["bias_std"].item() == 0.0
 
     def test_alignment_negative_when_balance_opposes_routing(self):
-        """balance_alignment must be negative when balance_logits = -routing_logits."""
+        """bias_alignment must be negative when balance_logits = -routing_logits."""
         torch.manual_seed(7)
         B, N, L = 1, 8, 4
         routing_logits = torch.randn(B, N, L)
         balance_logits = -routing_logits  # perfect anti-alignment → cosine similarity = -1
         semantic_logits = routing_logits + balance_logits
         result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
-        assert result["balance_alignment"].item() < 0, (
+        assert result["bias_alignment"].item() < 0, (
             f"expected negative alignment for opposing balance, "
-            f"got {result['balance_alignment'].item()}"
+            f"got {result['bias_alignment'].item()}"
         )
 
     def test_alignment_positive_when_balance_reinforces_routing(self):
-        """balance_alignment must be positive when balance_logits = routing_logits."""
+        """bias_alignment must be positive when balance_logits = routing_logits."""
         torch.manual_seed(7)
         B, N, L = 1, 8, 4
         routing_logits = torch.randn(B, N, L)
         balance_logits = routing_logits  # perfect alignment → cosine similarity = 1
         semantic_logits = routing_logits + balance_logits
         result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
-        assert result["balance_alignment"].item() > 0, (
+        assert result["bias_alignment"].item() > 0, (
             f"expected positive alignment for reinforcing balance, "
-            f"got {result['balance_alignment'].item()}"
+            f"got {result['bias_alignment'].item()}"
         )
 
 

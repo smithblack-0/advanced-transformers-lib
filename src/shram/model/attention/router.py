@@ -36,7 +36,7 @@ The router also computes and returns the load balance loss via a log-probability
 loss (see load_balance_loss.py). The loss formulation is selected by config; the default
 is cross-entropy.
 
-The router additionally computes and returns MaxVio, a detached scalar summarising
+The router additionally computes and returns Ma xVio, a detached scalar summarising
 routing imbalance for the current forward pass:
 
     MaxVio = mean_b( L · max_l(f_bl − 1/L) )
@@ -351,13 +351,13 @@ class MoSRAHRouter(nn.Module):
             router_diagnostics: Dict of routing feedback scalars. Keys:
                 - ``load_balance_loss``: scalar load-balance loss with gradient.
                 - ``max_vio``: detached scalar routing-imbalance summary.
-                - ``routing_logit_std``: mean per-token std of routing_logits; natural
-                  routing preference scale and baseline for interpreting balance_logit_std.
-                - ``balance_logit_std``: mean per-token std of balance_logits; near-zero
+                - ``raw_logit_std``: mean per-token std of routing_logits; natural
+                  routing preference scale and baseline for interpreting bias_std.
+                - ``bias_std``: mean per-token std of balance_logits; near-zero
                   means balance corrections have not built up relative to routing scale.
-                - ``semantic_logit_std``: mean per-token std of semantic_logits; lower than
-                  routing_logit_std means balance is flattening preferences (healthy correction).
-                - ``balance_alignment``: mean cosine similarity of routing_logits vs
+                - ``logit_std``: mean per-token std of semantic_logits; lower than
+                  raw_logit_std means balance is flattening preferences (healthy correction).
+                - ``bias_alignment``: mean cosine similarity of routing_logits vs
                   balance_logits per token. Negative means balance opposes routing direction
                   (healthy correction); positive means runaway reinforcement.
         """
@@ -472,25 +472,25 @@ class MoSRAHRouter(nn.Module):
 
         Returns:
             Dict with keys:
-            - ``routing_logit_std``:  Mean per-token std of routing_logits. Natural
-                                      routing preference scale; reference baseline for
-                                      interpreting balance_logit_std.
-            - ``balance_logit_std``:  Mean per-token std of balance_logits. Near-zero
-                                      means balance corrections have not built up
-                                      relative to the routing scale.
-            - ``semantic_logit_std``: Mean per-token std of semantic_logits. Lower than
-                                      routing_logit_std indicates balance is flattening
-                                      preferences (healthy correction signal).
-            - ``balance_alignment``:  Mean cosine similarity of routing_logits vs
-                                      balance_logits per token. Range [-1, 1]. Negative
-                                      means balance opposes routing direction (healthy
-                                      correction); positive means runaway reinforcement.
+            - ``raw_logit_std``:  Mean per-token std of routing_logits. Natural
+                                   routing preference scale; reference baseline for
+                                   interpreting bias_std.
+            - ``bias_std``:       Mean per-token std of balance_logits. Near-zero
+                                   means balance corrections have not built up
+                                   relative to the routing scale.
+            - ``logit_std``:      Mean per-token std of semantic_logits. Lower than
+                                   raw_logit_std indicates balance is flattening
+                                   preferences (healthy correction signal).
+            - ``bias_alignment``: Mean cosine similarity of routing_logits vs
+                                   balance_logits per token. Range [-1, 1]. Negative
+                                   means balance opposes routing direction (healthy
+                                   correction); positive means runaway reinforcement.
         """
         return {
-            "routing_logit_std":  routing_logits.std(dim=-1).mean().detach(),
-            "balance_logit_std":  balance_logits.std(dim=-1).mean().detach(),
-            "semantic_logit_std": semantic_logits.std(dim=-1).mean().detach(),
-            "balance_alignment":  F.cosine_similarity(
+            "raw_logit_std":  routing_logits.std(dim=-1).mean().detach(),
+            "bias_std":       balance_logits.std(dim=-1).mean().detach(),
+            "logit_std":      semantic_logits.std(dim=-1).mean().detach(),
+            "bias_alignment": F.cosine_similarity(
                 routing_logits, balance_logits, dim=-1
             ).mean().detach(),
         }
