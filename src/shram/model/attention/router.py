@@ -126,7 +126,7 @@ class MoSRAHRouter(nn.Module):
         self.routing_weight = nn.Parameter(
             torch.empty(config.num_mosrah_heads, config.embedding_width)
         )
-        nn.init.kaiming_uniform_(self.routing_weight)
+        nn.init.kaiming_normal_(self.routing_weight)
 
         # W_b (B): load-balancing projection matrix. Maps input (B, N, d) to per-head
         # correction scores (B, N, L). Receives gradients only from load_balance_loss.
@@ -134,7 +134,7 @@ class MoSRAHRouter(nn.Module):
         self.balance_weight = nn.Parameter(
             torch.empty(config.num_mosrah_heads, config.embedding_width)
         )
-        nn.init.kaiming_uniform_(self.balance_weight)
+        nn.init.kaiming_normal_(self.balance_weight)
 
         if self.routing_mode == "integral":
             L = config.num_mosrah_heads

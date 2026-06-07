@@ -206,15 +206,12 @@ def bce_loss(
     """
     f_bl = reduce_frequency_tokens(assignment_mask, active_mask)
     p_bl = reduce_probability_tokens(logits, active_mask)
-    # Clamp p_bl for numerical safety: F.binary_cross_entropy requires input in
-    # (0, 1) and will produce inf for exactly 0 or 1. Softmax outputs are
-    # strictly positive in normal operation; the clamp guards the all-dead-tokens
-    # edge case where the mean defaults to zero.
-    return F.binary_cross_entropy(
-        p_bl.clamp(min=1e-7, max=1.0 - 1e-7),
-        1.0 - f_bl,
-        reduction='mean',
-    )
+    # Clamp for numerical safety: softmax outputs are strictly positive in
+    # normal operation; the clamp guards the all-dead-tokens edge case where
+    # the mean defaults to zero. log1p(-p) avoids cancellation near p=1.
+    p = p_bl.clamp(min=1e-7, max=1.0 - 1e-7)
+    target = 1.0 - f_bl
+    return -(target * torch.log(p) + (1.0 - target) * torch.log1p(-p)).mean()
 
 
 # ---------------------------------------------------------------------------
