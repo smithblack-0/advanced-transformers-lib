@@ -4,13 +4,11 @@ Invariants verified:
 - Output shapes: selected_heads (B, N, K), routing_probs (B, N, K), loss scalar,
   max_vio scalar
 - routing_probs sum to 1 per token and are non-negative
-- routing_probs incorporate expert_bias via semantic_logits (logits + expert_bias.detach())
 - selected_heads are valid indices in [0, L-1] and are distinct per token
-- expert_bias influences both selection and routing_probs via the semantic gradient channel
-- expert_bias receives a gradient through load_balance_loss
-- routing_projection has no bias parameter
-- task loss backward populates routing_projection.weight.grad, not expert_bias.grad
-- load balance loss backward populates expert_bias.grad, not routing_projection.weight.grad
+- routing_weight and balance_weight both exist as nn.Parameter with shape (L, embedding_width)
+- balance_weight receives gradient through load_balance_loss, not through task loss
+- task loss backward populates routing_weight.grad, not balance_weight.grad
+- load balance loss backward populates balance_weight.grad, not routing_weight.grad
 - assignment_probs are computed before balance_capacity, preventing -1e8 contamination
 - max_vio is exactly 0 for perfectly uniform routing frequencies
 - max_vio is exactly 1 when the most overloaded head receives double its fair share
@@ -21,11 +19,12 @@ Invariants verified:
 - router forward max_vio matches _compute_max_vio called directly on all-live inputs
 - router_diagnostics separates routing decisions from routing feedback
 - load_balance_loss has gradient; all other diagnostic scalars are detached
-- bias_std is zero when expert_bias is zero
-- logit_std equals raw_logit_std when expert_bias is zero
-- bias_alignment is negative when expert_bias opposes routing logit direction
-- bias_alignment is positive when expert_bias reinforces routing logit direction
-- _compute_bias_diagnostics returns exactly {bias_std, raw_logit_std, logit_std, bias_alignment}, all detached
+- balance_logit_std is zero when balance_weight is zero
+- semantic_logit_std equals routing_logit_std when balance_weight is zero
+- balance_alignment is negative when balance_weight opposes routing_weight direction
+- balance_alignment is positive when balance_weight reinforces routing_weight direction
+- _compute_bias_diagnostics returns exactly {routing_logit_std, balance_logit_std,
+  semantic_logit_std, balance_alignment}, all detached
 - compiled and eager router diagnostics are numerically identical
 """
 
@@ -128,29 +127,6 @@ class TestRoutingProbabilities:
         _, routing_probs, _ = router(x, active_mask, None)
         assert (routing_probs >= 0).all()
 
-    def test_routing_probs_use_semantic_logits(self):
-        """routing_probs must match P recomputed from semantic_logits.
-
-        Routing_probs are gathered from softmax(semantic_logits) = softmax(logits +
-        expert_bias.detach()) at selected_heads indices and renormalized.
-        Verified by recomputing independently using the same biased values.
-        """
-        config = small_config()
-        router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, 64)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-
-        with torch.no_grad():
-            selected_heads, routing_probs, _ = router(x, active_mask, None)
-
-            # Recompute routing_probs through the semantic pathway
-            logits = router.routing_projection(x)
-            semantic_logits = logits + router.expert_bias
-            semantic_scores = torch.softmax(semantic_logits, dim=-1)
-            gathered = semantic_scores.gather(dim=-1, index=selected_heads)
-            expected_routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)
-
-        assert torch.allclose(routing_probs, expected_routing_probs, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -190,47 +166,55 @@ class TestSelectedHeads:
 # ---------------------------------------------------------------------------
 
 class TestBiasRoutingBehavior:
-    def test_large_bias_forces_head_selection(self):
-        """A large expert_bias on head 0 must cause head 0 to appear in every token's
-        selection — demonstrating that expert_bias drives selection via semantic_logits."""
+    def test_large_balance_weight_forces_head_selection(self):
+        """A large balance_weight row for head 0 must cause head 0 to appear in every
+        token's selection — demonstrating that balance_weight drives selection via
+        semantic_logits.
+
+        With routing_weight zeroed and balance_weight[0] set large, every token's
+        semantic_logit for head 0 dominates regardless of input direction.
+        All-ones x ensures the dot product with balance_weight[0] is maximally positive.
+        """
         config = small_config()
         router = MoSRAHRouter(config)
-        x = torch.randn(1, 6, 64)
+        # All-ones x ensures head 0's logit = sum(balance_weight[0]) = large * embedding_width.
+        x = torch.ones(1, 6, config.embedding_width)
         active_mask = torch.ones(1, 6, dtype=torch.bool)
 
         with torch.no_grad():
-            router.expert_bias.zero_()
-            router.expert_bias[0] = 100.0
+            router.routing_weight.zero_()
+            router.balance_weight.zero_()
+            router.balance_weight[0, :] = 100.0
             selected_heads, _, _ = router(x, active_mask, None)
 
-        # Head 0 must be selected for every token when its bias is enormous.
+        # Head 0 must be selected for every token when its balance logit is enormous.
         assert (selected_heads == 0).any(dim=-1).all()
 
-    def test_bias_incorporated_in_routing_probs(self):
-        """With non-zero expert_bias, routing_probs must differ from the zero-bias case.
+    def test_balance_weight_incorporated_in_routing_probs(self):
+        """With non-zero balance_weight, routing_probs must differ from the zero-balance case.
 
         Under the two-pathway architecture, routing_probs are gathered from
-        softmax(semantic_logits) = softmax(logits + expert_bias.detach()). A large
-        bias on one head shifts the softmax distribution, producing different routing_probs
-        than the zero-bias baseline.
+        softmax(semantic_logits) = softmax(A·x + (B·x).detach()). A large balance_weight
+        row for one head shifts the softmax distribution, producing different routing_probs
+        than the zero-balance-weight baseline.
         """
         config = small_config()
         router = MoSRAHRouter(config)
         torch.manual_seed(42)
-        x = torch.randn(1, 4, 64)
+        x = torch.ones(1, 4, config.embedding_width)
         active_mask = torch.ones(1, 4, dtype=torch.bool)
 
         with torch.no_grad():
-            router.expert_bias.zero_()
-            _, routing_probs_zero_bias, _ = router(x, active_mask, None)
+            router.balance_weight.zero_()
+            _, routing_probs_zero_balance, _ = router(x, active_mask, None)
 
-            router.expert_bias.zero_()
-            router.expert_bias[0] = 100.0
+            router.balance_weight.zero_()
+            router.balance_weight[0, :] = 100.0
             _, routing_probs_biased, _ = router(x, active_mask, None)
 
-        assert not torch.allclose(routing_probs_zero_bias, routing_probs_biased, atol=1e-4), (
-            "routing_probs must differ when expert_bias is non-zero — bias must be "
-            "incorporated via the semantic gradient channel"
+        assert not torch.allclose(routing_probs_zero_balance, routing_probs_biased, atol=1e-4), (
+            "routing_probs must differ when balance_weight is non-zero — balance_weight "
+            "must be incorporated via the semantic gradient channel"
         )
 
 
@@ -239,8 +223,8 @@ class TestBiasRoutingBehavior:
 # ---------------------------------------------------------------------------
 
 class TestGradients:
-    def test_expert_bias_receives_gradient(self):
-        """expert_bias must accumulate a gradient after backward on load_balance_loss."""
+    def test_balance_weight_receives_gradient(self):
+        """balance_weight must accumulate a gradient after backward on load_balance_loss."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
@@ -249,11 +233,11 @@ class TestGradients:
         load_balance_loss = diagnostics["load_balance_loss"]
         load_balance_loss.backward()
 
-        assert router.expert_bias.grad is not None
-        assert router.expert_bias.grad.shape == (config.num_mosrah_heads,)
+        assert router.balance_weight.grad is not None
+        assert router.balance_weight.grad.shape == (config.num_mosrah_heads, config.embedding_width)
 
-    def test_expert_bias_gradient_is_not_all_zero(self):
-        """With an unbalanced router, expert_bias.grad must be non-zero — all-zero grad
+    def test_balance_weight_gradient_is_not_all_zero(self):
+        """With an unbalanced router, balance_weight.grad must be non-zero — all-zero grad
         would mean the load balancing operator has no effect on training."""
         config = small_config()
         router = MoSRAHRouter(config)
@@ -263,16 +247,15 @@ class TestGradients:
         load_balance_loss = diagnostics["load_balance_loss"]
         load_balance_loss.backward()
 
-        # At initialization with zero biases and random weights the routing will be
-        # imperfectly balanced, so at least one head's gradient should be non-zero.
-        assert router.expert_bias.grad.abs().sum().item() > 0.0
+        # At initialization with random weights the routing will be imperfectly balanced,
+        # so at least one entry's gradient should be non-zero.
+        assert router.balance_weight.grad.abs().sum().item() > 0.0
 
-    def test_routing_projection_weight_grad_is_none_after_load_balance_loss_backward(self):
-        """Backward on load_balance_loss must not populate routing_projection.weight.grad.
+    def test_routing_weight_grad_is_none_after_load_balance_loss_backward(self):
+        """Backward on load_balance_loss must not populate routing_weight.grad.
 
-        Gradient isolation invariant: assignment probabilities are computed via
-        softmax(logits.detach() + expert_bias), so there is no autograd path from
-        load_balance_loss back to routing_projection.weight.
+        Gradient isolation invariant: load_balancing_logits = (A·x).detach() + B·(x.detach()),
+        so there is no autograd path from load_balance_loss back to routing_weight.
         """
         torch.manual_seed(0)
         config = small_config()
@@ -283,7 +266,7 @@ class TestGradients:
         _, _, diagnostics = router(x, active_mask, None)
         diagnostics["load_balance_loss"].backward()
 
-        assert router.routing_projection.weight.grad is None
+        assert router.routing_weight.grad is None
 
 
 # ---------------------------------------------------------------------------
@@ -291,18 +274,18 @@ class TestGradients:
 # ---------------------------------------------------------------------------
 
 class TestGradientIsolationTwoPathway:
-    """Tests certifying the two-pathway gradient architecture of Unit 24.C.
+    """Tests certifying the two-pathway gradient architecture.
 
-    semantic_logits = logits + expert_bias.detach() drives selection and routing_probs.
-    load_balancing_logits = logits.detach() + expert_bias drives assignment_probs.
-    Each pathway isolates one parameter set from the other's loss.
+    semantic_logits = A·x + (B·x).detach() drives selection and routing_probs.
+    load_balancing_logits = (A·x).detach() + B·(x.detach()) drives assignment_probs.
+    Each pathway isolates one parameter matrix from the other's loss.
     """
 
-    def test_task_loss_does_not_reach_expert_bias(self):
-        """Backward on task loss must not populate expert_bias.grad.
+    def test_task_loss_does_not_reach_balance_weight(self):
+        """Backward on task loss must not populate balance_weight.grad.
 
-        semantic_logits uses expert_bias.detach() — there is no autograd path
-        from routing_probs or selected_heads back to expert_bias.
+        semantic_logits = A·x + (B·x).detach() — there is no autograd path
+        from routing_probs or selected_heads back to balance_weight.
         """
         torch.manual_seed(0)
         config = small_config()
@@ -313,14 +296,14 @@ class TestGradientIsolationTwoPathway:
         _, routing_probs, _ = router(x, active_mask, None)
         routing_probs.sum().backward()
 
-        assert router.routing_projection.weight.grad is not None
-        assert router.expert_bias.grad is None
+        assert router.routing_weight.grad is not None
+        assert router.balance_weight.grad is None
 
-    def test_load_balance_loss_does_not_reach_routing_projection(self):
-        """Backward on load_balance_loss must not populate routing_projection.weight.grad.
+    def test_load_balance_loss_does_not_reach_routing_weight(self):
+        """Backward on load_balance_loss must not populate routing_weight.grad.
 
-        load_balancing_logits uses logits.detach() — there is no autograd path
-        from assignment_probs back to routing_projection.weight.
+        load_balancing_logits = (A·x).detach() + B·(x.detach()) — there is no autograd
+        path from load_balance_loss back to routing_weight.
         """
         torch.manual_seed(0)
         config = small_config()
@@ -331,19 +314,19 @@ class TestGradientIsolationTwoPathway:
         _, _, diagnostics = router(x, active_mask, None)
         diagnostics["load_balance_loss"].backward()
 
-        assert router.expert_bias.grad is not None
-        assert router.routing_projection.weight.grad is None
+        assert router.balance_weight.grad is not None
+        assert router.routing_weight.grad is None
 
     def test_assignment_probs_not_contaminated_by_capacity_masking(self):
         """Load balance gradients must be finite when a preferred expert is over capacity.
 
         Post-capacity bug: softmax over -1e8-masked logits gives p_0 = exp(-1e8) / sum,
         which underflows to 0.0 in float32. CE loss computes log(0) = -inf, producing
-        inf/NaN gradients through expert_bias.
+        inf/NaN gradients through balance_weight.
 
         Pre-capacity fix (correct): softmax(load_balancing_logits) is computed before
-        balance_capacity. With expert_bias[0] = 50, p_0 ≈ 1.0 and log(p_0) ≈ 0 —
-        gradient is bounded.
+        balance_capacity. With balance_weight[0] large and x = ones, p_0 ≈ 1.0 and
+        log(p_0) ≈ 0 — gradient is bounded.
         """
         torch.manual_seed(0)
         # Sparse routing so one expert can be genuinely over capacity in inference mode.
@@ -361,24 +344,27 @@ class TestGradientIsolationTwoPathway:
         used_capacity = torch.zeros(B, L, dtype=torch.long)
         used_capacity[0, 0] = capacity  # expert 0 fully at capacity
 
-        # Large positive bias toward expert 0 (already at capacity).
+        # Large balance_weight row for head 0. With x = ones, load_balancing_logit
+        # for head 0 ≈ 50, dominating all other heads.
         with torch.no_grad():
-            router.expert_bias.zero_()
-            router.expert_bias[0] = 50.0
+            router.routing_weight.zero_()
+            router.balance_weight.zero_()
+            router.balance_weight[0, :] = 50.0 / config.embedding_width
 
-        x = torch.randn(B, N, config.embedding_width)
+        # All-ones x so that head 0's load_balancing_logit = sum(balance_weight[0]) ≈ 50.
+        x = torch.ones(B, N, config.embedding_width)
         active_mask = torch.ones(B, N, dtype=torch.bool)
 
         _, _, diagnostics = router(x, active_mask, used_capacity)
         diagnostics["load_balance_loss"].backward()
 
         # Post-capacity bug: p_0 = 0.0 (float32 underflow) → log(0) = -inf → inf grad.
-        # Pre-capacity fix: p_0 ≈ 1.0 (from bias=50) → log(1) ≈ 0 → bounded grad.
-        assert torch.isfinite(router.expert_bias.grad).all(), (
-            "expert_bias.grad is non-finite — assignment_probs may have been computed "
+        # Pre-capacity fix: p_0 ≈ 1.0 → log(1) ≈ 0 → bounded grad.
+        assert torch.isfinite(router.balance_weight.grad).all(), (
+            "balance_weight.grad is non-finite — assignment_probs may have been computed "
             "post-balance_capacity, producing log(0) from the -1e8 sentinel"
         )
-        assert router.expert_bias.grad.abs().max().item() < 1e6
+        assert router.balance_weight.grad.abs().max().item() < 1e6
 
 
 # ---------------------------------------------------------------------------
@@ -409,63 +395,49 @@ class TestRouterDiagnostics:
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
         _, _, diagnostics = router(x, active_mask, None)
-        for key in ("max_vio", "bias_std", "raw_logit_std", "logit_std", "bias_alignment"):
+        for key in ("max_vio", "routing_logit_std", "balance_logit_std",
+                    "semantic_logit_std", "balance_alignment"):
             assert not diagnostics[key].requires_grad, (
                 f"diagnostic scalar '{key}' must be detached but requires_grad is True"
             )
 
-    def test_bias_std_zero_when_bias_zero(self):
-        """bias_std must be zero when expert_bias is the zero vector."""
-        config = small_config()
-        router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, 64)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-        with torch.no_grad():
-            router.expert_bias.zero_()
-        _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["bias_std"].item() == 0.0
+    def test_balance_logit_std_zero_when_balance_weight_zero(self):
+        """balance_logit_std must be zero when balance_weight is zero.
 
-    def test_logit_std_equals_raw_logit_std_when_bias_zero(self):
-        """logit_std must equal raw_logit_std when expert_bias is zero.
-
-        With a zero bias, (logits + expert_bias) == logits, so the combined
-        spread is identical to the unbiased spread.
+        With balance_weight zeroed, B·x = 0 for any x, so per-token std of
+        balance_logits is identically zero.
         """
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
         with torch.no_grad():
-            router.expert_bias.zero_()
+            router.balance_weight.zero_()
         _, _, diagnostics = router(x, active_mask, None)
-        assert torch.allclose(diagnostics["logit_std"], diagnostics["raw_logit_std"], atol=1e-6)
+        assert diagnostics["balance_logit_std"].item() == 0.0
 
-    def test_bias_alignment_negative_when_bias_opposes_logits(self):
-        """bias_alignment must be negative when expert_bias points opposite to logits.
+    def test_semantic_logit_std_equals_routing_logit_std_when_balance_weight_zero(self):
+        """semantic_logit_std must equal routing_logit_std when balance_weight is zero.
 
-        Computed by measuring the mean logit direction then setting expert_bias
-        to its negation, guaranteeing a negative mean cosine similarity.
+        With balance_weight zeroed, B·x = 0, so semantic_logits = A·x + 0 = A·x,
+        and both stds are computed over the same values.
         """
         config = small_config()
         router = MoSRAHRouter(config)
-        torch.manual_seed(42)
-        x = torch.randn(1, 8, 64)
-        active_mask = torch.ones(1, 8, dtype=torch.bool)
+        x = torch.randn(2, 8, 64)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
         with torch.no_grad():
-            logits = router.routing_projection(x)          # (1, 8, L)
-            mean_logit_direction = logits.mean(dim=(0, 1)) # (L,)
-            router.expert_bias.copy_(-mean_logit_direction)
+            router.balance_weight.zero_()
         _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["bias_alignment"].item() < 0, (
-            f"expected negative bias_alignment for opposing bias, "
-            f"got {diagnostics['bias_alignment'].item()}"
+        assert torch.allclose(
+            diagnostics["semantic_logit_std"], diagnostics["routing_logit_std"], atol=1e-6
         )
 
-    def test_bias_alignment_positive_when_bias_reinforces_logits(self):
-        """bias_alignment must be positive when expert_bias reinforces logit direction.
+    def test_balance_alignment_negative_when_balance_opposes_routing(self):
+        """balance_alignment must be negative when balance_weight = -routing_weight.
 
-        Computed by setting expert_bias to the mean logit direction, guaranteeing
-        a positive mean cosine similarity.
+        Setting balance_weight = -routing_weight guarantees balance_logits = -routing_logits
+        for any x, so cosine similarity between the two is -1 for every token.
         """
         config = small_config()
         router = MoSRAHRouter(config)
@@ -473,13 +445,30 @@ class TestRouterDiagnostics:
         x = torch.randn(1, 8, 64)
         active_mask = torch.ones(1, 8, dtype=torch.bool)
         with torch.no_grad():
-            logits = router.routing_projection(x)
-            mean_logit_direction = logits.mean(dim=(0, 1))
-            router.expert_bias.copy_(mean_logit_direction)
+            router.balance_weight.copy_(-router.routing_weight)
         _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["bias_alignment"].item() > 0, (
-            f"expected positive bias_alignment for reinforcing bias, "
-            f"got {diagnostics['bias_alignment'].item()}"
+        assert diagnostics["balance_alignment"].item() < 0, (
+            f"expected negative balance_alignment for opposing balance_weight, "
+            f"got {diagnostics['balance_alignment'].item()}"
+        )
+
+    def test_balance_alignment_positive_when_balance_reinforces_routing(self):
+        """balance_alignment must be positive when balance_weight = routing_weight.
+
+        Setting balance_weight = routing_weight guarantees balance_logits = routing_logits
+        for any x, so cosine similarity between the two is 1 for every token.
+        """
+        config = small_config()
+        router = MoSRAHRouter(config)
+        torch.manual_seed(42)
+        x = torch.randn(1, 8, 64)
+        active_mask = torch.ones(1, 8, dtype=torch.bool)
+        with torch.no_grad():
+            router.balance_weight.copy_(router.routing_weight)
+        _, _, diagnostics = router(x, active_mask, None)
+        assert diagnostics["balance_alignment"].item() > 0, (
+            f"expected positive balance_alignment for reinforcing balance_weight, "
+            f"got {diagnostics['balance_alignment'].item()}"
         )
 
 
@@ -500,64 +489,65 @@ class TestBiasDiagnostics:
         N: int,
         L: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Construct (logits, semantic_logits, expert_bias) for static method tests."""
-        logits = torch.randn(B, N, L)
-        expert_bias = torch.randn(L)
-        semantic_logits = logits + expert_bias
-        return logits, semantic_logits, expert_bias
+        """Construct (routing_logits, balance_logits, semantic_logits) for static method tests."""
+        routing_logits = torch.randn(B, N, L)
+        balance_logits = torch.randn(B, N, L)
+        semantic_logits = routing_logits + balance_logits
+        return routing_logits, balance_logits, semantic_logits
 
     def test_returns_expected_keys(self):
         """_compute_bias_diagnostics must return a dict with exactly the four expected keys."""
-        logits, semantic_logits, expert_bias = self._make_inputs(2, 8, 4)
-        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
-        assert set(result.keys()) == {"bias_std", "raw_logit_std", "logit_std", "bias_alignment"}
+        routing_logits, balance_logits, semantic_logits = self._make_inputs(2, 8, 4)
+        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
+        assert set(result.keys()) == {
+            "routing_logit_std", "balance_logit_std", "semantic_logit_std", "balance_alignment"
+        }
 
     def test_all_values_detached(self):
         """All four diagnostic scalars must be detached from the autograd graph."""
-        logits = torch.randn(2, 8, 4, requires_grad=True)
-        expert_bias = torch.randn(4, requires_grad=True)
-        semantic_logits = logits + expert_bias
-        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
+        routing_logits = torch.randn(2, 8, 4, requires_grad=True)
+        balance_logits = torch.randn(2, 8, 4, requires_grad=True)
+        semantic_logits = routing_logits + balance_logits
+        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
         for key, val in result.items():
             assert not val.requires_grad, (
                 f"{key} must be detached but requires_grad is True"
             )
 
-    def test_bias_std_zero_when_bias_is_uniform(self):
-        """bias_std must be exactly 0 when all expert_bias entries are equal."""
-        L = 6
-        logits = torch.randn(1, 4, L)
-        expert_bias = torch.full((L,), 2.5)
-        semantic_logits = logits + expert_bias
-        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
-        assert result["bias_std"].item() == 0.0
+    def test_balance_logit_std_zero_when_balance_is_uniform(self):
+        """balance_logit_std must be exactly 0 when balance_logits are constant across L."""
+        B, N, L = 1, 4, 6
+        routing_logits = torch.randn(B, N, L)
+        # Constant across the L dimension → per-token std = 0.
+        balance_logits = torch.full((B, N, L), 2.5)
+        semantic_logits = routing_logits + balance_logits
+        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
+        assert result["balance_logit_std"].item() == 0.0
 
-    def test_alignment_negative_when_bias_opposes_logits(self):
-        """bias_alignment must be negative when expert_bias is set to -mean_logit_direction."""
+    def test_alignment_negative_when_balance_opposes_routing(self):
+        """balance_alignment must be negative when balance_logits = -routing_logits."""
         torch.manual_seed(7)
         B, N, L = 1, 8, 4
-        logits = torch.randn(B, N, L)
-        mean_direction = logits.mean(dim=(0, 1))              # (L,)
-        expert_bias = -mean_direction
-        semantic_logits = logits + expert_bias
-        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
-        assert result["bias_alignment"].item() < 0, (
-            f"expected negative alignment for opposing bias, "
-            f"got {result['bias_alignment'].item()}"
+        routing_logits = torch.randn(B, N, L)
+        balance_logits = -routing_logits  # perfect anti-alignment → cosine similarity = -1
+        semantic_logits = routing_logits + balance_logits
+        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
+        assert result["balance_alignment"].item() < 0, (
+            f"expected negative alignment for opposing balance, "
+            f"got {result['balance_alignment'].item()}"
         )
 
-    def test_alignment_positive_when_bias_reinforces_logits(self):
-        """bias_alignment must be positive when expert_bias is set to +mean_logit_direction."""
+    def test_alignment_positive_when_balance_reinforces_routing(self):
+        """balance_alignment must be positive when balance_logits = routing_logits."""
         torch.manual_seed(7)
         B, N, L = 1, 8, 4
-        logits = torch.randn(B, N, L)
-        mean_direction = logits.mean(dim=(0, 1))              # (L,)
-        expert_bias = mean_direction
-        semantic_logits = logits + expert_bias
-        result = MoSRAHRouter._compute_bias_diagnostics(logits, semantic_logits, expert_bias)
-        assert result["bias_alignment"].item() > 0, (
-            f"expected positive alignment for reinforcing bias, "
-            f"got {result['bias_alignment'].item()}"
+        routing_logits = torch.randn(B, N, L)
+        balance_logits = routing_logits  # perfect alignment → cosine similarity = 1
+        semantic_logits = routing_logits + balance_logits
+        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
+        assert result["balance_alignment"].item() > 0, (
+            f"expected positive alignment for reinforcing balance, "
+            f"got {result['balance_alignment'].item()}"
         )
 
 
@@ -566,24 +556,31 @@ class TestBiasDiagnostics:
 # ---------------------------------------------------------------------------
 
 class TestArchitectureInvariants:
-    def test_routing_projection_has_no_bias(self):
-        """routing_projection must be bias-free (paper specifies xW_r with no bias term).
-        expert_bias is the only bias-like parameter and has an entirely separate role."""
+    def test_routing_weight_is_parameter(self):
+        """routing_weight must be an nn.Parameter so the optimizer sees and updates it,
+        and HuggingFace _init_weights does not override its kaiming initialization."""
         config = small_config()
         router = MoSRAHRouter(config)
-        assert router.routing_projection.bias is None
+        assert isinstance(router.routing_weight, torch.nn.Parameter)
 
-    def test_expert_bias_shape(self):
-        """expert_bias must have shape (num_mosrah_heads,) — one scalar per head."""
+    def test_balance_weight_is_parameter(self):
+        """balance_weight must be an nn.Parameter so the optimizer sees and updates it,
+        and HuggingFace _init_weights does not override its kaiming initialization."""
         config = small_config()
         router = MoSRAHRouter(config)
-        assert router.expert_bias.shape == (config.num_mosrah_heads,)
+        assert isinstance(router.balance_weight, torch.nn.Parameter)
 
-    def test_expert_bias_is_parameter(self):
-        """expert_bias must be an nn.Parameter so the optimizer sees and updates it."""
+    def test_routing_weight_shape(self):
+        """routing_weight must have shape (num_mosrah_heads, embedding_width)."""
         config = small_config()
         router = MoSRAHRouter(config)
-        assert isinstance(router.expert_bias, torch.nn.Parameter)
+        assert router.routing_weight.shape == (config.num_mosrah_heads, config.embedding_width)
+
+    def test_balance_weight_shape(self):
+        """balance_weight must have shape (num_mosrah_heads, embedding_width)."""
+        config = small_config()
+        router = MoSRAHRouter(config)
+        assert router.balance_weight.shape == (config.num_mosrah_heads, config.embedding_width)
 
 
 # ---------------------------------------------------------------------------

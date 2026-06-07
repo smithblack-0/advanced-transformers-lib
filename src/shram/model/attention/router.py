@@ -9,24 +9,28 @@ paper. Given an input hidden state x, the router produces two outputs used downs
     the semantic routing scores at the selected indices and renormalized to sum to 1
     per token.
 
-Routing computation uses two gradient-isolated pathways over numerically identical
-biased values:
+Routing uses two learnable projection matrices and two gradient-isolated pathways:
 
-  - semantic_logits = logits + expert_bias.detach(): drives selection and routing_probs.
-    Task gradients reach routing_projection.weight; expert_bias is isolated from task loss.
-  - load_balancing_logits = logits.detach() + expert_bias: drives assignment_probs.
-    Load balance gradients reach expert_bias; routing_projection.weight is isolated from
-    load balance loss.
+  - routing_weight (A): shape (L, embedding_width). Maps input to per-head routing
+    scores. Receives gradients from task loss; balance_weight is isolated.
+  - balance_weight (B): shape (L, embedding_width). Maps input to per-head load-balance
+    correction scores. Receives gradients from load_balance_loss; routing_weight is
+    isolated.
 
-No unbiased routing computation exists. All routing uses biased values. The separation
-of gradient paths replaces the previous biased/unbiased split, closing the loophole where
-a bias-redirected expert could be selected but contribute negligibly to the output because
-its unbiased preference — and thus its routing_prob — remained near zero.
+The two gradient-isolated pathways over numerically identical values:
+
+  - semantic_logits = A·x + (B·x).detach(): task gradients reach routing_weight;
+    balance_weight is isolated from task loss.
+  - load_balancing_logits = (A·x).detach() + B·(x.detach()): load balance gradients
+    reach balance_weight; routing_weight and x are isolated from load balance loss.
+
+Both matrices are nn.Parameter so that HuggingFace _init_weights does not override
+their kaiming initialization at construction.
 
 Assignment probabilities are computed before balance_capacity applies -1e8 sentinels.
 Post-capacity softmax would invert the load balance gradient for over-capacity experts
-(near-zero probability after masking signals "increase bias" for an already-overloaded
-expert).
+(near-zero probability after masking signals "increase corrections" for an already-
+overloaded expert).
 
 The router also computes and returns the load balance loss via a log-probability auxiliary
 loss (see load_balance_loss.py). The loss formulation is selected by config; the default
@@ -51,23 +55,21 @@ import torch.nn.functional as F
 from ..configuration import ShramConfig
 from .load_balance_loss import make_load_balance_loss, reduce_frequency_tokens
 
-from typing import Optional
-
 class MoSRAHRouter(nn.Module):
     """Token-choice router for MoSRAH sparse attention.
 
     Each input token independently selects K of the L available expert heads. Both
-    selection and routing_probs incorporate expert_bias via two gradient-isolated
-    pathways over numerically identical biased values. See module docstring for the
+    selection and routing_probs incorporate balance_weight via two gradient-isolated
+    pathways over numerically identical values. See module docstring for the
     two-pathway architecture.
 
-    The routing projection W_r has no bias term — the paper specifies xW_r with no
-    additional projection bias. The only bias-like parameter is expert_bias (b), which
-    has an entirely separate role and gradient path.
+    Both routing_weight and balance_weight are nn.Parameter rather than nn.Linear
+    so that HuggingFace _init_weights does not override their kaiming initialization
+    at construction.
 
     Args:
-        config: Model configuration. Must expose ``hidden_size``, ``num_mosrah_heads``
-            (L), and ``num_selected_heads`` (K).
+        config: Model configuration. Must expose ``embedding_width``,
+            ``num_mosrah_heads`` (L), and ``num_selected_heads`` (K).
     """
 
     def __init__(self, config: ShramConfig) -> None:
@@ -82,15 +84,22 @@ class MoSRAHRouter(nn.Module):
         self.max_bid_rounds = config.max_bid_rounds
         self._load_balance_loss = make_load_balance_loss(config.load_balance_loss_type)
 
-        # W_r: routing projection, no bias (paper specifies xW_r, no additional term).
-        self.routing_projection = nn.Linear(
-            config.embedding_width, config.num_mosrah_heads, bias=False
+        # W_r (A): semantic routing matrix. Maps input to per-head routing scores for
+        # selection and routing_probs. nn.Parameter ensures HuggingFace _init_weights
+        # does not override kaiming initialization at construction.
+        self.routing_weight = nn.Parameter(
+            torch.empty(config.num_mosrah_heads, config.embedding_width)
         )
+        nn.init.kaiming_uniform_(self.routing_weight)
 
-        # b: learned per-head bias for load balancing. Initialized to zero so that all
-        # heads start with equal selection probability. Updated by the main optimizer
-        # via gradients from the load balance loss through load_balancing_logits.
-        self.expert_bias = nn.Parameter(torch.zeros(config.num_mosrah_heads))
+        # W_b (B): load-balancing projection matrix. Maps input to per-head correction
+        # scores. Receives gradients only from load_balance_loss via the
+        # load_balancing_logits pathway. nn.Parameter ensures HuggingFace _init_weights
+        # does not override kaiming initialization at construction.
+        self.balance_weight = nn.Parameter(
+            torch.empty(config.num_mosrah_heads, config.embedding_width)
+        )
+        nn.init.kaiming_uniform_(self.balance_weight)
 
     @staticmethod
     def get_best_proposals(
@@ -326,7 +335,7 @@ class MoSRAHRouter(nn.Module):
         """Route input tokens to K expert heads each and compute routing probabilities.
 
         Args:
-            x: Input hidden states of shape (batch, seq_len, hidden_size).
+            x: Input hidden states of shape (batch, seq_len, embedding_width).
             active_mask: Current-chunk active mask of shape (batch, seq_len), where
                 True means the token is semantically live. Dead tokens do not
                 contribute to routing frequencies, load_balance_loss, or max_vio.
@@ -342,43 +351,39 @@ class MoSRAHRouter(nn.Module):
             router_diagnostics: Dict of routing feedback scalars. Keys:
                 - ``load_balance_loss``: scalar load-balance loss with gradient.
                 - ``max_vio``: detached scalar routing-imbalance summary.
-                - ``bias_std``: std of expert_bias; near-zero means corrections have not built up.
-                - ``raw_logit_std``: mean per-token std of scaled logits; the natural routing scale.
-                - ``logit_std``: mean per-token std of semantic_logits; lower than
-                  raw_logit_std means bias is flattening preferences (healthy correction).
-                - ``bias_alignment``: mean cosine similarity of expert_bias against per-token
-                  logits. Negative means bias opposes routing direction (healthy correction);
-                  positive means runaway reinforcement.
+                - ``routing_logit_std``: mean per-token std of routing_logits; natural
+                  routing preference scale and baseline for interpreting balance_logit_std.
+                - ``balance_logit_std``: mean per-token std of balance_logits; near-zero
+                  means balance corrections have not built up relative to routing scale.
+                - ``semantic_logit_std``: mean per-token std of semantic_logits; lower than
+                  routing_logit_std means balance is flattening preferences (healthy correction).
+                - ``balance_alignment``: mean cosine similarity of routing_logits vs
+                  balance_logits per token. Negative means balance opposes routing direction
+                  (healthy correction); positive means runaway reinforcement.
         """
         B, N, _ = x.shape
         L = self.num_mosrah_heads
         K = self.num_selected_heads
 
-        logits = self.routing_projection(x)    # (B, N, L)
+        logits = self._compute_routing_logits(x)
 
-        # Two gradient-isolated pathways over numerically identical biased values.
-        # semantic_logits: task gradients reach routing_projection; expert_bias isolated.
-        # load_balancing_logits: load balance gradients reach expert_bias; routing_projection isolated.
-        semantic_logits       = logits + self.expert_bias.detach()   # (B, N, L)
-        load_balancing_logits = logits.detach() + self.expert_bias   # (B, N, L)
-
-        # Diagnostic scalars characterising the load-balance mechanism. Must be computed
+        # Diagnostic scalars characterising the two routing pathways. Must be computed
         # before balance_capacity injects -1e8 sentinels that would corrupt std and
         # cosine similarity. Extracted to _compute_bias_diagnostics to keep the forward
         # body free of non-(B,N,L) reduction logic.
         bias_diagnostics = self._compute_bias_diagnostics(
-            logits, semantic_logits, self.expert_bias
+            logits["routing_logits"], logits["balance_logits"], logits["semantic_logits"]
         )
 
         # Pre-capacity semantic softmax for gathering routing_probs. Computed before
         # balance_capacity so that gathered probabilities reflect genuine preference
         # magnitudes rather than hard-masked sentinel values.
-        routing_scores = F.softmax(semantic_logits, dim=-1)          # (B, N, L)
+        routing_scores = F.softmax(logits["semantic_logits"], dim=-1)          # (B, N, L)
 
         # Capacity-balanced semantic logits for selection. Injects -1e8 into positions
         # that would exceed per-expert token budget, enforcing the packing constraint.
         balanced_semantic_logits = self.balance_capacity(
-            semantic_logits,
+            logits["semantic_logits"],
             used_capacity,
             self.capacity,
             self.num_selected_heads,
@@ -402,7 +407,7 @@ class MoSRAHRouter(nn.Module):
         assignment_mask.scatter_(-1, selected_heads, 1.0)
 
         load_balance_loss = self._load_balance_loss(
-            load_balancing_logits, assignment_mask, active_mask
+            logits["load_balancing_logits"], assignment_mask, active_mask
         )
 
         # MaxVio: detached monitoring scalar averaged over batch items. Computed from
@@ -416,42 +421,77 @@ class MoSRAHRouter(nn.Module):
         }
         return selected_heads, routing_probs, router_diagnostics
 
-    @staticmethod
-    def _compute_bias_diagnostics(
-        logits: torch.Tensor,
-        semantic_logits: torch.Tensor,
-        expert_bias: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Compute detached diagnostic scalars characterising the load-balance mechanism.
+    def _compute_routing_logits(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Compute the two gradient-isolated logit pathways from input hidden states.
 
-        All four scalars must be computed before balance_capacity applies -1e8 sentinels,
-        which would corrupt std and cosine similarity. Extracted from forward to keep the
-        main body free of non-(B,N,L) reduction logic.
+        Isolates all per-pathway arithmetic in one place so that Unit 25.C (integral
+        routing) can extend this method with the cumulative-sum term without
+        modifying forward.
+
+        Two gradient-isolated pathways over numerically identical values:
+          - semantic_logits = A·x + (B·x).detach(): task gradients reach routing_weight;
+            balance_weight is isolated from task loss.
+          - load_balancing_logits = (A·x).detach() + B·(x.detach()): load balance
+            gradients reach balance_weight; routing_weight and x are isolated.
 
         Args:
-            logits:          Scaled routing logits before expert_bias, shape (B, N, L).
-            semantic_logits: Biased logits used for selection, shape (B, N, L).
-            expert_bias:     Learned per-head load-balance bias, shape (L,).
+            x: Input hidden states, shape (batch, seq_len, embedding_width).
 
         Returns:
             Dict with keys:
-            - ``bias_std``:       Std of expert_bias. Near-zero means corrections have
-                                  not built up relative to routing logit scale.
-            - ``raw_logit_std``:  Mean per-token std of logits. Natural routing preference
-                                  scale; reference baseline for interpreting bias_std.
-            - ``logit_std``:      Mean per-token std of semantic_logits. Lower than
-                                  raw_logit_std indicates bias is flattening preferences
-                                  (healthy correction signal).
-            - ``bias_alignment``: Mean cosine similarity of expert_bias against per-token
-                                  logits. Negative means bias opposes routing direction
-                                  (healthy correction); positive means runaway reinforcement.
+            - ``routing_logits``:        A·x, shape (B, N, L). Gradient through routing_weight.
+            - ``balance_logits``:        B·x, shape (B, N, L). Gradient through balance_weight.
+            - ``semantic_logits``:       A·x + (B·x).detach(), shape (B, N, L).
+            - ``load_balancing_logits``: (A·x).detach() + B·(x.detach()), shape (B, N, L).
+        """
+        routing_logits = F.linear(x, self.routing_weight)                                      # (B, N, L)
+        balance_logits = F.linear(x, self.balance_weight)                                      # (B, N, L)
+        return {
+            "routing_logits":        routing_logits,
+            "balance_logits":        balance_logits,
+            "semantic_logits":       routing_logits + balance_logits.detach(),
+            "load_balancing_logits": routing_logits.detach() + F.linear(x.detach(), self.balance_weight),
+        }
+
+    @staticmethod
+    def _compute_bias_diagnostics(
+        routing_logits: torch.Tensor,
+        balance_logits: torch.Tensor,
+        semantic_logits: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute detached diagnostic scalars characterising the two routing pathways.
+
+        All scalars must be computed from pre-capacity logits; balance_capacity
+        applies -1e8 sentinels that would corrupt std and cosine similarity.
+        Extracted from forward to keep the main body free of reduction logic.
+
+        Args:
+            routing_logits:  A·x, routing pathway output, shape (B, N, L).
+            balance_logits:  B·x, balance pathway output, shape (B, N, L).
+            semantic_logits: A·x + (B·x).detach(), combined signal, shape (B, N, L).
+
+        Returns:
+            Dict with keys:
+            - ``routing_logit_std``:  Mean per-token std of routing_logits. Natural
+                                      routing preference scale; reference baseline for
+                                      interpreting balance_logit_std.
+            - ``balance_logit_std``:  Mean per-token std of balance_logits. Near-zero
+                                      means balance corrections have not built up
+                                      relative to the routing scale.
+            - ``semantic_logit_std``: Mean per-token std of semantic_logits. Lower than
+                                      routing_logit_std indicates balance is flattening
+                                      preferences (healthy correction signal).
+            - ``balance_alignment``:  Mean cosine similarity of routing_logits vs
+                                      balance_logits per token. Range [-1, 1]. Negative
+                                      means balance opposes routing direction (healthy
+                                      correction); positive means runaway reinforcement.
         """
         return {
-            "bias_std":       expert_bias.std().detach(),
-            "raw_logit_std":  logits.std(dim=-1).mean().detach(),
-            "logit_std":      semantic_logits.std(dim=-1).mean().detach(),
-            "bias_alignment": F.cosine_similarity(
-                logits, expert_bias.expand_as(logits), dim=-1
+            "routing_logit_std":  routing_logits.std(dim=-1).mean().detach(),
+            "balance_logit_std":  balance_logits.std(dim=-1).mean().detach(),
+            "semantic_logit_std": semantic_logits.std(dim=-1).mean().detach(),
+            "balance_alignment":  F.cosine_similarity(
+                routing_logits, balance_logits, dim=-1
             ).mean().detach(),
         }
 
