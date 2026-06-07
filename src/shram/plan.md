@@ -99,7 +99,11 @@ is being achieved, one verified unit at a time.
 - [X] Unit 24.A — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
 - [X] Unit 24.B — Routing logit variance reduction: near-zero scalar gate
 - [X] Unit 24.C — Biased routing probabilities: incorporate expert_bias into P
-- [ ] Unit 25 — Final Audit
+- [ ] Unit 25 — Load balancing rebuild
+- [ ] Unit 25.A — Load balancing loss fix
+- [ ] Unit 25.B — Balancing offset mechanism rebuild
+- [ ] Unit 25.C — Integral Routing
+- [ ] Unit 26 — Final Audit
 
 ---
 
@@ -3064,7 +3068,123 @@ Both selection and routing_probs must incorporate expert_bias. The gradient conf
 
 ---
 
-### Unit 25 — Final Audit
+
+## Unit 25 — Load balancing rebuild
+
+The load balancing system is insufficient for
+the desired task. Simply put, a global bias per element is not enough to constrain the behavior within an individual batch. There are several problems involving the way loss is taken and computed. 
+
+### Unit 25.A: Load balancing loss fix
+
+**Responsibility**: Fix a load balancing oversight
+
+**Context of Correctness**
+
+A standard mixture of expert accepts load balancing that is averaged across all batches. This makes no significant difference normally as batches can be removed by repacking before execution in expert-packed format.
+
+This however is a mixture of attention, and cannot neglect batches. Unfortunately, this was not caught when the routing algorithm was originally written.
+
+Based on the given telemetry, once some confusing details were understood, it is clear that load balancing is operating perfectly but imbalances between batches are causing convergence to fail. One batch which overallocates experts can be compensated for by another batch underallocating. 
+
+This behavior must be removed, and preferably the telemetry issue fixed. Additionally, minor artifacts on p-mean and max_vio will need to be cleaned up
+
+**Invariants**
+
+- `router.py` is modified such that all contents to the loss function move in 1(B, N, L)` format
+- `load_balancing_loss.py` is modified to accept this format
+- `load_balancing_loss.py` is modified to use reductions which preserve batch dimensions where possible
+- `load_balancing_loss.py` is considered in terms of using the torch builtin functions
+- `router.py` and `configuration.py` and documentation has references to `p-mean` removed, with aveage used instead. 
+- `max_vio.py` is computed independently in `router.py` as an independent static or class method. This method accepts the agreed [B, N, L] tensor flow and computes from there independently from the loss system.
+- `forward` in router.py has primarily tensors of shape [B, N, L] or [B, N, K] flowing through the main section. Logic which does not behave this way, besides metrics and losses being orchestrated, is processed elsewhere.
+- `routing_scale` is removed, and it's config entry purged, along with any needed documentation changes. 
+
+**Tests**
+
+- All tests are updated to be compatible
+- The necessary telemetry metric function is tested as needed by virtue of being a class or static method
+- 
+
+**Preliminary implementation strategy**
+
+- This needs a discussion to verify the plan is viable. 
+- We need to stop reducing in the router itself.
+- Per token frequencies of shape [B, N, L] should likely be computed in the main body then passed around to loss and max_vio functions. 
+- It is almost certain metrics must be computed in helper methods to hit the forcing constraints. 
+- The forcing constraints are to make refactored code saner. If you cannot meet one ,bring it up!
+
+### 25.B: Balancing offset mechanism rebuild
+
+**Responsibility** Rebuild the load balancing system to use a decoupled projective bias for balancing, such that the model can respond to history to maintain balance within a given batch
+
+**Context of Correctness**
+
+The existing load balancing system attempts to train a global offset for each expert and use that to achieve load balancing. It has become clear this is enviable
+
+While global balancing is possible on average, individual batches tend to desire to overspecialize on a single expert and have no mechanism to correct their behavior when overusing one. This is because there is no way to modify behavior based on the history of the access patterns of the model.
+
+The standard fix for this is to make the load balance loss modify the model alongside the main loss. however, this has been shown to have significant performance consequences. 
+
+Instead, we will rebuild the load balancing system to use a detached projective schema that can read the activity the model has been up to in order to pull back the rate of usage. The detached training system will be retained as well for the existing benefits
+
+**Invariants**
+
+- The underlying routing balancing system will cease to use any bias of shape [L] as a global offset term
+- The routing system will now compute logits using, in theory, the formula `logits=A@x +B@x` where A is the semantic routing matrix and B is the load balancing matrix and x the inputs for logit proejctions.
+- Matrixes `A` and `B` have shape embedding, L.
+- Semantic logits occurs through the construction `semantic_logits = A@x + B.detach() @ x`
+- Load balancing logits occur through `load_balancing_logits = (A @ x).detach() + B@x.detach()`
+- These names are properly adapted into compliant code variable names, not inserted verbatum. 
+
+**Tests**
+
+- The existance of matrices A and B are checked. 
+- Tests are modified in any way needed to test the new system.
+- Tests confirm gradients are not applied in the wrong modes to the wrong places. 
+
+**Preliminary Implementation**
+
+- It would be a really good idea to do some refactoring to pull out logit computations in preparation for the next unit
+
+### Unit 25.C: Integral Routing
+
+**Note**: 
+
+- We will try 25.B while setting this case up.
+
+**Responsibility**: Ensure history cannot be discarded and is taken into account when making routing decisions
+
+**Context of Correctness**
+
+Standard routing is inherently parallel in nature. This leaves it unable to adjust, except indirectly by observing decisions in token streams from the prior layer, to forming routing inbalances. It also is unable to tell when a set of experts has been overused and a different strategy is called for, except indirectly as discussed.
+
+A cumulative sum of the routing logits may change this. Such a quantity, correctly constructed and used, is capable of informing on the overall preferences that have been exhibited up to this point. This may allow more advanced routing decisions for semantic purposes, and will allow more advanced routing decisions for recurrent purposes
+
+It may, however, not be compatible with torch compile. We shall see.
+
+**Invariants**
+
+- The routing construct is modified to have an "integral" and "standard" control mode.
+- The config has an entry added to enter integral routing mode, and is set to it by default.
+- Integral mode produces two additional parameters `A'` and `B'`.
+- If `logits=A@x +B@x` then the cumsum `u` is produced by shifted_logits= concat[zeros[1], logits][:-1] then `u=cumsum(shifted_logits)`
+- The final logits are then produced by `logits = logits + A'@u + B'@u`
+- As before, the semantic and load balance pathways are detached in separate ways
+- `semantic_logits = semantic_logits + A'@u_semantic + B.detach() @u_semantic`
+- `load_balancing_logits = load_balancing_logits + A.detach() @ u_load + B @ u_load`
+
+**Tests**
+
+- Tests confirm gradients work in both modes
+- A test is added with a global flag at the top of the file. When engaged, it will profile the speed of both modes, in compiled or uncompiled form.
+- It is checked that compilation still works in integral form.
+
+**Preliminary strategy**
+
+- Really think through how to design the multimode support. A stupid simple implementation will be unsupportably messy. 
+- It may be useful to make a "exclusive_cumsum" static method for the shifting behavior. 
+
+### Unit 26 — Final Audit
 
 **What:** Review every audit note in plan.md and, if not overridden, ensure compliance. Crosscheck with papers/main.tex and verify whether or not paper is still complaint.
 
