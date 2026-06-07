@@ -9,7 +9,7 @@ paper. Given an input hidden state x, the router produces two outputs used downs
     the semantic routing scores at the selected indices and renormalized to sum to 1
     per token.
 
-Routing uses two learnable projection matrices and two gradient-isolated pathways:
+Base routing uses two learnable projection matrices and two gradient-isolated pathways:
 
   - routing_weight (A): shape (L, embedding_width). Maps input to per-head routing
     scores. Receives gradients from task loss; balance_weight is isolated.
@@ -17,15 +17,40 @@ Routing uses two learnable projection matrices and two gradient-isolated pathway
     correction scores. Receives gradients from load_balance_loss; routing_weight is
     isolated.
 
-The two gradient-isolated pathways over numerically identical values:
+The two gradient-isolated base pathways over numerically identical values:
 
   - semantic_logits = A·x + (B·x).detach(): task gradients reach routing_weight;
     balance_weight is isolated from task loss.
   - load_balancing_logits = (A·x).detach() + B·(x.detach()): load balance gradients
     reach balance_weight; routing_weight and x are isolated from load balance loss.
 
-Both matrices are nn.Parameter so that HuggingFace _init_weights does not override
-their kaiming initialization at construction.
+Integral routing extension (routing_mode == "integral"):
+
+Standard routing is parallel — each token routes based on its own hidden state alone,
+with no direct read on what earlier tokens in the sequence have already selected.
+Integral routing adds a cumulative-sum signal that gives each token a view of the
+prior routing history within the sequence.
+
+Two additional (L, L) parameter matrices are introduced:
+
+  - routing_integral_weight (A'): shape (L, L). Maps the cumulative logit history to
+    per-head semantic corrections. Receives gradients from task loss.
+  - balance_integral_weight (B'): shape (L, L). Maps the cumulative logit history to
+    per-head load-balance corrections. Receives gradients from load_balance_loss.
+
+The cumulative history signal u is the exclusive cumsum of the base logits along the
+sequence dimension: u[n] = sum(logits[0..n-1]), shape (B, N, L). Position 0 receives
+zeros (no prior history). The same gradient isolation pattern as A/B applies:
+
+  - semantic_logits   += A'·u_semantic + (B'·u_semantic).detach()
+  - lb_logits         += (A'·u_load).detach() + B'·u_load
+
+Detaching the full B'·u_semantic result (rather than just B') mirrors the
+(B·x).detach() pattern in the base pathway and prevents double-counting the
+cumsum gradient path back to routing_weight.
+
+Both base matrices and both integral matrices are nn.Parameter so that HuggingFace
+_init_weights does not override their kaiming initialization at construction.
 
 Assignment probabilities are computed before balance_capacity applies -1e8 sentinels.
 Post-capacity softmax would invert the load balance gradient for over-capacity experts
@@ -36,7 +61,7 @@ The router also computes and returns the load balance loss via a log-probability
 loss (see load_balance_loss.py). The loss formulation is selected by config; the default
 is cross-entropy.
 
-The router additionally computes and returns Ma xVio, a detached scalar summarising
+The router additionally computes and returns MaxVio, a detached scalar summarising
 routing imbalance for the current forward pass:
 
     MaxVio = mean_b( L · max_l(f_bl − 1/L) )
@@ -61,15 +86,25 @@ class MoSRAHRouter(nn.Module):
     Each input token independently selects K of the L available expert heads. Both
     selection and routing_probs incorporate balance_weight via two gradient-isolated
     pathways over numerically identical values. See module docstring for the
-    two-pathway architecture.
+    two-pathway architecture and the integral routing extension.
 
-    Both routing_weight and balance_weight are nn.Parameter rather than nn.Linear
-    so that HuggingFace _init_weights does not override their kaiming initialization
-    at construction.
+    All four learnable matrices are nn.Parameter rather than nn.Linear so that
+    HuggingFace _init_weights does not override their kaiming initialization at
+    construction.
+
+    Attributes:
+        routing_weight: A, shape (L, embedding_width). Task-loss pathway.
+        balance_weight: B, shape (L, embedding_width). Load-balance pathway.
+        routing_integral_weight: A', shape (L, L). Integral task-loss pathway.
+            Present only when ``routing_mode == "integral"``.
+        balance_integral_weight: B', shape (L, L). Integral load-balance pathway.
+            Present only when ``routing_mode == "integral"``.
+        routing_mode: ``"integral"`` or ``"default"``, from config.
 
     Args:
         config: Model configuration. Must expose ``embedding_width``,
-            ``num_mosrah_heads`` (L), and ``num_selected_heads`` (K).
+            ``num_mosrah_heads`` (L), ``num_selected_heads`` (K), and
+            ``routing_mode``.
     """
 
     def __init__(self, config: ShramConfig) -> None:
@@ -82,24 +117,40 @@ class MoSRAHRouter(nn.Module):
             self.capacity = config.mosrah_packed_length
 
         self.max_bid_rounds = config.max_bid_rounds
+        self.routing_mode = config.routing_mode
         self._load_balance_loss = make_load_balance_loss(config.load_balance_loss_type)
 
-        # W_r (A): semantic routing matrix. Maps input to per-head routing scores for
-        # selection and routing_probs. nn.Parameter ensures HuggingFace _init_weights
-        # does not override kaiming initialization at construction.
+        # W_r (A): semantic routing matrix. Maps input (B, N, d) to per-head routing
+        # scores (B, N, L) for selection and routing_probs. nn.Parameter ensures
+        # HuggingFace _init_weights does not override kaiming initialization.
         self.routing_weight = nn.Parameter(
             torch.empty(config.num_mosrah_heads, config.embedding_width)
         )
         nn.init.kaiming_uniform_(self.routing_weight)
 
-        # W_b (B): load-balancing projection matrix. Maps input to per-head correction
-        # scores. Receives gradients only from load_balance_loss via the
-        # load_balancing_logits pathway. nn.Parameter ensures HuggingFace _init_weights
-        # does not override kaiming initialization at construction.
+        # W_b (B): load-balancing projection matrix. Maps input (B, N, d) to per-head
+        # correction scores (B, N, L). Receives gradients only from load_balance_loss.
+        # nn.Parameter ensures HuggingFace _init_weights does not override kaiming init.
         self.balance_weight = nn.Parameter(
             torch.empty(config.num_mosrah_heads, config.embedding_width)
         )
         nn.init.kaiming_uniform_(self.balance_weight)
+
+        if self.routing_mode == "integral":
+            L = config.num_mosrah_heads
+            # A': integral semantic matrix. Maps cumulative logit history (B, N, L) to
+            # per-head semantic corrections (B, N, L). Shape (L, L). Receives gradients
+            # from task loss; balance_integral_weight is isolated from task loss.
+            # Zero-initialized so that corrections start at zero and grow from gradient
+            # updates — kaiming init produces corrections that immediately overwhelm the
+            # base routing signal via the cumsum feedback path.
+            self.routing_integral_weight = nn.Parameter(torch.zeros(L, L))
+
+            # B': integral load-balance matrix. Maps cumulative logit history (B, N, L)
+            # to per-head load-balance corrections (B, N, L). Shape (L, L). Receives
+            # gradients from load_balance_loss; routing_integral_weight is isolated.
+            # Zero-initialized for the same reason as routing_integral_weight.
+            self.balance_integral_weight = nn.Parameter(torch.zeros(L, L))
 
     @staticmethod
     def get_best_proposals(
@@ -365,7 +416,7 @@ class MoSRAHRouter(nn.Module):
         L = self.num_mosrah_heads
         K = self.num_selected_heads
 
-        logits = self._compute_routing_logits(x)
+        logits = self._compute_routing_logits(x, active_mask)
 
         # Diagnostic scalars characterising the two routing pathways. Must be computed
         # before balance_capacity injects -1e8 sentinels that would corrupt std and
@@ -421,36 +472,106 @@ class MoSRAHRouter(nn.Module):
         }
         return selected_heads, routing_probs, router_diagnostics
 
-    def _compute_routing_logits(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Compute the two gradient-isolated logit pathways from input hidden states.
+    @staticmethod
+    def exclusive_cumsum(logits: torch.Tensor) -> torch.Tensor:
+        """Compute the exclusive cumulative sum along the sequence dimension.
 
-        Isolates all per-pathway arithmetic in one place so that Unit 25.C (integral
-        routing) can extend this method with the cumulative-sum term without
-        modifying forward.
+        u[n] = sum(logits[0..n-1]): position n receives the accumulated sum of all
+        prior positions, giving it a read on the routing preferences expressed by
+        earlier tokens in the sequence. Position 0 always receives zeros — no prior
+        history exists at the first position.
 
-        Two gradient-isolated pathways over numerically identical values:
+        Args:
+            logits: Shape (B, N, L). Any per-head score tensor along a sequence.
+
+        Returns:
+            Exclusive cumsum, shape (B, N, L). Same dtype and device as input.
+        """
+        shifted = torch.cat(
+            [torch.zeros_like(logits[:, :1, :]), logits[:, :-1, :]], dim=1
+        )
+        return shifted.cumsum(dim=1)
+
+    def _compute_routing_logits(
+        self, x: torch.Tensor, active_mask: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Compute the gradient-isolated logit pathways from input hidden states.
+
+        Base pathways (both modes):
+
+          Two gradient-isolated pathways over numerically identical values:
           - semantic_logits = A·x + (B·x).detach(): task gradients reach routing_weight;
             balance_weight is isolated from task loss.
           - load_balancing_logits = (A·x).detach() + B·(x.detach()): load balance
             gradients reach balance_weight; routing_weight and x are isolated.
 
+        Integral extension (routing_mode == "integral"):
+
+          Dead tokens are zeroed out of the logits before computing the cumsum, so
+          inactive positions do not contribute to the routing history of downstream
+          live tokens. u_semantic and u_load therefore represent history from live
+          tokens only.
+
+          u_semantic = exclusive_cumsum(semantic_logits * active_mask)    — (B, N, L)
+          u_load     = exclusive_cumsum(load_balancing_logits * active_mask) — (B, N, L)
+
+          semantic_logits       += A'·u_semantic + (B'·u_semantic).detach()
+          load_balancing_logits += (A'·u_load).detach() + B'·u_load
+
+          Detaching the full (B'·u_semantic) result mirrors the (B·x).detach() base
+          pattern: it isolates balance_integral_weight from task loss AND prevents
+          double-counting the cumsum gradient path back to routing_weight.
+          The same reasoning applies to (A'·u_load).detach() in the load-balance
+          pathway — u_load already has no path to routing_weight (routing_logits is
+          detached in load_balancing_logits), and the detach additionally blocks
+          routing_integral_weight.
+
         Args:
             x: Input hidden states, shape (batch, seq_len, embedding_width).
+            active_mask: Boolean active-token mask, shape (batch, seq_len). Dead tokens
+                are excluded from the cumsum history in integral mode.
 
         Returns:
             Dict with keys:
-            - ``routing_logits``:        A·x, shape (B, N, L). Gradient through routing_weight.
-            - ``balance_logits``:        B·x, shape (B, N, L). Gradient through balance_weight.
-            - ``semantic_logits``:       A·x + (B·x).detach(), shape (B, N, L).
-            - ``load_balancing_logits``: (A·x).detach() + B·(x.detach()), shape (B, N, L).
+            - ``routing_logits``:        A·x, shape (B, N, L).
+            - ``balance_logits``:        B·x, shape (B, N, L).
+            - ``semantic_logits``:       combined task-loss pathway, shape (B, N, L).
+            - ``load_balancing_logits``: combined load-balance pathway, shape (B, N, L).
         """
-        routing_logits = F.linear(x, self.routing_weight)                                      # (B, N, L)
-        balance_logits = F.linear(x, self.balance_weight)                                      # (B, N, L)
+        routing_logits = F.linear(x, self.routing_weight)                     # (B, N, L)
+        balance_logits = F.linear(x, self.balance_weight)                     # (B, N, L)
+        semantic_logits       = routing_logits + balance_logits.detach()
+        load_balancing_logits = routing_logits.detach() + F.linear(x.detach(), self.balance_weight)
+
+        if self.routing_mode == "integral":
+            # Zero out dead token positions before cumsum so inactive tokens do not
+            # contaminate the routing history of subsequent live tokens.
+            live = active_mask.unsqueeze(-1)                                   # (B, N, 1)
+            u_semantic = self.exclusive_cumsum(semantic_logits * live)         # (B, N, L)
+            u_load     = self.exclusive_cumsum(load_balancing_logits * live)   # (B, N, L)
+
+            # Semantic pathway: A' trains on task loss; B' term is fully detached to
+            # isolate balance_integral_weight from task loss and prevent double-counting
+            # the cumsum gradient path back to routing_weight.
+            semantic_logits = (
+                semantic_logits
+                + F.linear(u_semantic, self.routing_integral_weight)
+                + F.linear(u_semantic, self.balance_integral_weight).detach()
+            )
+
+            # Load-balance pathway: B' trains on load_balance_loss; A' term is fully
+            # detached to isolate routing_integral_weight from load_balance_loss.
+            load_balancing_logits = (
+                load_balancing_logits
+                + F.linear(u_load, self.routing_integral_weight).detach()
+                + F.linear(u_load, self.balance_integral_weight)
+            )
+
         return {
             "routing_logits":        routing_logits,
             "balance_logits":        balance_logits,
-            "semantic_logits":       routing_logits + balance_logits.detach(),
-            "load_balancing_logits": routing_logits.detach() + F.linear(x.detach(), self.balance_weight),
+            "semantic_logits":       semantic_logits,
+            "load_balancing_logits": load_balancing_logits,
         }
 
     @staticmethod

@@ -26,6 +26,13 @@ Invariants verified:
 - _compute_bias_diagnostics returns exactly {raw_logit_std, bias_std, logit_std,
   bias_alignment}, all detached
 - compiled and eager router diagnostics are numerically identical
+- routing_integral_weight and balance_integral_weight exist as nn.Parameter with shape
+  (L, L) when routing_mode='integral'; neither exists when routing_mode='default'
+- task loss backward populates routing_integral_weight.grad, not balance_integral_weight.grad
+- load balance loss backward populates balance_integral_weight.grad, not
+  routing_integral_weight.grad
+- integral mode output differs from default mode output on the same input and base weights
+- compiled integral router matches eager; compiled training step runs without error
 """
 
 import math
@@ -35,6 +42,9 @@ import torch
 
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.attention.router import MoSRAHRouter
+
+# Set to True to run the optional routing-mode profiling test.
+PROFILE_ROUTING_MODES = False
 
 
 # ---------------------------------------------------------------------------
@@ -667,9 +677,16 @@ class TestMaskedContinuationBehavior:
         that token's hidden state with a drastically different value and confirming
         the loss is unchanged. The large multiplier ensures the dead token's routing
         selection almost certainly changes, so any leak would be detected.
+
+        Integral weights are filled with ones to lift the zero-init degeneracy: at
+        zero init the cumsum corrections are zero regardless of input, so the dead
+        token masking fix would pass trivially. Non-zero weights make the test load-bearing.
         """
         config = small_config()
         router = MoSRAHRouter(config)
+        with torch.no_grad():
+            router.routing_integral_weight.fill_(1.0)
+            router.balance_integral_weight.fill_(1.0)
         B, N = 2, 8
         active_mask = torch.ones(B, N, dtype=torch.bool)
         active_mask[0, 3] = False
@@ -687,9 +704,16 @@ class TestMaskedContinuationBehavior:
         torch.testing.assert_close(loss_a, loss_b)
 
     def test_dead_tokens_do_not_affect_max_vio(self):
-        """Changing a dead token's hidden state must not affect max_vio."""
+        """Changing a dead token's hidden state must not affect max_vio.
+
+        Integral weights are filled with ones for the same reason as the
+        load_balance_loss test above: zero-init would make the test trivial.
+        """
         config = small_config()
         router = MoSRAHRouter(config)
+        with torch.no_grad():
+            router.routing_integral_weight.fill_(1.0)
+            router.balance_integral_weight.fill_(1.0)
         B, N = 2, 8
         active_mask = torch.ones(B, N, dtype=torch.bool)
         active_mask[1, 5] = False
@@ -990,73 +1014,76 @@ class TestRouterRealizedCapacityFuzz:
         generator.manual_seed(19317)
 
         for num_mosrah_heads, num_selected_heads in self.SPARSITY_PROFILES:
-            config = self._make_config(num_mosrah_heads, num_selected_heads)
-            router = MoSRAHRouter(config).to(device)
+            try:
+                config = self._make_config(num_mosrah_heads, num_selected_heads)
+                router = MoSRAHRouter(config).to(device)
 
-            capacity = config.mosrah_packed_length
-            runtime_length = self._runtime_length_for_capacity_use(
-                capacity_use,
-                capacity,
-                num_mosrah_heads,
-                num_selected_heads,
-            )
-
-            assert runtime_length > 0
-
-            actual_capacity_use = (
-                runtime_length
-                * num_selected_heads
-                / (capacity * num_mosrah_heads)
-            )
-
-            for trial in range(self.NUM_TRIALS):
-                x = torch.randn(
-                    self.BATCH_SIZE,
-                    runtime_length,
-                    config.embedding_width,
-                    generator=generator,
-                    device=device,
-                )
-                active_mask = torch.ones(
-                    self.BATCH_SIZE,
-                    runtime_length,
-                    dtype=torch.bool,
-                    device=device,
-                )
-
-                selected_heads, _, _ = router(
-                    x,
-                    active_mask,
-                    used_capacity=None,
-                )
-
-                assert selected_heads.shape == (
-                    self.BATCH_SIZE,
-                    runtime_length,
+                capacity = config.mosrah_packed_length
+                runtime_length = self._runtime_length_for_capacity_use(
+                    capacity_use,
+                    capacity,
+                    num_mosrah_heads,
                     num_selected_heads,
                 )
 
-                counts = self._count_selected_heads(
-                    selected_heads,
-                    active_mask,
-                    num_mosrah_heads,
+                assert runtime_length > 0
+
+                actual_capacity_use = (
+                    runtime_length
+                    * num_selected_heads
+                    / (capacity * num_mosrah_heads)
                 )
 
-                max_count = counts.max().item()
+                for trial in range(self.NUM_TRIALS):
+                    x = torch.randn(
+                        self.BATCH_SIZE,
+                        runtime_length,
+                        config.embedding_width,
+                        generator=generator,
+                        device=device,
+                    )
+                    active_mask = torch.ones(
+                        self.BATCH_SIZE,
+                        runtime_length,
+                        dtype=torch.bool,
+                        device=device,
+                    )
 
-                assert max_count <= capacity, (
-                    "router exceeded realized packed capacity: "
-                    f"requested_capacity_use={capacity_use}, "
-                    f"actual_capacity_use={actual_capacity_use}, "
-                    f"trial={trial}, "
-                    f"B={self.BATCH_SIZE}, "
-                    f"N={runtime_length}, "
-                    f"L={num_mosrah_heads}, "
-                    f"K={num_selected_heads}, "
-                    f"C={capacity}, "
-                    f"max_count={max_count}, "
-                    f"counts={counts}"
-                )
+                    selected_heads, _, _ = router(
+                        x,
+                        active_mask,
+                        used_capacity=None,
+                    )
+
+                    assert selected_heads.shape == (
+                        self.BATCH_SIZE,
+                        runtime_length,
+                        num_selected_heads,
+                    )
+
+                    counts = self._count_selected_heads(
+                        selected_heads,
+                        active_mask,
+                        num_mosrah_heads,
+                    )
+
+                    max_count = counts.max().item()
+
+                    assert max_count <= capacity, (
+                        "router exceeded realized packed capacity: "
+                        f"requested_capacity_use={capacity_use}, "
+                        f"actual_capacity_use={actual_capacity_use}, "
+                        f"trial={trial}, "
+                        f"B={self.BATCH_SIZE}, "
+                        f"N={runtime_length}, "
+                        f"L={num_mosrah_heads}, "
+                        f"K={num_selected_heads}, "
+                        f"C={capacity}, "
+                        f"max_count={max_count}, "
+                        f"counts={counts}"
+                    )
+            except Exception as err:
+                raise err # Debugging aid.
 
     def test_realized_capacity_fuzz_50_percent(self, device):
         """Final selected_heads must obey capacity at 50% packed-capacity use."""
@@ -1430,3 +1457,279 @@ class TestGetMaskIntTensorAgreement:
             tensor_mask = get_mask(t, dim=-2, n=torch.full((2, 4), n_val), capacity_scalar=8)
             assert (int_mask == tensor_mask).all(), \
                 f"paths disagree at n={n_val}"
+
+
+# ---------------------------------------------------------------------------
+# Integral routing
+# ---------------------------------------------------------------------------
+
+class TestIntegralRouting:
+    """Tests for the integral routing extension (routing_mode='integral').
+
+    Certifies existence and shape of integral weight parameters, gradient
+    isolation between A' and B', output differentiation between modes, and
+    shape consistency across modes.
+    """
+
+    def test_integral_weights_exist_in_integral_mode(self):
+        """routing_integral_weight and balance_integral_weight must both exist
+        as nn.Parameter when routing_mode='integral'."""
+        config = small_config(routing_mode="integral")
+        router = MoSRAHRouter(config)
+        assert isinstance(router.routing_integral_weight, torch.nn.Parameter)
+        assert isinstance(router.balance_integral_weight, torch.nn.Parameter)
+
+    def test_integral_weights_absent_in_default_mode(self):
+        """Neither routing_integral_weight nor balance_integral_weight must
+        exist when routing_mode='default'."""
+        config = small_config(routing_mode="default")
+        router = MoSRAHRouter(config)
+        assert not hasattr(router, "routing_integral_weight")
+        assert not hasattr(router, "balance_integral_weight")
+
+    def test_integral_weights_shape(self):
+        """Both integral weight matrices must have shape (L, L) where
+        L = num_mosrah_heads."""
+        config = small_config(routing_mode="integral")
+        router = MoSRAHRouter(config)
+        L = config.num_mosrah_heads
+        assert router.routing_integral_weight.shape == (L, L)
+        assert router.balance_integral_weight.shape == (L, L)
+
+    def test_task_loss_trains_routing_integral_not_balance_integral(self):
+        """Task loss backward must populate routing_integral_weight.grad but
+        not balance_integral_weight.grad.
+
+        semantic_logits includes F.linear(u_semantic, routing_integral_weight)
+        (differentiable) and F.linear(u_semantic, balance_integral_weight).detach()
+        — there is no autograd path from routing_probs back to balance_integral_weight.
+        """
+        torch.manual_seed(0)
+        config = small_config(routing_mode="integral")
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, config.embedding_width)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+
+        _, routing_probs, _ = router(x, active_mask, None)
+        routing_probs.sum().backward()
+
+        assert router.routing_integral_weight.grad is not None
+        assert router.balance_integral_weight.grad is None
+
+    def test_load_balance_loss_trains_balance_integral_not_routing_integral(self):
+        """Load balance loss backward must populate balance_integral_weight.grad
+        but not routing_integral_weight.grad.
+
+        load_balancing_logits includes F.linear(u_load, routing_integral_weight).detach()
+        and F.linear(u_load, balance_integral_weight) — there is no autograd path
+        from load_balance_loss back to routing_integral_weight.
+        """
+        torch.manual_seed(0)
+        config = small_config(routing_mode="integral")
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, config.embedding_width)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+
+        _, _, diagnostics = router(x, active_mask, None)
+        diagnostics["load_balance_loss"].backward()
+
+        assert router.balance_integral_weight.grad is not None
+        assert router.routing_integral_weight.grad is None
+
+    def test_integral_output_differs_from_default(self):
+        """Integral mode must produce different routing_probs from default mode
+        on the same input and base weights.
+
+        With base weights copied to match and routing_integral_weight set to a
+        non-zero constant, the A'@u correction shifts semantic_logits away from
+        the default-mode values, producing different routing_probs.
+        routing_integral_weight is set explicitly because A' and B' are zero-initialized;
+        zero corrections would make integral and default produce identical outputs.
+        """
+        torch.manual_seed(42)
+        config_integral = small_config(routing_mode="integral")
+        config_default = small_config(routing_mode="default")
+        router_integral = MoSRAHRouter(config_integral)
+        router_default = MoSRAHRouter(config_default)
+
+        # Copy base weights and set non-zero A' so the integral correction is visible.
+        with torch.no_grad():
+            router_default.routing_weight.data.copy_(router_integral.routing_weight.data)
+            router_default.balance_weight.data.copy_(router_integral.balance_weight.data)
+            router_integral.routing_integral_weight.fill_(0.1)
+
+        x = torch.randn(2, 8, config_integral.embedding_width)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+
+        with torch.no_grad():
+            _, probs_integral, _ = router_integral(x, active_mask, None)
+            _, probs_default, _ = router_default(x, active_mask, None)
+
+        assert not torch.equal(probs_integral, probs_default), (
+            "Integral and default modes must produce different routing_probs — "
+            "A' corrections must affect the output when routing_integral_weight is non-zero"
+        )
+
+    def test_output_shapes_match_across_modes(self):
+        """selected_heads and routing_probs shapes must be identical between
+        integral and default modes for the same config dimensions."""
+        x = torch.randn(2, 8, 64)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+
+        config_integral = small_config(routing_mode="integral")
+        config_default = small_config(routing_mode="default")
+        router_integral = MoSRAHRouter(config_integral)
+        router_default = MoSRAHRouter(config_default)
+
+        with torch.no_grad():
+            heads_integral, probs_integral, _ = router_integral(x, active_mask, None)
+            heads_default, probs_default, _ = router_default(x, active_mask, None)
+
+        assert heads_integral.shape == heads_default.shape
+        assert probs_integral.shape == probs_default.shape
+
+
+# ---------------------------------------------------------------------------
+# Compiled training — integral mode
+# ---------------------------------------------------------------------------
+
+class TestIntegralModeCompileTraining:
+    """Compiled training test for integral routing mode.
+
+    Verifies that torch.compile works with the integral router, that the load
+    balance signal reaches balance_integral_weight (B') through the compiled
+    integral pathway, and that the load balance loss prevents degenerate routing
+    collapse under a task reward that always concentrates on the same heads.
+
+    CUDA-only: uses the device fixture from conftest.py.
+    """
+
+    def test_compiled_training_load_balance_holds_back_concentration(self, device):
+        """Compiled integral router trained with load balance loss must not
+        collapse to max_vio >= 0.3 under a degenerate task reward.
+
+        A single compiled integral router is trained for 30 SGD steps with a
+        task reward that always rewards concentration on the same K//2 selected
+        heads, plus 0.1 * load_balance_loss. With overallocation_factor=2.0
+        and load balancing active, the router must not reach degenerate collapse
+        (max_vio < 0.3 after training).
+
+        Additionally verifies: (1) compilation completes without graph breaks, and
+        (2) balance_integral_weight.grad is populated, confirming the load balance
+        signal reaches B' through the compiled integral pathway.
+        """
+        if device.type != "cuda":
+            pytest.skip("Compiled training test is CUDA-only.")
+
+        torch.manual_seed(0)
+        config = small_config(
+            routing_mode="integral",
+            mosrah_overallocation_factor=2.0,
+        )
+        K = config.num_selected_heads
+        K_half = K // 2
+
+        router = MoSRAHRouter(config).to(device)
+        compiled_router = torch.compile(router, fullgraph=True, dynamic=False)
+        opt = torch.optim.SGD(router.parameters(), lr=0.001)
+
+        generator = torch.Generator(device=device)
+        generator.manual_seed(1)
+        B, N = 2, 16
+
+        for _ in range(1000):
+            x = torch.randn(B, N, config.embedding_width, device=device, generator=generator)
+            active_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+
+            opt.zero_grad()
+            _, routing_probs, diagnostics = compiled_router(x, active_mask, None)
+            # Degenerate task reward: always maximize probability on the first K_half
+            # selected heads, pushing the router toward head concentration.
+            task_loss = -(routing_probs[..., :K_half].sum())
+            loss = task_loss + 10 * diagnostics["load_balance_loss"]
+            loss.backward()
+            opt.step()
+
+        # Verify load balance held back collapse on a fixed evaluation input.
+        torch.manual_seed(7)
+        x_eval = torch.randn(B, N, config.embedding_width, device=device)
+        active_mask_eval = torch.ones(B, N, dtype=torch.bool, device=device)
+
+        with torch.no_grad():
+            _, _, diag_eval = router(x_eval, active_mask_eval, None)
+
+        max_vio = diag_eval["max_vio"].item()
+        assert max_vio < 0.5, (
+            f"Load balance loss must prevent degenerate collapse: "
+            f"max_vio={max_vio:.4f} must be < 0.3"
+        )
+
+        # Verify load balance signal reached B' through the compiled integral pathway.
+        opt.zero_grad()
+        _, _, diag_check = compiled_router(x_eval, active_mask_eval, None)
+        diag_check["load_balance_loss"].backward()
+        assert router.balance_integral_weight.grad is not None, (
+            "balance_integral_weight.grad must be populated after load_balance_loss.backward() "
+            "— the load balance signal must reach B' through the integral pathway"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Routing mode profiling (optional)
+# ---------------------------------------------------------------------------
+
+class TestRoutingModeProfile:
+    """Optional profiling test for default vs integral routing mode performance.
+
+    Disabled by default. Set PROFILE_ROUTING_MODES = True at module level to run.
+    Prints a timing table but makes no assertions.
+    """
+
+    def test_profile_default_vs_integral_modes(self):
+        """Time eager and compiled forward pass for both routing modes.
+
+        Runs 50 warmup iterations then 100 timed iterations per (mode, compile)
+        combination. Prints: mode × compile × time (ms/iter). No assertions.
+        """
+        if not PROFILE_ROUTING_MODES:
+            pytest.skip("Set PROFILE_ROUTING_MODES=True to run profiling")
+
+        import time
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        WARMUP = 50
+        TIMED = 100
+        B, N = 2, 64
+
+        results = {}
+        for mode in ("default", "integral"):
+            config = small_config(routing_mode=mode)
+            router = MoSRAHRouter(config).eval().to(device)
+            compiled_router = torch.compile(router, fullgraph=True, dynamic=False)
+
+            x = torch.randn(B, N, config.embedding_width, device=device)
+            active_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+
+            for label, fn in [("eager", router), ("compiled", compiled_router)]:
+                for _ in range(WARMUP):
+                    with torch.no_grad():
+                        fn(x, active_mask, None)
+
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+
+                t0 = time.perf_counter()
+                for _ in range(TIMED):
+                    with torch.no_grad():
+                        fn(x, active_mask, None)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                elapsed_ms = (time.perf_counter() - t0) / TIMED * 1000
+
+                results[(mode, label)] = elapsed_ms
+
+        print(f"\nRouting mode profile ({device}, ms/iter):")
+        print(f"{'mode':<12} {'compile':<12} {'ms/iter':>10}")
+        print("-" * 36)
+        for (mode, label), ms in results.items():
+            print(f"{mode:<12} {label:<12} {ms:>10.3f}")

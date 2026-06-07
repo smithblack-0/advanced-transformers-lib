@@ -95,6 +95,13 @@ class ShramConfig(PretrainedConfig):
             is the default; its log-probability signal scales with violation severity
             and makes correction magnitude proportional to routing imbalance.
             Default ``"ce"``.
+        routing_mode: Routing computation mode. ``"integral"`` (default) enables the
+            integral routing extension: the exclusive cumsum of routing logits along
+            the sequence dimension is mapped through two additional (L, L) parameter
+            matrices (``routing_integral_weight`` A' and ``balance_integral_weight``
+            B') and added as corrections to both logit pathways. This gives each
+            token a read on the cumulative routing history so far in the sequence.
+            ``"default"`` disables the extension; A' and B' are not created.
     """
 
     model_type = "shram"
@@ -130,6 +137,7 @@ class ShramConfig(PretrainedConfig):
         mosrah_overallocation_factor: float = 2.0,
         max_bid_rounds: int = 10,
         load_balance_loss_type: str = "ce",
+        routing_mode: str = "integral",
         **kwargs
     ):
         if head_dim % 2 != 0:
@@ -177,6 +185,14 @@ class ShramConfig(PretrainedConfig):
                 f"load_balance_loss_type must be one of {supported}, "
                 f"got {load_balance_loss_type!r}."
             )
+
+        _supported_routing_modes = {"default", "integral"}
+        if routing_mode not in _supported_routing_modes:
+            supported = ", ".join(f'"{m}"' for m in sorted(_supported_routing_modes))
+            raise ValueError(
+                f"routing_mode must be one of {supported}, got {routing_mode!r}."
+            )
+
         self.vocab_size = vocab_size
         self.embedding_width = embedding_width
         self.mlp_width = mlp_width
@@ -197,6 +213,7 @@ class ShramConfig(PretrainedConfig):
         self.mosrah_overallocation_factor = mosrah_overallocation_factor
         self.max_bid_rounds = max_bid_rounds
         self.load_balance_loss_type = load_balance_loss_type
+        self.routing_mode = routing_mode
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
 

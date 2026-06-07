@@ -590,7 +590,7 @@ class TestGradientBehavior:
 
         local_param = first_parameter(layer.local_attention)
         sparse_output_param = layer.sparse_attention.bea.q_proj
-        sparse_balance_param = layer.sparse_attention.router.expert_bias
+        sparse_balance_param = layer.sparse_attention.router.balance_weight
 
         hybrid_output, router_diagnostics = layer(
             hidden_states=hidden_states,
@@ -617,14 +617,14 @@ class TestGradientBehavior:
         assert balance_grad is None or torch.all(balance_grad == 0)
 
     def test_load_balance_loss_backward_reaches_the_sparse_balancing_path_and_causes_movement(self, device):
-        """The returned load-balance loss should survive the hybrid layer and update expert_bias."""
+        """The returned load-balance loss should survive the hybrid layer and update balance_weight."""
         hidden_states, position_ids, active_mask = make_inputs(device, requires_grad=True, start_position=0)
         layer = make_layer(make_config(), device, seed=0)
 
         local_param = first_parameter(layer.local_attention)
         sparse_output_param = layer.sparse_attention.bea.q_proj
-        expert_bias = layer.sparse_attention.router.expert_bias
-        expert_bias_before = expert_bias.detach().clone()
+        balance_weight = layer.sparse_attention.router.balance_weight
+        balance_weight_before = balance_weight.detach().clone()
 
         optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
 
@@ -641,9 +641,9 @@ class TestGradientBehavior:
         load_balance_loss.backward()
         optimizer.step()
 
-        assert expert_bias.grad is not None
-        assert torch.isfinite(expert_bias.grad).all()
-        assert not torch.allclose(expert_bias, expert_bias_before)
+        assert balance_weight.grad is not None
+        assert torch.isfinite(balance_weight.grad).all()
+        assert not torch.allclose(balance_weight, balance_weight_before)
 
         # The hybrid layer should not redirect the sparse balancing signal into
         # the local path or the sparse output-path parameters.

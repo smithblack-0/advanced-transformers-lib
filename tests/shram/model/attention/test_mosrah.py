@@ -233,8 +233,8 @@ class TestRealExecution:
 # ---------------------------------------------------------------------------
 
 class TestGradientFlow:
-    def test_sparse_output_backward_reaches_the_real_output_path_but_not_expert_bias(self, device):
-        """Sparse-output gradients should flow through the assembled path without using biased scores."""
+    def test_sparse_output_backward_reaches_the_real_output_path_but_not_balance_weight(self, device):
+        """Sparse-output gradients must reach routing_weight but must not reach balance_weight."""
         torch.manual_seed(0)
         config = make_config("main_sequence")
         layer = MoSRAHLayer(config).to(device)
@@ -254,22 +254,22 @@ class TestGradientFlow:
         assert hidden_states.grad is not None
         assert torch.isfinite(hidden_states.grad).all()
 
-        router_weight_grad = layer.router.routing_projection.weight.grad
-        assert router_weight_grad is not None
-        assert torch.isfinite(router_weight_grad).all()
+        routing_weight_grad = layer.router.routing_weight.grad
+        assert routing_weight_grad is not None
+        assert torch.isfinite(routing_weight_grad).all()
 
         bea_q_grad = layer.bea.q_proj.grad
         assert bea_q_grad is not None
         assert torch.isfinite(bea_q_grad).all()
 
-        # The sparse output should not backpropagate through the biased selection
-        # path into expert_bias. That path is intentionally excluded from the
-        # output reduction contract.
-        expert_bias_grad = layer.router.expert_bias.grad
-        assert expert_bias_grad is None or torch.all(expert_bias_grad == 0)
+        # The sparse output must not backpropagate through the load-balance pathway
+        # into balance_weight. That path is intentionally excluded from the output
+        # reduction contract.
+        balance_weight_grad = layer.router.balance_weight.grad
+        assert balance_weight_grad is None or torch.all(balance_weight_grad == 0)
 
-    def test_load_balance_loss_backward_reaches_expert_bias_but_not_routing_projection(self, device):
-        """The assembled layer should expose the router's load-balance signal to training."""
+    def test_load_balance_loss_backward_reaches_balance_weight_but_not_routing_weight(self, device):
+        """load_balance_loss must reach balance_weight and must not reach routing_weight."""
         torch.manual_seed(0)
         config = make_config("main_sequence")
         layer = MoSRAHLayer(config).to(device)
@@ -286,9 +286,9 @@ class TestGradientFlow:
 
         load_balance_loss.backward()
 
-        expert_bias_grad = layer.router.expert_bias.grad
-        assert expert_bias_grad is not None
-        assert torch.isfinite(expert_bias_grad).all()
+        balance_weight_grad = layer.router.balance_weight.grad
+        assert balance_weight_grad is not None
+        assert torch.isfinite(balance_weight_grad).all()
 
-        router_weight_grad = layer.router.routing_projection.weight.grad
-        assert router_weight_grad is None or torch.all(router_weight_grad == 0)
+        routing_weight_grad = layer.router.routing_weight.grad
+        assert routing_weight_grad is None or torch.all(routing_weight_grad == 0)

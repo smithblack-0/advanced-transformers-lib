@@ -99,10 +99,10 @@ is being achieved, one verified unit at a time.
 - [X] Unit 24.A — Load balance loss: replace DeepSeek fixed-step mechanism with log-probability auxiliary loss
 - [X] Unit 24.B — Routing logit variance reduction: near-zero scalar gate
 - [X] Unit 24.C — Biased routing probabilities: incorporate expert_bias into P
-- [ ] Unit 25 — Load balancing rebuild
-- [ ] Unit 25.A — Load balancing loss fix
-- [ ] Unit 25.B — Balancing offset mechanism rebuild
-- [ ] Unit 25.C — Integral Routing
+- [X] Unit 25 — Load balancing rebuild
+- [X] Unit 25.A — Load balancing loss fix
+- [X] Unit 25.B — Balancing offset mechanism rebuild
+- [X] Unit 25.C — Integral Routing
 - [ ] Unit 26 — Final Audit
 
 ---
@@ -3170,8 +3170,8 @@ It may, however, not be compatible with torch compile. We shall see.
 - If `logits=A@x +B@x` then the cumsum `u` is produced by shifted_logits= concat[zeros[1], logits][:-1] then `u=cumsum(shifted_logits)`
 - The final logits are then produced by `logits = logits + A'@u + B'@u`
 - As before, the semantic and load balance pathways are detached in separate ways
-- `semantic_logits = semantic_logits + A'@u_semantic + B.detach() @u_semantic`
-- `load_balancing_logits = load_balancing_logits + A.detach() @ u_load + B @ u_load`
+- `semantic_logits = semantic_logits + A'@u_semantic + B'.detach() @u_semantic`
+- `load_balancing_logits = load_balancing_logits + A.detach() @ u_load + B' @ u_load`
 
 **Tests**
 
@@ -3181,8 +3181,8 @@ It may, however, not be compatible with torch compile. We shall see.
 
 **Preliminary strategy**
 
-- Really think through how to design the multimode support. A stupid simple implementation will be unsupportably messy. 
-- It may be useful to make a "exclusive_cumsum" static method for the shifting behavior. 
+- Really think through how to design the multimode support. A stupid simple implementation will be unsupportably messy.
+- It may be useful to make a "exclusive_cumsum" static method for the shifting behavior.
 
 ### Unit 26 — Final Audit
 
