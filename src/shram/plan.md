@@ -3184,187 +3184,256 @@ It may, however, not be compatible with torch compile. We shall see.
 - Really think through how to design the multimode support. A stupid simple implementation will be unsupportably messy.
 - It may be useful to make a "exclusive_cumsum" static method for the shifting behavior.
 
-### 26: Load balancing final fix forcing.
 
-**Responsibility**:
 
-Install forcing feedback behavior that forces load balancing. Remove separation between gradient modes
-
-**Context of Correctness**
-
-Split loss mechanisms have failed to correctly constrain the model. However, the SHRAM model has an extremely strong bias towards reusing the same experts again and again. Specifically, since attention can only occur within tokens in the same expert bucket, it is strongly incentivized to put all tokens in the same bucket.
-
-This presents a conundrum. We must use strong load balancing losses to constrain the model. However, if we do so, we destroy the ability to actually train towards the thing we care about because it is mostly training to satisfy the loss, not the problem. 
-
-The solution is to invent a new form of loss. This is the temporal imbalance loss.
-
-**Mathematics**
-
-All token/expert assignments are considered independently for each sequence in the batch. Let:
-
-- `$z_{n,l}$` be the routing logit for expert `$l$` at token position `$n$`.
-- `$a_{n,l}\in\{0,1\}$` indicate whether expert `$l$` is selected by TopK at position `$n$`.
-- `$K$` be the number of experts selected per token.
-- `$L$` be the total number of experts.
-- `$C$` be the permitted cumulative excess above ideal allocation.
-
-The number of prior assignments to expert `$l$` is computed with an exclusive cumulative sum:
-
-`$$
-c_{n,l}=\sum_{t<n}a_{t,l}.
-$$`
-
-If padding or inactive tokens are present, `$n$` in the following equation is replaced by the number of active tokens preceding the current position.
-
-Under uniform routing, the expected number of prior assignments to each expert is:
-
-`$$
-\mu_n=\frac{nK}{L}.
-$$`
-
-An expert is temporally overcapacity when its cumulative assignments exceed the ideal trajectory plus the permitted excess:
-
-`$$
-v_{n,l}
-=
-\mathbf 1\left[c_{n,l}>\mu_n+C\right].
-$$`
-
-The assignment and violation masks are discrete and detached from autograd. They determine where corrective gradients are applied but do not themselves receive gradients.
-
-For each token position, let:
-
-`$$
-V_n=\{l\mid v_{n,l}=1\}
-$$`
-
-be the set of temporally overcapacity experts. When `$V_n$` is nonempty, the temporal imbalance loss is the centered contrast:
-
-`$$
-\ell_n
-=
-\frac{1}{|V_n|}
-\sum_{l\in V_n}z_{n,l}
--
-\frac{1}{L-|V_n|}
-\sum_{l\notin V_n}z_{n,l}.
-$$`
-
-When no expert is overcapacity, `$\ell_n=0$`. The complete loss is the mean of `$\ell_n$` over active token positions.
-
-Minimizing this loss pushes overcapacity experts downward while distributing an equal total upward gradient across the remaining experts:
-
-`$$
-\frac{\partial \ell_n}{\partial z_{n,l}}
-=
-\begin{cases}
-\frac{1}{|V_n|}, & l\in V_n,\\[4pt]
--\frac{1}{L-|V_n|}, & l\notin V_n.
-\end{cases}
-$$`
-
-The gradients therefore sum to zero across experts:
-
-`$$
-\sum_l\frac{\partial \ell_n}{\partial z_{n,l}}=0.
-$$`
-
-This prevents global logit drift and makes the loss invariant to adding a common offset to every expert logit. The scalar loss has the direct interpretation:
-
-> The average current-logit advantage of temporally overcapacity experts over the remaining experts.
-
-The permitted excess `$C$` allows short-lived semantic specialization. Sustained concentration activates the loss, while the loss automatically shuts off once the growing ideal allocation trajectory catches up with the expert’s cumulative usage.
-
-#### 26.A: Restoration of coupled routing processes.
-
-**Responsibility**
-
-Removal of arbitrary separation of routing processes
-
-**Context of Correctness**
-
-Every attempt to manage load balancing by separate gradients than the main learning process has ended in failure. It appears whatever is occurring inside the model is either outrunning the load balancing or failing to provide the needed information for load balancing. For this reason it must be removed. The integral routing system has, also, failed to be of any use
-
-**Invariants**
-
-- The routing system is reduced down to a linear projection into logits. 
-- There is no longer any separation between semantic and routing projections.
-- Health metrics are redesigned to respect this new reality. 
-- The integral mode and configuration flag for routing mode is removed. All routing always proceeds along default.
-
-**Tests**
-
-[todo]
-
-**Preliminary**
-
-[todo]
-
-### 26.B: Temporal Overcapacity Loss
-
-**Responsibility**
-
-Wire into place the temporal overcapacity loss and set it as the default loss type
-
-**Context of Correctness**
-
-Split loss mechanisms have failed to correctly constrain the model. However, the SHRAM model has an extremely strong bias towards reusing the same experts again and again. Specifically, since attention can only occur within tokens in the same expert bucket, it is strongly incentivized to put all tokens in the same bucket.
-
-This presents a conundrum. We must use strong load balancing losses to constrain the model. However, if we do so, we destroy the ability to actually train towards the thing we care about because it is mostly training to satisfy the loss, not the problem. 
-
-The solution is to invent a new form of loss. This is the temporal imbalance loss.
-
-**Invariants**
-
-- An
-
-### 26.B: Automatic Balance Compensation.
-
-**Responsibility**
-
-Install foundational limiting that will not physically let the model overallocate capacity by means of decreasing ability to assign to that expert in the near future
-
-**Context of Correctness**
-
-Fed up with load balancing concerns, parallel load balancing strategies were explored. One extremely interesting one was a Finite Window Average compensation strategy which ensured when a model attempted to overallocate a window, it decreased the ability to call that expert in the near future. This is computable by cumsum.
-
-This proved extremely robust to bias and balance capable. When combined with a weak, inherent balancing strategy it should be sufficient to provide excellent load balancing by inherently forcing the model to consider assignment tradeoffs and use all experts. Note emperical exploration has proven this is fairly stable. However, a weak load balancing loss will still be needed to avoid the model being able to find patterns that produce an imbalance nonetheless.
-
-**Invariants**
-
-- Given raw starting logits `logits`, the logits actually relevant for a step are given as `logits = logits - FWA(logits, load_balancing_window_size)`
-- - The formal version of this is, with `L` logits, `L'_n = L_n - 1/W*\sum_{t=n-W}^{n}L_{t}`. Where W is load_balancing_window_size, and L'_n the revised logits.
-- `load_balancing_window_size` is stored in config and set to 64 by default. 
-- `FWA` is calculated in it's fully parallel form using cumsum across the time (N) axis.
-- Absolutely NO serial computation besides using cumsums is allowed.
-
-**Tests**
-
-- A logit projection that is designed to choose only a certain entry again and again does not, in fact, cause max_vio to spike to 1.0. Instead, it stays under 0.6. Done by setting router logits manually.
-
-[To design]
-
-**Preliminary Implementation Strategy**
-
-- This can be implemented by using two "shifted_cumsum" operations. One not shifted, one shifted backwards by the window. 
-- The 'shifted_cumsum' operation pads by the shift in the shift direction, then slices and cumsums, returning the result.
-
-[To design]
-
-### Unit 26.C: Inference Hookup
-
-**Responsibility**
-
-Install the additional caching subsystems necessary to handle the fact routing is now
-a recurrent process so inference can proceed
-
-**Context of Correctnesss**
-
-With the addition of the PWA average, it is the case the routing process is, in fact, recurrent. An additional caching mechanism needs to be designed, and integration with the caching thought through 
-
-**Invariants**
-
-[Design needed]
+## 26: Load balancing fix .  
+  
+**Responsibility**:  
+  
+Fix the damn load balancing. 
+  
+**Context of Correctness**  
+  
+Split loss mechanisms have failed to correctly constrain the model. However, the SHRAM model has an extremely strong bias towards reusing the same experts again and again. Specifically, since attention can only occur within tokens in the same expert bucket, it is strongly incentivized to put all tokens in the same bucket.  
+  
+This presents a conundrum. We must use strong load balancing losses to constrain the model. However, if we do so, we destroy the ability to actually train towards the thing we care about because it is mostly training to satisfy the loss, not the problem.   
+  
+The solution is to invent a new form of loss. This is the temporal overcapacity loss.  
+  
+**Mathematics**  
+  
+All token/expert assignments are considered independently for each sequence in the batch. Let:  
+  
+- $z_{b, n,l}$ be the routing logit for expert `$l$` at token position $n$ in batch $b$  
+- $a_{b, n,l}\in\{0,1\}$ indicate whether expert $l$ is selected by TopK at position $n$ in batch $b$  
+- $d_{b, n} \in\{0,1\}$ indicates whether a token in a batch $b$ was active or not (active=1). 
+- $c_{b, n,l}=\sum_{t<n} d_{b, t} a_{b,t,l}.$ is the number of experts selected cumulatively and exclusively up to token $n$ for expert $l$ in batch $b$. This can be vectorized using a cumsum.
+- $S_{b, n} = \sum_{t<=n} d_{b, t}$, the count of unmasked (active) tokens up to a given position.  
+- $K$ be the number of experts selected per token.  
+- $L$ be the total number of experts.  
+- $C$ be the permitted excess above ideal allocation.  
+
+*Imbalance Mask*
+
+Under uniform routing, the expected number of prior assignments to each expert is $\frac{nK}{L}.$ Accommodating a total of $C$ extra expert selection allows us to claim that in a well-balanced system it should be the case that
+
+$$
+c_{b, n, l} <= \frac{nK}{L} + C
+$$
+
+Correspondingly, we can build the imbalance mask $u_{b, n, l}$ as 
+
+$$
+u_{b, n,l} = \mathbf{1}[c_{b, n, l} > \frac{S_{b, n}K}{L} + C]
+$$
+
+This selects anything that exceeds an imbalance criteria of being more than $C$ tokens ahead of the ideal load balance for possible correction. 
+
+*Violating and Safe Sets*
+
+An expert is 'violating' it's constraint if it exceeds it's allowed capacity and it is included in the top-k selection. We define the topk selection mask according to
+
+$$
+a_{b,n, l}  = topkmask(z_{b, n,l}, dim=l)
+$$
+
+The violating mask is given as 
+ 
+ $$
+ v_{b, n,l} = a_{b, n, l} *u_{b, n,l} 
+ $$
+
+while the compliant mask is given as
+
+$$
+\tilde{v}_{b, n,l} = !u_{b, n,l}
+$$
+
+Note $v_{b, n,l} \neq !\tilde{v}_{b, n,l}$ One additional mask of importance is the activity mask, which counts violations. This is simply given as
+
+$$
+w_{b, n} = \mathbf{1}[\sum_{l} v_{b, n, l} > 0]
+$$
+
+The activity mask is nonzero precisely when a violation occurs
+
+*Temporal Overcapacity Loss*
+
+The temporal overcapacity loss is defined in two steps. First is the direct statement of the loss moment itself, and second is the conditions in which it activates and the way it reduces. 
+
+The underlying mechanics of the loss request the mean of the violating logits to reduce and the mean of the nonviolating logits to increase. Note in practice numeric epsilons are needed in the denominators to prevent division by zero. This will not affect the final result, as such situations are zeroed out later anyhow.
+
+$$
+A_{b, n} = \frac{1}{\sum_l v_{b, n, l}}[\sum_l v_{b, n,l}z_{b, n,l}] - \frac{1}{\sum_l \tilde{v}_{b, n,l}}[\sum_{l} \tilde{v}_{b, n, l}z_{b, n, l}]
+$$
+
+This has very the very useful gradient mechanics that logit redistribution is symmetric. The same amount of logit mass that is moved from one is added to another, and only violating or compliant sets see movement. The loss itself is also easy to interpret. These gradient properties can be represented as:
+
+$$
+\frac{\partial A_{b,n}}{\partial z_{b,n,l}} = \frac{v_{b,n,l}}{V} - \frac{\tilde{v}_{b,n,l}}{\tilde{V}}
+$$
+$$
+\sum_l \frac{\partial A_{b,n}}{\partial z_{b,n,l}} = 0
+$$
+
+Left alone, however, this loss would move logit mass at all times. In reality, we simply wish to move logit mass when violations happen. For this reason we only activate the loss when a violation occurs. This is the secret behind it's effectiveness, as the loss can be strong, but will stay out of the way when no violations are occurring. The loss itself is then a reduction over active sequences, and a reduction over batches.
+
+$$
+B_{b} = \frac{1}{\sum_{n} d_{b, n}}[\sum_n d_{b,n} w_{b,n} A_{b, n}]
+$$
+$$
+L_{TO} = \frac{1}{B}[\sum_{b} B_{b}]
+$$
+  
+The maximum expert overclaim`$C$` allows short-lived semantic specialization. Sustained concentration activates the loss, while the loss automatically shuts off once the growing ideal allocation trajectory catches up with the expert’s cumulative usage.
+
+### Unit 26.A — Restore Coupled Routing  
+  
+**Responsibility**  
+  
+Restore the MoSRAH router to a single coupled routing pathway. Semantic training and load-balancing training must act on the same routing projection.  
+  
+**Context of Correctness**  
+  
+The previous routing design attempted to protect task training by sending semantic gradients and load-balancing gradients through different routing pathways. The later integral-routing extension added learned cumulative-history routing corrections. Neither have worked. It is now believed this is due to a foundational difference with respect to conventional load balancing.   
+  
+Unlike conventional MoE routing, SHRAM gives the task objective a direct incentive to concentrate tokens into a small number of expert buckets. Sparse attention occurs only among tokens routed to the same expert, so concentration improves short-context communication even though it damages the near-uniform bucket structure required for the architecture to scale correctly. Since this incentive is so strong, no indirect and separate gradient pathway will ever work to balance the model. No matter how hard, it is always worth it for the model to learn and evolve to trick it's routing balancer. 
+As a result, it is necessary to strongly constrain the model with a loss, and to train the model to be balanced at the same time as training. This means the existing technology splitting the gradient pathways is largely superfluous. additionally, this also means the integral formulation is useless as well, and telemetry needs significant revisions due to the pending lack of bias structures. 
+  
+**Invariants**  
+  
+* The router constructs one routing-logit tensor which is sent through a loss function, then capacity balanced, then returned. 
+* There is no existence of multiple detached gradient pathways. There is no concept of separate logits for different modes.
+* Load-balancing gradients are allowed to flow through the router input.  
+* Capacity balancing remains executed by the balancing unit, after the point the load balancing loss is applied. 
+* Expert selection is determined from the capacity-balanced coupled logits.  
+* The public telemetry is reduced down to simply  transitional router diagnostic contract is exactly `load_balance_loss`, `max_vio`, and `logit_std`.
+* 
+**Tests**  
+  
+  Note some level of judgment is needed. Tests which are already done should NOT be reimplemented blindly, and existing tests may be adapted to perform these roles. 
+  
+  - Ensure existing or new tests verify that operation with a load balancing loss over a number of batches using a synthetic training technique will eventually balance the router.   
+* Verify by existing test or test addition that load-balancing gradients can reach the router input tensor.  
+* Verify by existing test or test addition that routing probabilities are gathered at the selected expert indices and renormalized correctly.  
+* Verify by existing test or test addition that router, model-level, and public output diagnostics expose exactly the transitional diagnostic key set.  
+* Rewire significant telemetry testing throughout the test suite well outside the main test file to handle the new telemetry contract.
+* Verify by existing test or test addition that eager and compiled forward/backward execution remain valid.  
+  
+**Audit**  
+  
+* Confirm by inspection that the router has one hidden-state-to-expert routing projection participating in forward routing.  
+* Confirm by inspection that no independent learned balancing projection participates in forward routing.  
+* Confirm by inspection that no learned cumulative-history or integral-routing projection participates in forward routing.  
+* Confirm by inspection that no configuration field selects between standard and integral routing behavior.  
+* Confirm by inspection that obsolete detach logic from the split semantic/load-balancing pathways has been removed.  
+* Confirm by inspection that obsolete split-path diagnostics are not returned by the router, aggregated by the model, exposed in public output classes, or described as current behavior in documentation.  
+* Confirm by inspection that temporal overcapacity logic has not been added in this unit.  
+  
+**Preliminary Implementation Strategy**  
+  
+* Inspect the active branch before editing. Expected current artifacts include `routing_weight`, `balance_weight`, `routing_integral_weight`, `balance_integral_weight`, `routing_mode`, `exclusive_cumsum`, `_compute_routing_logits`, and the split-path diagnostic helper.  
+* - A haiku agent or brief explore over the codebase will be needed to find the telemetry checks that are being run in other units. It would be wise to treat 'what externel tests will break' as it's own pass.
+* Retain `routing_weight` as the single coupled routing projection unless branch inspection reveals a specific reason to rename it. 
+* Remove `balance_weight` and all `B @ x` / detached balancing-path arithmetic.  
+* Update downstream aggregation and public output structures so no removed diagnostic field is still surfaced by `ShramModel`, `ShramCausalLMOutput`, tests, or documentation.  
+* Remove or rewrite tests whose only purpose was to certify semantic/balancing gradient separation or integral routing.  
+  
+### Unit 26.B — Temporal Overcapacity Loss  
+  
+**Responsibility**  
+  
+Install temporal overcapacity loss in `load_balance_loss.py` and extend the load-balance loss factory to support loss-specific construction parameters.  
+  
+**Context of Correctness**  
+  
+Existing load-balancing losses evaluate routing primarily through aggregate expert use. That feedback is poorly matched to SHRAM, where concentrating tokens into the same expert buckets directly improves short-context communication and therefore creates a strong task-level incentive toward sustained imbalance.  
+  
+Temporal overcapacity loss was selected because it can identify the sequence regions where that sustained concentration exceeds an allowed trajectory and apply correction specifically there. Its centered form redirects routing preference without creating a global downward bias in the logits.  
+
+However, significant changes are needed in the load balancing testing suite in order to accomodate the new loss. A factory system that allows usage of constructors is needed. 
+  
+**Invariants**  
+  
+* - The **Mathematics** section at the beginning of unit 26  is the authoritative definition of temporal overcapacity loss.  
+* `make_load_balance_loss(loss_type, **loss_parameters)` returns a runtime callable with the established interface:  
+  `loss_fn(logits, assignment_mask, active_mask) -> scalar`  
+* Every registered load-balance loss is constructed through a loss-specific factory. Factories receiving unnecessary terms no-op
+
+* Math is mapped to variables by sane names. Using the term in the math section as the name is strictly forbidden. Commenting as though the user will have the math section in front of them when reading is strictly forbidden.
+* The implementation is broken up acceptably into helper functions and separate responsibilities. 
+* The	`temporal_overcapacity_loss_factory` can expect the parameters `num_selected_heads`, `num_total_heads`, and `maximum_expert_overclaim`. 
+* Existing load-balance loss types retain their established numerical behavior.  
+  
+**Tests**  
+  
+* Add tests by test addition that the temporal loss matches the Mathematics section for a series of hand-calculated example. Coverage should include:
+  * no violations;  
+  * one violating expert;  
+  * multiple violating experts;  
+  * inactive token positions.   
+* Verify eager and compiled forward and backward behavior.  
+  
+**Audit**  
+  
+* Confirm by inspection that `_LOSS_REGISTRY` dispatches through factories rather than directly through runtime loss functions.  
+* Confirm by inspection that temporal overcapacity loss does not construct routing assignments or reproduce router responsibilities.  
+* Confirm by inspection that no configuration, router, telemetry, or public-output code is modified by this unit.  
+* Confirm by inspection that the implementation remains tensorized over batch, sequence, and expert dimensions.  
+  
+**Preliminary Implementation Strategy**  
+  
+* * Modify `load_balance_loss.py` and its corresponding test module.  
+* Convert `_LOSS_REGISTRY` from runtime loss functions to loss factories.  
+* Extend `make_load_balance_loss` to accept shared construction-time keyword arguments and forward them to the selected factory.  
+* Add factory wrappers for `gshard`, `ce`, and `bce`. These should return the existing runtime functions and ignore construction parameters they do not use.  
+* Add `temporal_overcapacity_loss_factory`, capturing `num_selected_heads`, `num_total_heads`, and `maximum_` in the returned callable.  
+* Structure the temporal loss implementation around the responsibilities established in the Mathematics section. Develop a sane helper function breakdown. Do NOT code until all parties agree the breakdown is sane. 
+* Commenting needs to be aggressive. Fully understand the block commenting paradigm before coding.  
+  
+### Unit 26.C — Temporal Overcapacity Integration  
+  
+**Responsibility**  
+  
+Configure temporal overcapacity loss as the default load-balancing mechanism, connect the router to the extended loss factory, and install telemetry measuring how often hard capacity repair changes the router's requested assignments.  
+  
+**Context of Correctness**  
+  
+Unit 26.B makes temporal overcapacity loss available, but does not connect it to the model. The router must now provide the loss with the unconstrained routing behavior it is intended to correct: the coupled logits and their pre-capacity TopK assignments.  
+
+This loss is intended to be strong, but shut off when needed. It will have to be the model default for this model to ever have a chance of being load balancing. 
+  
+Hard capacity balancing remains a downstream recovery mechanism. It prevents an unusable allocation from stopping training, but may substantially rewrite the router's requested assignments. Because that intervention is otherwise invisible, the system also needs a general diagnostic measuring how much routing is being repaired rather than learned.  
+  
+**Invariants**  
+  
+* `ShramConfig` exposes `maximum_expert_overclaim` as a nonnegative integer and preserves it through serialization.  It explains it is how many tokens over ideal load balancing an expert can claim before it starts taking loss. 
+* `load_balance_loss_type` defaults to `"temporal_overcapacity"`.  
+* `MoSRAHRouter` constructs the selected load-balance loss by passing `num_selected_heads`, `num_mosrah_heads`, and `maximum_expert_overclaim` to `make_load_balance_loss`.  
+* The loss continues to be computed after the logit projection but before the hard load balancing. The hard load balancing allows recovery of training from extreme upsets and limits crashes, but should not be thought of as a full solution.
+* Existing loss propagation, loss weighting, routing probabilities, capacity enforcement, and final assignment behavior remain unchanged.  
+
+**Tests**  
+  Existing test suite is largely sufficient, as this is an integration suite. The only new tests needed are
+  - Verification in extremely tight packing situations intervention rate is nonzero on some rounds
+  - Verification that a short synthetic model will stabilize routing when used with the new loss. 
+  
+**Audit**  
+  
+* Confirm by inspection that the router does not duplicate temporal overcapacity mathematics already owned by `load_balance_loss.py`.  
+* Confirm by inspection that the hard capacity-repair path does not feed its internal masking back into the load-balance loss.  
+* Confirm by inspection that no temporal-overcapacity-specific telemetry is added.  
+* Confirm by inspection that no loss registry or factory implementation is rebuilt in this unit.  
+  
+**Preliminary Implementation Strategy**  
+  
+* In `MoSRAHRouter.__init__`, the loss function will need to have the additional terms added:
+  * `num_selected_heads=config.num_selected_heads`;  
+  * `maximum_expert_overclaim=config.maximum_expert_overclaim`;  
+     *`num_total_heads = config.num_mosrah_heads` 
+    into the factory call installed by Unit 26.B.  
+* Minor telemetry updates may be needed. 
+- Other changes will likely be needed.
 
 ### Unit 26 — Final Audit
 
