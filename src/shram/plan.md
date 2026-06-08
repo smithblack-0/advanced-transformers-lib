@@ -3184,7 +3184,191 @@ It may, however, not be compatible with torch compile. We shall see.
 - Really think through how to design the multimode support. A stupid simple implementation will be unsupportably messy.
 - It may be useful to make a "exclusive_cumsum" static method for the shifting behavior.
 
+### 26: Load balancing final fix forcing.
+
+**Responsibility**:
+
+Install forcing feedback behavior that forces load balancing. Remove separation between gradient modes
+
+**Context of Correctness**
+
+Split loss mechanisms have failed to correctly constrain the model. However, the SHRAM model has an extremely strong bias towards reusing the same experts again and again. Specifically, since attention can only occur within tokens in the same expert bucket, it is strongly incentivized to put all tokens in the same bucket.
+
+This presents a conundrum. We must use strong load balancing losses to constrain the model. However, if we do so, we destroy the ability to actually train towards the thing we care about because it is mostly training to satisfy the loss, not the problem. 
+
+The solution is to invent a new form of loss. This is the temporal imbalance loss.
+
+**Mathematics**
+
+All token/expert assignments are considered independently for each sequence in the batch. Let:
+
+- `$z_{n,l}$` be the routing logit for expert `$l$` at token position `$n$`.
+- `$a_{n,l}\in\{0,1\}$` indicate whether expert `$l$` is selected by TopK at position `$n$`.
+- `$K$` be the number of experts selected per token.
+- `$L$` be the total number of experts.
+- `$C$` be the permitted cumulative excess above ideal allocation.
+
+The number of prior assignments to expert `$l$` is computed with an exclusive cumulative sum:
+
+`$$
+c_{n,l}=\sum_{t<n}a_{t,l}.
+$$`
+
+If padding or inactive tokens are present, `$n$` in the following equation is replaced by the number of active tokens preceding the current position.
+
+Under uniform routing, the expected number of prior assignments to each expert is:
+
+`$$
+\mu_n=\frac{nK}{L}.
+$$`
+
+An expert is temporally overcapacity when its cumulative assignments exceed the ideal trajectory plus the permitted excess:
+
+`$$
+v_{n,l}
+=
+\mathbf 1\left[c_{n,l}>\mu_n+C\right].
+$$`
+
+The assignment and violation masks are discrete and detached from autograd. They determine where corrective gradients are applied but do not themselves receive gradients.
+
+For each token position, let:
+
+`$$
+V_n=\{l\mid v_{n,l}=1\}
+$$`
+
+be the set of temporally overcapacity experts. When `$V_n$` is nonempty, the temporal imbalance loss is the centered contrast:
+
+`$$
+\ell_n
+=
+\frac{1}{|V_n|}
+\sum_{l\in V_n}z_{n,l}
+-
+\frac{1}{L-|V_n|}
+\sum_{l\notin V_n}z_{n,l}.
+$$`
+
+When no expert is overcapacity, `$\ell_n=0$`. The complete loss is the mean of `$\ell_n$` over active token positions.
+
+Minimizing this loss pushes overcapacity experts downward while distributing an equal total upward gradient across the remaining experts:
+
+`$$
+\frac{\partial \ell_n}{\partial z_{n,l}}
+=
+\begin{cases}
+\frac{1}{|V_n|}, & l\in V_n,\\[4pt]
+-\frac{1}{L-|V_n|}, & l\notin V_n.
+\end{cases}
+$$`
+
+The gradients therefore sum to zero across experts:
+
+`$$
+\sum_l\frac{\partial \ell_n}{\partial z_{n,l}}=0.
+$$`
+
+This prevents global logit drift and makes the loss invariant to adding a common offset to every expert logit. The scalar loss has the direct interpretation:
+
+> The average current-logit advantage of temporally overcapacity experts over the remaining experts.
+
+The permitted excess `$C$` allows short-lived semantic specialization. Sustained concentration activates the loss, while the loss automatically shuts off once the growing ideal allocation trajectory catches up with the expert’s cumulative usage.
+
+#### 26.A: Restoration of coupled routing processes.
+
+**Responsibility**
+
+Removal of arbitrary separation of routing processes
+
+**Context of Correctness**
+
+Every attempt to manage load balancing by separate gradients than the main learning process has ended in failure. It appears whatever is occurring inside the model is either outrunning the load balancing or failing to provide the needed information for load balancing. For this reason it must be removed. The integral routing system has, also, failed to be of any use
+
+**Invariants**
+
+- The routing system is reduced down to a linear projection into logits. 
+- There is no longer any separation between semantic and routing projections.
+- Health metrics are redesigned to respect this new reality. 
+- The integral mode and configuration flag for routing mode is removed. All routing always proceeds along default.
+
+**Tests**
+
+[todo]
+
+**Preliminary**
+
+[todo]
+
+### 26.B: Temporal Overcapacity Loss
+
+**Responsibility**
+
+Wire into place the temporal overcapacity loss and set it as the default loss type
+
+**Context of Correctness**
+
+Split loss mechanisms have failed to correctly constrain the model. However, the SHRAM model has an extremely strong bias towards reusing the same experts again and again. Specifically, since attention can only occur within tokens in the same expert bucket, it is strongly incentivized to put all tokens in the same bucket.
+
+This presents a conundrum. We must use strong load balancing losses to constrain the model. However, if we do so, we destroy the ability to actually train towards the thing we care about because it is mostly training to satisfy the loss, not the problem. 
+
+The solution is to invent a new form of loss. This is the temporal imbalance loss.
+
+**Invariants**
+
+- An
+
+### 26.B: Automatic Balance Compensation.
+
+**Responsibility**
+
+Install foundational limiting that will not physically let the model overallocate capacity by means of decreasing ability to assign to that expert in the near future
+
+**Context of Correctness**
+
+Fed up with load balancing concerns, parallel load balancing strategies were explored. One extremely interesting one was a Finite Window Average compensation strategy which ensured when a model attempted to overallocate a window, it decreased the ability to call that expert in the near future. This is computable by cumsum.
+
+This proved extremely robust to bias and balance capable. When combined with a weak, inherent balancing strategy it should be sufficient to provide excellent load balancing by inherently forcing the model to consider assignment tradeoffs and use all experts. Note emperical exploration has proven this is fairly stable. However, a weak load balancing loss will still be needed to avoid the model being able to find patterns that produce an imbalance nonetheless.
+
+**Invariants**
+
+- Given raw starting logits `logits`, the logits actually relevant for a step are given as `logits = logits - FWA(logits, load_balancing_window_size)`
+- - The formal version of this is, with `L` logits, `L'_n = L_n - 1/W*\sum_{t=n-W}^{n}L_{t}`. Where W is load_balancing_window_size, and L'_n the revised logits.
+- `load_balancing_window_size` is stored in config and set to 64 by default. 
+- `FWA` is calculated in it's fully parallel form using cumsum across the time (N) axis.
+- Absolutely NO serial computation besides using cumsums is allowed.
+
+**Tests**
+
+- A logit projection that is designed to choose only a certain entry again and again does not, in fact, cause max_vio to spike to 1.0. Instead, it stays under 0.6. Done by setting router logits manually.
+
+[To design]
+
+**Preliminary Implementation Strategy**
+
+- This can be implemented by using two "shifted_cumsum" operations. One not shifted, one shifted backwards by the window. 
+- The 'shifted_cumsum' operation pads by the shift in the shift direction, then slices and cumsums, returning the result.
+
+[To design]
+
+### Unit 26.C: Inference Hookup
+
+**Responsibility**
+
+Install the additional caching subsystems necessary to handle the fact routing is now
+a recurrent process so inference can proceed
+
+**Context of Correctnesss**
+
+With the addition of the PWA average, it is the case the routing process is, in fact, recurrent. An additional caching mechanism needs to be designed, and integration with the caching thought through 
+
+**Invariants**
+
+[Design needed]
+
 ### Unit 26 — Final Audit
+
+This unit can only be completed once the paper is done and results are back. It involves resolving the paper to the codebase. 
 
 **What:** Review every audit note in plan.md and, if not overridden, ensure compliance. Crosscheck with papers/main.tex and verify whether or not paper is still complaint.
 
