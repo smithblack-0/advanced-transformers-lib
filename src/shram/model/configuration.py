@@ -91,17 +91,18 @@ class ShramConfig(PretrainedConfig):
             correctness guard — exhausting it raises ``RuntimeError``. Must be >= 1.
             Default 10.
         load_balance_loss_type: Formula used for the load-balance auxiliary loss.
-            One of ``"gshard"``, ``"ce"``, or ``"bce"``. ``"ce"`` (cross-entropy)
-            is the default; its log-probability signal scales with violation severity
-            and makes correction magnitude proportional to routing imbalance.
-            Default ``"ce"``.
-        routing_mode: Routing computation mode. ``"integral"`` (default) enables the
-            integral routing extension: the exclusive cumsum of routing logits along
-            the sequence dimension is mapped through two additional (L, L) parameter
-            matrices (``routing_integral_weight`` A' and ``balance_integral_weight``
-            B') and added as corrections to both logit pathways. This gives each
-            token a read on the cumulative routing history so far in the sequence.
-            ``"default"`` disables the extension; A' and B' are not created.
+            One of ``"gshard"``, ``"ce"``, ``"bce"``, or ``"temporal_overcapacity"``.
+            ``"temporal_overcapacity"`` is the default; it fires only when an expert
+            exceeds its allowed trajectory (controlled by ``maximum_expert_overclaim``)
+            and shuts off automatically once routing is balanced, allowing it to be
+            used with a strong weight without interfering with task training during
+            balanced routing. Default ``"temporal_overcapacity"``.
+        maximum_expert_overclaim: Maximum number of tokens an expert may receive above
+            its ideal allocation trajectory before the temporal overcapacity loss
+            fires. A value of 0 means violations trigger immediately at any imbalance.
+            Larger values permit short-lived semantic specialization before correction.
+            Only used when ``load_balance_loss_type="temporal_overcapacity"``.
+            Must be non-negative. Default 20.
     """
 
     model_type = "shram"
@@ -136,8 +137,8 @@ class ShramConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         mosrah_overallocation_factor: float = 2.0,
         max_bid_rounds: int = 10,
-        load_balance_loss_type: str = "ce",
-        routing_mode: str = "integral",
+        load_balance_loss_type: str = "temporal_overcapacity",
+        maximum_expert_overclaim: int = 20,
         **kwargs
     ):
         if head_dim % 2 != 0:
@@ -178,19 +179,18 @@ class ShramConfig(PretrainedConfig):
                 f"max_bid_rounds must be at least 1, got {max_bid_rounds}."
             )
 
-        _supported_loss_types = {"gshard", "ce", "bce"}
+        if maximum_expert_overclaim < 0:
+            raise ValueError(
+                f"maximum_expert_overclaim must be non-negative, "
+                f"got {maximum_expert_overclaim}."
+            )
+
+        _supported_loss_types = {"gshard", "ce", "bce", "temporal_overcapacity"}
         if load_balance_loss_type not in _supported_loss_types:
             supported = ", ".join(f'"{t}"' for t in sorted(_supported_loss_types))
             raise ValueError(
                 f"load_balance_loss_type must be one of {supported}, "
                 f"got {load_balance_loss_type!r}."
-            )
-
-        _supported_routing_modes = {"default", "integral"}
-        if routing_mode not in _supported_routing_modes:
-            supported = ", ".join(f'"{m}"' for m in sorted(_supported_routing_modes))
-            raise ValueError(
-                f"routing_mode must be one of {supported}, got {routing_mode!r}."
             )
 
         self.vocab_size = vocab_size
@@ -213,7 +213,7 @@ class ShramConfig(PretrainedConfig):
         self.mosrah_overallocation_factor = mosrah_overallocation_factor
         self.max_bid_rounds = max_bid_rounds
         self.load_balance_loss_type = load_balance_loss_type
-        self.routing_mode = routing_mode
+        self.maximum_expert_overclaim = maximum_expert_overclaim
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
 

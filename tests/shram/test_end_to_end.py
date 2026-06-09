@@ -498,19 +498,19 @@ class TestIntegrationRouterDiagnostics:
     """Router diagnostic scalars must be present, finite, and live.
 
     Invariants verified:
-    - All four fields are present, scalar, and finite after every forward pass.
+    - All three fields are present, scalar, and finite after every forward pass.
     - The scalars reflect actual model state and change as training proceeds.
     """
 
     def test_diagnostic_fields_present_and_finite(self, device):
-        """All four diagnostic scalars must be non-None, scalar, and finite after a forward pass."""
+        """All three diagnostic scalars must be non-None, scalar, and finite after a forward pass."""
         m = ShramForCausalLM(small_config()).eval().to(device)
         ids = torch.randint(0, 256, (1, 4), device=device)
 
         with torch.no_grad():
             out = m(ids, use_cache=False)
 
-        for field in ("bias_std", "raw_logit_std", "logit_std", "bias_alignment"):
+        for field in ("logit_std", "max_vio", "load_balance_loss"):
             val = getattr(out, field)
             assert val is not None, f"{field} is None"
             assert val.ndim == 0, f"{field} is not a scalar (shape={val.shape})"
@@ -519,10 +519,8 @@ class TestIntegrationRouterDiagnostics:
     def test_diagnostic_scalars_respond_to_training(self, device):
         """Diagnostic scalars must change after training steps, verifying they are live.
 
-        The default small_config uses K=L (all heads selected), so routing
-        frequencies are exactly 1/L and expert_bias receives no gradient.
         This test overrides to K=2, L=4 so routing is genuinely sparse:
-        imbalance arises, bias updates, and routing weights evolve.
+        imbalance arises, routing weights evolve, and monitoring scalars shift.
 
         Asserts at least one scalar changed — not which one — to remain
         robust against variation in which diagnostic shifts first.
@@ -532,7 +530,7 @@ class TestIntegrationRouterDiagnostics:
         m = ShramForCausalLM(config).train().to(device)
         ids = torch.randint(0, 256, (2, 16), device=device)
 
-        fields = ("bias_std", "raw_logit_std", "logit_std", "bias_alignment")
+        fields = ("logit_std", "max_vio", "load_balance_loss")
 
         with torch.no_grad():
             before = {f: getattr(m(ids, use_cache=False), f).item() for f in fields}

@@ -1,15 +1,15 @@
 """Tests for MoSRAHRouter.
 
 Invariants verified:
-- Output shapes: selected_heads (B, N, K), routing_probs (B, N, K), loss scalar,
-  max_vio scalar
+- routing_weight is the only routing projection; balance_weight does not exist
+- load-balance gradients reach routing_weight; task loss gradients also reach routing_weight
+- load-balance gradients reach the router input x
+- router_diagnostics exposes exactly {load_balance_loss, max_vio, logit_std}
+- load_balance_loss has gradient; max_vio and logit_std are detached
+- compiled and eager router diagnostics are numerically identical
+- Output shapes: selected_heads (B, N, K), routing_probs (B, N, K), loss scalar, max_vio scalar
 - routing_probs sum to 1 per token and are non-negative
 - selected_heads are valid indices in [0, L-1] and are distinct per token
-- routing_weight and balance_weight both exist as nn.Parameter with shape (L, embedding_width)
-- balance_weight receives gradient through load_balance_loss, not through task loss
-- task loss backward populates routing_weight.grad, not balance_weight.grad
-- load balance loss backward populates balance_weight.grad, not routing_weight.grad
-- assignment_probs are computed before balance_capacity, preventing -1e8 contamination
 - max_vio is exactly 0 for perfectly uniform routing frequencies
 - max_vio is exactly 1 when the most overloaded head receives double its fair share
 - max_vio produces the correct value for a known intermediate routing imbalance
@@ -17,22 +17,7 @@ Invariants verified:
 - dead outer tokens do not affect load_balance_loss
 - dead outer tokens do not affect max_vio
 - router forward max_vio matches _compute_max_vio called directly on all-live inputs
-- router_diagnostics separates routing decisions from routing feedback
-- load_balance_loss has gradient; all other diagnostic scalars are detached
-- bias_std is zero when balance_weight is zero
-- logit_std equals raw_logit_std when balance_weight is zero
-- bias_alignment is negative when balance_weight opposes routing_weight direction
-- bias_alignment is positive when balance_weight reinforces routing_weight direction
-- _compute_bias_diagnostics returns exactly {raw_logit_std, bias_std, logit_std,
-  bias_alignment}, all detached
-- compiled and eager router diagnostics are numerically identical
-- routing_integral_weight and balance_integral_weight exist as nn.Parameter with shape
-  (L, L) when routing_mode='integral'; neither exists when routing_mode='default'
-- task loss backward populates routing_integral_weight.grad, not balance_integral_weight.grad
-- load balance loss backward populates balance_integral_weight.grad, not
-  routing_integral_weight.grad
-- integral mode output differs from default mode output on the same input and base weights
-- compiled integral router matches eager; compiled training step runs without error
+- each loss mode (gshard, ce, bce, temporal_overcapacity) reduces routing concentration over training
 """
 
 import math
@@ -43,9 +28,6 @@ import torch
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.attention.router import MoSRAHRouter
 
-# Set to True to run the optional routing-mode profiling test.
-PROFILE_ROUTING_MODES = False
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -53,7 +35,8 @@ PROFILE_ROUTING_MODES = False
 
 def small_config(**kwargs) -> ShramConfig:
     """Small config valid for router tests. num_selected_heads < num_mosrah_heads
-    so TopK is genuinely sparse."""
+    so TopK is genuinely sparse. maximum_expert_overclaim=0 ensures the temporal
+    overcapacity loss fires on any imbalance, keeping gradient tests meaningful."""
     defaults = dict(
         embedding_width=64,
         num_mosrah_heads=8,
@@ -63,6 +46,7 @@ def small_config(**kwargs) -> ShramConfig:
         window_size=16,
         mlp_width=128,
         num_decoder_layers=2,
+        maximum_expert_overclaim=0,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
@@ -172,101 +156,19 @@ class TestSelectedHeads:
 
 
 # ---------------------------------------------------------------------------
-# Bias routing behavior
-# ---------------------------------------------------------------------------
-
-class TestBiasRoutingBehavior:
-    def test_large_balance_weight_forces_head_selection(self):
-        """A large balance_weight row for head 0 must cause head 0 to appear in every
-        token's selection — demonstrating that balance_weight drives selection via
-        semantic_logits.
-
-        With routing_weight zeroed and balance_weight[0] set large, every token's
-        semantic_logit for head 0 dominates regardless of input direction.
-        All-ones x ensures the dot product with balance_weight[0] is maximally positive.
-        """
-        config = small_config()
-        router = MoSRAHRouter(config)
-        # All-ones x ensures head 0's logit = sum(balance_weight[0]) = large * embedding_width.
-        x = torch.ones(1, 6, config.embedding_width)
-        active_mask = torch.ones(1, 6, dtype=torch.bool)
-
-        with torch.no_grad():
-            router.routing_weight.zero_()
-            router.balance_weight.zero_()
-            router.balance_weight[0, :] = 100.0
-            selected_heads, _, _ = router(x, active_mask, None)
-
-        # Head 0 must be selected for every token when its balance logit is enormous.
-        assert (selected_heads == 0).any(dim=-1).all()
-
-    def test_balance_weight_incorporated_in_routing_probs(self):
-        """With non-zero balance_weight, routing_probs must differ from the zero-balance case.
-
-        Under the two-pathway architecture, routing_probs are gathered from
-        softmax(semantic_logits) = softmax(A·x + (B·x).detach()). A large balance_weight
-        row for one head shifts the softmax distribution, producing different routing_probs
-        than the zero-balance-weight baseline.
-        """
-        config = small_config()
-        router = MoSRAHRouter(config)
-        torch.manual_seed(42)
-        x = torch.ones(1, 4, config.embedding_width)
-        active_mask = torch.ones(1, 4, dtype=torch.bool)
-
-        with torch.no_grad():
-            router.balance_weight.zero_()
-            _, routing_probs_zero_balance, _ = router(x, active_mask, None)
-
-            router.balance_weight.zero_()
-            router.balance_weight[0, :] = 100.0
-            _, routing_probs_biased, _ = router(x, active_mask, None)
-
-        assert not torch.allclose(routing_probs_zero_balance, routing_probs_biased, atol=1e-4), (
-            "routing_probs must differ when balance_weight is non-zero — balance_weight "
-            "must be incorporated via the semantic gradient channel"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Gradients
 # ---------------------------------------------------------------------------
 
 class TestGradients:
-    def test_balance_weight_receives_gradient(self):
-        """balance_weight must accumulate a gradient after backward on load_balance_loss."""
-        config = small_config()
-        router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, 64)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, diagnostics = router(x, active_mask, None)
-        load_balance_loss = diagnostics["load_balance_loss"]
-        load_balance_loss.backward()
+    """Tests certifying gradient flow in the coupled single-projection architecture.
 
-        assert router.balance_weight.grad is not None
-        assert router.balance_weight.grad.shape == (config.num_mosrah_heads, config.embedding_width)
+    routing_weight is the only routing parameter. Both task loss and load_balance_loss
+    must train it directly — there is no gradient isolation between the two signals.
+    """
 
-    def test_balance_weight_gradient_is_not_all_zero(self):
-        """With an unbalanced router, balance_weight.grad must be non-zero — all-zero grad
-        would mean the load balancing operator has no effect on training."""
-        config = small_config()
-        router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, 64)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, diagnostics = router(x, active_mask, None)
-        load_balance_loss = diagnostics["load_balance_loss"]
-        load_balance_loss.backward()
-
-        # At initialization with random weights the routing will be imperfectly balanced,
-        # so at least one entry's gradient should be non-zero.
-        assert router.balance_weight.grad.abs().sum().item() > 0.0
-
-    def test_routing_weight_grad_is_none_after_load_balance_loss_backward(self):
-        """Backward on load_balance_loss must not populate routing_weight.grad.
-
-        Gradient isolation invariant: load_balancing_logits = (A·x).detach() + B·(x.detach()),
-        so there is no autograd path from load_balance_loss back to routing_weight.
-        """
+    def test_load_balance_loss_reaches_routing_weight(self):
+        """Backward on load_balance_loss must populate routing_weight.grad with a
+        non-zero, finite gradient — confirming the loss trains the routing projection."""
         torch.manual_seed(0)
         config = small_config()
         router = MoSRAHRouter(config)
@@ -276,27 +178,12 @@ class TestGradients:
         _, _, diagnostics = router(x, active_mask, None)
         diagnostics["load_balance_loss"].backward()
 
-        assert router.routing_weight.grad is None
+        assert router.routing_weight.grad is not None
+        assert router.routing_weight.grad.abs().sum().item() > 0.0
 
-
-# ---------------------------------------------------------------------------
-# Two-pathway gradient isolation (Unit 24.C)
-# ---------------------------------------------------------------------------
-
-class TestGradientIsolationTwoPathway:
-    """Tests certifying the two-pathway gradient architecture.
-
-    semantic_logits = A·x + (B·x).detach() drives selection and routing_probs.
-    load_balancing_logits = (A·x).detach() + B·(x.detach()) drives assignment_probs.
-    Each pathway isolates one parameter matrix from the other's loss.
-    """
-
-    def test_task_loss_does_not_reach_balance_weight(self):
-        """Backward on task loss must not populate balance_weight.grad.
-
-        semantic_logits = A·x + (B·x).detach() — there is no autograd path
-        from routing_probs or selected_heads back to balance_weight.
-        """
+    def test_task_loss_reaches_routing_weight(self):
+        """Backward on routing_probs.sum() must populate routing_weight.grad —
+        confirming task gradients reach the routing projection."""
         torch.manual_seed(0)
         config = small_config()
         router = MoSRAHRouter(config)
@@ -307,74 +194,22 @@ class TestGradientIsolationTwoPathway:
         routing_probs.sum().backward()
 
         assert router.routing_weight.grad is not None
-        assert router.balance_weight.grad is None
+        assert router.routing_weight.grad.abs().sum().item() > 0.0
 
-    def test_load_balance_loss_does_not_reach_routing_weight(self):
-        """Backward on load_balance_loss must not populate routing_weight.grad.
-
-        load_balancing_logits = (A·x).detach() + B·(x.detach()) — there is no autograd
-        path from load_balance_loss back to routing_weight.
-        """
+    def test_load_balance_loss_reaches_input(self):
+        """Backward on load_balance_loss must populate x.grad — confirming gradient
+        flows through the router input, not just to routing_weight."""
         torch.manual_seed(0)
         config = small_config()
         router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, config.embedding_width)
+        x = torch.randn(2, 8, config.embedding_width, requires_grad=True)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
 
         _, _, diagnostics = router(x, active_mask, None)
         diagnostics["load_balance_loss"].backward()
 
-        assert router.balance_weight.grad is not None
-        assert router.routing_weight.grad is None
-
-    def test_assignment_probs_not_contaminated_by_capacity_masking(self):
-        """Load balance gradients must be finite when a preferred expert is over capacity.
-
-        Post-capacity bug: softmax over -1e8-masked logits gives p_0 = exp(-1e8) / sum,
-        which underflows to 0.0 in float32. CE loss computes log(0) = -inf, producing
-        inf/NaN gradients through balance_weight.
-
-        Pre-capacity fix (correct): softmax(load_balancing_logits) is computed before
-        balance_capacity. With balance_weight[0] large and x = ones, p_0 ≈ 1.0 and
-        log(p_0) ≈ 0 — gradient is bounded.
-        """
-        torch.manual_seed(0)
-        # Sparse routing so one expert can be genuinely over capacity in inference mode.
-        config = small_config(
-            num_mosrah_heads=4,
-            num_selected_heads=2,
-            training_sequence_length=8,
-            inference_sequence_length=8,
-            mosrah_overallocation_factor=2.0,
-        )
-        router = MoSRAHRouter(config)
-
-        capacity = config.mosrah_cache_length
-        B, N, L = 1, 2, 4
-        used_capacity = torch.zeros(B, L, dtype=torch.long)
-        used_capacity[0, 0] = capacity  # expert 0 fully at capacity
-
-        # Large balance_weight row for head 0. With x = ones, load_balancing_logit
-        # for head 0 ≈ 50, dominating all other heads.
-        with torch.no_grad():
-            router.routing_weight.zero_()
-            router.balance_weight.zero_()
-            router.balance_weight[0, :] = 50.0 / config.embedding_width
-
-        # All-ones x so that head 0's load_balancing_logit = sum(balance_weight[0]) ≈ 50.
-        x = torch.ones(B, N, config.embedding_width)
-        active_mask = torch.ones(B, N, dtype=torch.bool)
-
-        _, _, diagnostics = router(x, active_mask, used_capacity)
-        diagnostics["load_balance_loss"].backward()
-
-        # Post-capacity bug: p_0 = 0.0 (float32 underflow) → log(0) = -inf → inf grad.
-        # Pre-capacity fix: p_0 ≈ 1.0 → log(1) ≈ 0 → bounded grad.
-        assert torch.isfinite(router.balance_weight.grad).all(), (
-            "balance_weight.grad is non-finite — assignment_probs may have been computed "
-            "post-balance_capacity, producing log(0) from the -1e8 sentinel"
-        )
-        assert router.balance_weight.grad.abs().max().item() < 1e6
+        assert x.grad is not None
+        assert x.grad.abs().sum().item() > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -384,10 +219,18 @@ class TestGradientIsolationTwoPathway:
 class TestRouterDiagnostics:
     """Tests for the router_diagnostics dict returned from MoSRAHRouter.forward.
 
-    Verifies that routing decisions and routing feedback are structurally
-    separated, that gradients flow only through load_balance_loss, and that
-    the four load-balance health scalars have the correct relationships.
+    Verifies the exact three-key contract {load_balance_loss, max_vio, logit_std},
+    that load_balance_loss retains gradient, and that monitoring scalars are detached.
     """
+
+    def test_diagnostics_has_exactly_three_keys(self):
+        """router_diagnostics must expose exactly {load_balance_loss, max_vio, logit_std}."""
+        config = small_config()
+        router = MoSRAHRouter(config)
+        x = torch.randn(2, 8, 64)
+        active_mask = torch.ones(2, 8, dtype=torch.bool)
+        _, _, diagnostics = router(x, active_mask, None)
+        assert set(diagnostics.keys()) == {"load_balance_loss", "max_vio", "logit_std"}
 
     def test_load_balance_loss_has_gradient(self):
         """load_balance_loss must retain its gradient; it is the training signal."""
@@ -399,166 +242,17 @@ class TestRouterDiagnostics:
         assert diagnostics["load_balance_loss"].requires_grad
 
     def test_diagnostic_scalars_are_detached(self):
-        """All diagnostic scalars except load_balance_loss must be detached."""
+        """max_vio and logit_std must be detached — they are monitoring metrics."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
         _, _, diagnostics = router(x, active_mask, None)
-        for key in ("max_vio", "raw_logit_std", "bias_std",
-                    "logit_std", "bias_alignment"):
+        for key in ("max_vio", "logit_std"):
             assert not diagnostics[key].requires_grad, (
                 f"diagnostic scalar '{key}' must be detached but requires_grad is True"
             )
 
-    def test_bias_std_zero_when_balance_weight_zero(self):
-        """bias_std must be zero when balance_weight is zero.
-
-        With balance_weight zeroed, B·x = 0 for any x, so per-token std of
-        balance_logits is identically zero.
-        """
-        config = small_config()
-        router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, 64)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-        with torch.no_grad():
-            router.balance_weight.zero_()
-        _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["bias_std"].item() == 0.0
-
-    def test_logit_std_equals_raw_logit_std_when_balance_weight_zero(self):
-        """logit_std must equal raw_logit_std when balance_weight is zero.
-
-        With balance_weight zeroed, B·x = 0, so semantic_logits = A·x + 0 = A·x,
-        and both stds are computed over the same values.
-        """
-        config = small_config()
-        router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, 64)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-        with torch.no_grad():
-            router.balance_weight.zero_()
-        _, _, diagnostics = router(x, active_mask, None)
-        assert torch.allclose(
-            diagnostics["logit_std"], diagnostics["raw_logit_std"], atol=1e-6
-        )
-
-    def test_bias_alignment_negative_when_balance_opposes_routing(self):
-        """bias_alignment must be negative when balance_weight = -routing_weight.
-
-        Setting balance_weight = -routing_weight guarantees balance_logits = -routing_logits
-        for any x, so cosine similarity between the two is -1 for every token.
-        """
-        config = small_config()
-        router = MoSRAHRouter(config)
-        torch.manual_seed(42)
-        x = torch.randn(1, 8, 64)
-        active_mask = torch.ones(1, 8, dtype=torch.bool)
-        with torch.no_grad():
-            router.balance_weight.copy_(-router.routing_weight)
-        _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["bias_alignment"].item() < 0, (
-            f"expected negative bias_alignment for opposing balance_weight, "
-            f"got {diagnostics['bias_alignment'].item()}"
-        )
-
-    def test_bias_alignment_positive_when_balance_reinforces_routing(self):
-        """bias_alignment must be positive when balance_weight = routing_weight.
-
-        Setting balance_weight = routing_weight guarantees balance_logits = routing_logits
-        for any x, so cosine similarity between the two is 1 for every token.
-        """
-        config = small_config()
-        router = MoSRAHRouter(config)
-        torch.manual_seed(42)
-        x = torch.randn(1, 8, 64)
-        active_mask = torch.ones(1, 8, dtype=torch.bool)
-        with torch.no_grad():
-            router.balance_weight.copy_(router.routing_weight)
-        _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["bias_alignment"].item() > 0, (
-            f"expected positive bias_alignment for reinforcing balance_weight, "
-            f"got {diagnostics['bias_alignment'].item()}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Bias diagnostics (static method)
-# ---------------------------------------------------------------------------
-
-class TestBiasDiagnostics:
-    """Tests for MoSRAHRouter._compute_bias_diagnostics called directly as a static method.
-
-    TestRouterDiagnostics verifies the same scalars through the router forward pass.
-    This class certifies the static method contract independently, without routing.
-    """
-
-    def _make_inputs(
-        self,
-        B: int,
-        N: int,
-        L: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Construct (routing_logits, balance_logits, semantic_logits) for static method tests."""
-        routing_logits = torch.randn(B, N, L)
-        balance_logits = torch.randn(B, N, L)
-        semantic_logits = routing_logits + balance_logits
-        return routing_logits, balance_logits, semantic_logits
-
-    def test_returns_expected_keys(self):
-        """_compute_bias_diagnostics must return a dict with exactly the four expected keys."""
-        routing_logits, balance_logits, semantic_logits = self._make_inputs(2, 8, 4)
-        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
-        assert set(result.keys()) == {
-            "raw_logit_std", "bias_std", "logit_std", "bias_alignment"
-        }
-
-    def test_all_values_detached(self):
-        """All four diagnostic scalars must be detached from the autograd graph."""
-        routing_logits = torch.randn(2, 8, 4, requires_grad=True)
-        balance_logits = torch.randn(2, 8, 4, requires_grad=True)
-        semantic_logits = routing_logits + balance_logits
-        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
-        for key, val in result.items():
-            assert not val.requires_grad, (
-                f"{key} must be detached but requires_grad is True"
-            )
-
-    def test_bias_std_zero_when_balance_is_uniform(self):
-        """bias_std must be exactly 0 when balance_logits are constant across L."""
-        B, N, L = 1, 4, 6
-        routing_logits = torch.randn(B, N, L)
-        # Constant across the L dimension → per-token std = 0.
-        balance_logits = torch.full((B, N, L), 2.5)
-        semantic_logits = routing_logits + balance_logits
-        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
-        assert result["bias_std"].item() == 0.0
-
-    def test_alignment_negative_when_balance_opposes_routing(self):
-        """bias_alignment must be negative when balance_logits = -routing_logits."""
-        torch.manual_seed(7)
-        B, N, L = 1, 8, 4
-        routing_logits = torch.randn(B, N, L)
-        balance_logits = -routing_logits  # perfect anti-alignment → cosine similarity = -1
-        semantic_logits = routing_logits + balance_logits
-        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
-        assert result["bias_alignment"].item() < 0, (
-            f"expected negative alignment for opposing balance, "
-            f"got {result['bias_alignment'].item()}"
-        )
-
-    def test_alignment_positive_when_balance_reinforces_routing(self):
-        """bias_alignment must be positive when balance_logits = routing_logits."""
-        torch.manual_seed(7)
-        B, N, L = 1, 8, 4
-        routing_logits = torch.randn(B, N, L)
-        balance_logits = routing_logits  # perfect alignment → cosine similarity = 1
-        semantic_logits = routing_logits + balance_logits
-        result = MoSRAHRouter._compute_bias_diagnostics(routing_logits, balance_logits, semantic_logits)
-        assert result["bias_alignment"].item() > 0, (
-            f"expected positive alignment for reinforcing balance, "
-            f"got {result['bias_alignment'].item()}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +260,11 @@ class TestBiasDiagnostics:
 # ---------------------------------------------------------------------------
 
 class TestArchitectureInvariants:
+    """Tests certifying the single-projection coupled architecture.
+
+    routing_weight is the only routing parameter. balance_weight must not exist.
+    """
+
     def test_routing_weight_is_parameter(self):
         """routing_weight must be an nn.Parameter so the optimizer sees and updates it,
         and HuggingFace _init_weights does not override its kaiming initialization."""
@@ -573,24 +272,17 @@ class TestArchitectureInvariants:
         router = MoSRAHRouter(config)
         assert isinstance(router.routing_weight, torch.nn.Parameter)
 
-    def test_balance_weight_is_parameter(self):
-        """balance_weight must be an nn.Parameter so the optimizer sees and updates it,
-        and HuggingFace _init_weights does not override its kaiming initialization."""
-        config = small_config()
-        router = MoSRAHRouter(config)
-        assert isinstance(router.balance_weight, torch.nn.Parameter)
-
     def test_routing_weight_shape(self):
         """routing_weight must have shape (num_mosrah_heads, embedding_width)."""
         config = small_config()
         router = MoSRAHRouter(config)
         assert router.routing_weight.shape == (config.num_mosrah_heads, config.embedding_width)
 
-    def test_balance_weight_shape(self):
-        """balance_weight must have shape (num_mosrah_heads, embedding_width)."""
+    def test_balance_weight_does_not_exist(self):
+        """balance_weight must not exist — the router has one coupled projection only."""
         config = small_config()
         router = MoSRAHRouter(config)
-        assert router.balance_weight.shape == (config.num_mosrah_heads, config.embedding_width)
+        assert not hasattr(router, "balance_weight")
 
 
 # ---------------------------------------------------------------------------
@@ -677,16 +369,9 @@ class TestMaskedContinuationBehavior:
         that token's hidden state with a drastically different value and confirming
         the loss is unchanged. The large multiplier ensures the dead token's routing
         selection almost certainly changes, so any leak would be detected.
-
-        Integral weights are filled with ones to lift the zero-init degeneracy: at
-        zero init the cumsum corrections are zero regardless of input, so the dead
-        token masking fix would pass trivially. Non-zero weights make the test load-bearing.
         """
         config = small_config()
         router = MoSRAHRouter(config)
-        with torch.no_grad():
-            router.routing_integral_weight.fill_(1.0)
-            router.balance_integral_weight.fill_(1.0)
         B, N = 2, 8
         active_mask = torch.ones(B, N, dtype=torch.bool)
         active_mask[0, 3] = False
@@ -704,16 +389,9 @@ class TestMaskedContinuationBehavior:
         torch.testing.assert_close(loss_a, loss_b)
 
     def test_dead_tokens_do_not_affect_max_vio(self):
-        """Changing a dead token's hidden state must not affect max_vio.
-
-        Integral weights are filled with ones for the same reason as the
-        load_balance_loss test above: zero-init would make the test trivial.
-        """
+        """Changing a dead token's hidden state must not affect max_vio."""
         config = small_config()
         router = MoSRAHRouter(config)
-        with torch.no_grad():
-            router.routing_integral_weight.fill_(1.0)
-            router.balance_integral_weight.fill_(1.0)
         B, N = 2, 8
         active_mask = torch.ones(B, N, dtype=torch.bool)
         active_mask[1, 5] = False
@@ -1460,276 +1138,150 @@ class TestGetMaskIntTensorAgreement:
 
 
 # ---------------------------------------------------------------------------
-# Integral routing
+# Load balance convergence
 # ---------------------------------------------------------------------------
 
-class TestIntegralRouting:
-    """Tests for the integral routing extension (routing_mode='integral').
+class TestLoadBalanceConvergence:
+    """Tests that each loss mode reduces routing concentration when used as the sole
+    training signal.
 
-    Certifies existence and shape of integral weight parameters, gradient
-    isolation between A' and B', output differentiation between modes, and
-    shape consistency across modes.
+    Each test trains a router from a fixed random initialization using only
+    load_balance_loss, then verifies that max_vio on the training input is lower
+    after training than before. Evaluating on the same input used for training is
+    the correct design: the claim is that the loss reduces concentration on inputs
+    it has seen, not that it generalises to arbitrary unseen inputs.
+
+    A generous overallocation_factor ensures balance_capacity never intervenes,
+    leaving routing fully determined by the learned routing_weight. Adam is used
+    in place of SGD because the training landscape is non-convex and Adam's
+    adaptive step sizes handle the per-parameter curvature differences better.
+
+    CPU-compatible: no CUDA required.
     """
 
-    def test_integral_weights_exist_in_integral_mode(self):
-        """routing_integral_weight and balance_integral_weight must both exist
-        as nn.Parameter when routing_mode='integral'."""
-        config = small_config(routing_mode="integral")
-        router = MoSRAHRouter(config)
-        assert isinstance(router.routing_integral_weight, torch.nn.Parameter)
-        assert isinstance(router.balance_integral_weight, torch.nn.Parameter)
+    B = 2
+    N = 16
+    NUM_STEPS = 500
+    LR = 0.001
 
-    def test_integral_weights_absent_in_default_mode(self):
-        """Neither routing_integral_weight nor balance_integral_weight must
-        exist when routing_mode='default'."""
-        config = small_config(routing_mode="default")
-        router = MoSRAHRouter(config)
-        assert not hasattr(router, "routing_integral_weight")
-        assert not hasattr(router, "balance_integral_weight")
-
-    def test_integral_weights_shape(self):
-        """Both integral weight matrices must have shape (L, L) where
-        L = num_mosrah_heads."""
-        config = small_config(routing_mode="integral")
-        router = MoSRAHRouter(config)
-        L = config.num_mosrah_heads
-        assert router.routing_integral_weight.shape == (L, L)
-        assert router.balance_integral_weight.shape == (L, L)
-
-    def test_task_loss_trains_routing_integral_not_balance_integral(self):
-        """Task loss backward must populate routing_integral_weight.grad but
-        not balance_integral_weight.grad.
-
-        semantic_logits includes F.linear(u_semantic, routing_integral_weight)
-        (differentiable) and F.linear(u_semantic, balance_integral_weight).detach()
-        — there is no autograd path from routing_probs back to balance_integral_weight.
-        """
-        torch.manual_seed(0)
-        config = small_config(routing_mode="integral")
-        router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, config.embedding_width)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-
-        _, routing_probs, _ = router(x, active_mask, None)
-        routing_probs.sum().backward()
-
-        assert router.routing_integral_weight.grad is not None
-        assert router.balance_integral_weight.grad is None
-
-    def test_load_balance_loss_trains_balance_integral_not_routing_integral(self):
-        """Load balance loss backward must populate balance_integral_weight.grad
-        but not routing_integral_weight.grad.
-
-        load_balancing_logits includes F.linear(u_load, routing_integral_weight).detach()
-        and F.linear(u_load, balance_integral_weight) — there is no autograd path
-        from load_balance_loss back to routing_integral_weight.
-        """
-        torch.manual_seed(0)
-        config = small_config(routing_mode="integral")
-        router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, config.embedding_width)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-
-        _, _, diagnostics = router(x, active_mask, None)
-        diagnostics["load_balance_loss"].backward()
-
-        assert router.balance_integral_weight.grad is not None
-        assert router.routing_integral_weight.grad is None
-
-    def test_integral_output_differs_from_default(self):
-        """Integral mode must produce different routing_probs from default mode
-        on the same input and base weights.
-
-        With base weights copied to match and routing_integral_weight set to a
-        non-zero constant, the A'@u correction shifts semantic_logits away from
-        the default-mode values, producing different routing_probs.
-        routing_integral_weight is set explicitly because A' and B' are zero-initialized;
-        zero corrections would make integral and default produce identical outputs.
-        """
-        torch.manual_seed(42)
-        config_integral = small_config(routing_mode="integral")
-        config_default = small_config(routing_mode="default")
-        router_integral = MoSRAHRouter(config_integral)
-        router_default = MoSRAHRouter(config_default)
-
-        # Copy base weights and set non-zero A' so the integral correction is visible.
+    @staticmethod
+    def _measure_max_vio(
+        router: MoSRAHRouter,
+        x: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> float:
+        """Return max_vio for a router on a fixed input without modifying router state."""
         with torch.no_grad():
-            router_default.routing_weight.data.copy_(router_integral.routing_weight.data)
-            router_default.balance_weight.data.copy_(router_integral.balance_weight.data)
-            router_integral.routing_integral_weight.fill_(0.1)
+            _, _, diag = router(x, active_mask, None)
+        return diag["max_vio"].item()
 
-        x = torch.randn(2, 8, config_integral.embedding_width)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-
-        with torch.no_grad():
-            _, probs_integral, _ = router_integral(x, active_mask, None)
-            _, probs_default, _ = router_default(x, active_mask, None)
-
-        assert not torch.equal(probs_integral, probs_default), (
-            "Integral and default modes must produce different routing_probs — "
-            "A' corrections must affect the output when routing_integral_weight is non-zero"
-        )
-
-    def test_output_shapes_match_across_modes(self):
-        """selected_heads and routing_probs shapes must be identical between
-        integral and default modes for the same config dimensions."""
-        x = torch.randn(2, 8, 64)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-
-        config_integral = small_config(routing_mode="integral")
-        config_default = small_config(routing_mode="default")
-        router_integral = MoSRAHRouter(config_integral)
-        router_default = MoSRAHRouter(config_default)
-
-        with torch.no_grad():
-            heads_integral, probs_integral, _ = router_integral(x, active_mask, None)
-            heads_default, probs_default, _ = router_default(x, active_mask, None)
-
-        assert heads_integral.shape == heads_default.shape
-        assert probs_integral.shape == probs_default.shape
-
-
-# ---------------------------------------------------------------------------
-# Compiled training — integral mode
-# ---------------------------------------------------------------------------
-
-class TestIntegralModeCompileTraining:
-    """Compiled training test for integral routing mode.
-
-    Verifies that torch.compile works with the integral router, that the load
-    balance signal reaches balance_integral_weight (B') through the compiled
-    integral pathway, and that the load balance loss prevents degenerate routing
-    collapse under a task reward that always concentrates on the same heads.
-
-    CUDA-only: uses the device fixture from conftest.py.
-    """
-
-    def test_compiled_training_load_balance_holds_back_concentration(self, device):
-        """Compiled integral router trained with load balance loss must not
-        collapse to max_vio >= 0.3 under a degenerate task reward.
-
-        A single compiled integral router is trained for 30 SGD steps with a
-        task reward that always rewards concentration on the same K//2 selected
-        heads, plus 0.1 * load_balance_loss. With overallocation_factor=2.0
-        and load balancing active, the router must not reach degenerate collapse
-        (max_vio < 0.3 after training).
-
-        Additionally verifies: (1) compilation completes without graph breaks, and
-        (2) balance_integral_weight.grad is populated, confirming the load balance
-        signal reaches B' through the compiled integral pathway.
-        """
-        if device.type != "cuda":
-            pytest.skip("Compiled training test is CUDA-only.")
-
-        torch.manual_seed(0)
-        config = small_config(
-            routing_mode="integral",
-            mosrah_overallocation_factor=2.0,
-        )
-        K = config.num_selected_heads
-        K_half = K // 2
-
-        router = MoSRAHRouter(config).to(device)
-        compiled_router = torch.compile(router, fullgraph=True, dynamic=False)
-        opt = torch.optim.SGD(router.parameters(), lr=0.001)
-
-        generator = torch.Generator(device=device)
-        generator.manual_seed(1)
-        B, N = 2, 16
-
-        for _ in range(1000):
-            x = torch.randn(B, N, config.embedding_width, device=device, generator=generator)
-            active_mask = torch.ones(B, N, dtype=torch.bool, device=device)
-
+    @staticmethod
+    def _train_router(
+        router: MoSRAHRouter,
+        x: torch.Tensor,
+        active_mask: torch.Tensor,
+        num_steps: int,
+        lr: float,
+    ) -> None:
+        """Train a router in-place using load_balance_loss as the sole gradient signal."""
+        opt = torch.optim.Adam(router.parameters(), lr=lr)
+        for _ in range(num_steps):
             opt.zero_grad()
-            _, routing_probs, diagnostics = compiled_router(x, active_mask, None)
-            # Degenerate task reward: always maximize probability on the first K_half
-            # selected heads, pushing the router toward head concentration.
-            task_loss = -(routing_probs[..., :K_half].sum())
-            loss = task_loss + 10 * diagnostics["load_balance_loss"]
-            loss.backward()
+            _, _, diag = router(x, active_mask, None)
+            diag["load_balance_loss"].backward()
             opt.step()
 
-        # Verify load balance held back collapse on a fixed evaluation input.
-        torch.manual_seed(7)
-        x_eval = torch.randn(B, N, config.embedding_width, device=device)
-        active_mask_eval = torch.ones(B, N, dtype=torch.bool, device=device)
+    def _run_convergence(self, loss_type: str) -> None:
+        """Train a router with the given loss type and assert max_vio decreases.
 
-        with torch.no_grad():
-            _, _, diag_eval = router(x_eval, active_mask_eval, None)
+        Uses the same fixed x for both the before measurement and the after
+        measurement. All three loss-type variants share the same seed so their
+        starting conditions are identical and results are directly comparable.
+        """
+        torch.manual_seed(42)
+        config = small_config(
+            load_balance_loss_type=loss_type,
+            mosrah_overallocation_factor=2.0,
+        )
+        router = MoSRAHRouter(config)
+        x = torch.randn(self.B, self.N, config.embedding_width)
+        active_mask = torch.ones(self.B, self.N, dtype=torch.bool)
 
-        max_vio = diag_eval["max_vio"].item()
-        assert max_vio < 0.5, (
-            f"Load balance loss must prevent degenerate collapse: "
-            f"max_vio={max_vio:.4f} must be < 0.3"
+        max_vio_before = self._measure_max_vio(router, x, active_mask)
+        self._train_router(router, x, active_mask, self.NUM_STEPS, self.LR)
+        max_vio_after = self._measure_max_vio(router, x, active_mask)
+
+        assert max_vio_after < max_vio_before, (
+            f"load_balance_loss ({loss_type!r}) must reduce concentration: "
+            f"max_vio before={max_vio_before:.4f}, after={max_vio_after:.4f}"
         )
 
-        # Verify load balance signal reached B' through the compiled integral pathway.
-        opt.zero_grad()
-        _, _, diag_check = compiled_router(x_eval, active_mask_eval, None)
-        diag_check["load_balance_loss"].backward()
-        assert router.balance_integral_weight.grad is not None, (
-            "balance_integral_weight.grad must be populated after load_balance_loss.backward() "
-            "— the load balance signal must reach B' through the integral pathway"
+    def test_gshard_reduces_concentration(self):
+        """Router trained with gshard loss must reach lower max_vio than at initialization."""
+        self._run_convergence("gshard")
+
+    def test_ce_reduces_concentration(self):
+        """Router trained with ce loss must reach lower max_vio than at initialization."""
+        self._run_convergence("ce")
+
+    def test_bce_reduces_concentration(self):
+        """Router trained with bce loss must reach lower max_vio than at initialization."""
+        self._run_convergence("bce")
+
+    def test_temporal_overcapacity_reduces_concentration(self):
+        """Router trained with temporal_overcapacity loss must reach lower max_vio than at
+        initialization. maximum_expert_overclaim=0 ensures violations fire immediately so
+        the loss is active from the first imbalanced position."""
+        torch.manual_seed(42)
+        config = small_config(
+            load_balance_loss_type="temporal_overcapacity",
+            maximum_expert_overclaim=0,
+            mosrah_overallocation_factor=2.0,
+        )
+        router = MoSRAHRouter(config)
+        x = torch.randn(self.B, self.N, config.embedding_width)
+        active_mask = torch.ones(self.B, self.N, dtype=torch.bool)
+
+        max_vio_before = self._measure_max_vio(router, x, active_mask)
+        self._train_router(router, x, active_mask, self.NUM_STEPS, self.LR)
+        max_vio_after = self._measure_max_vio(router, x, active_mask)
+
+        assert max_vio_after < max_vio_before, (
+            f"load_balance_loss ('temporal_overcapacity') must reduce concentration: "
+            f"max_vio before={max_vio_before:.4f}, after={max_vio_after:.4f}"
         )
 
 
 # ---------------------------------------------------------------------------
-# Routing mode profiling (optional)
+# Compiled backward
 # ---------------------------------------------------------------------------
 
-class TestRoutingModeProfile:
-    """Optional profiling test for default vs integral routing mode performance.
+class TestCompiledBackward:
+    """Compiled forward+backward test for the coupled single-projection router.
 
-    Disabled by default. Set PROFILE_ROUTING_MODES = True at module level to run.
-    Prints a timing table but makes no assertions.
+    CUDA-only via the device fixture from conftest.py.
     """
 
-    def test_profile_default_vs_integral_modes(self):
-        """Time eager and compiled forward pass for both routing modes.
+    def test_compiled_forward_backward_no_error(self, device):
+        """Compiled router must run one forward+backward step without error,
+        and routing_weight.grad must be populated after backward."""
+        if device.type != "cuda":
+            pytest.skip("Compiled backward test is CUDA-only.")
 
-        Runs 50 warmup iterations then 100 timed iterations per (mode, compile)
-        combination. Prints: mode × compile × time (ms/iter). No assertions.
-        """
-        if not PROFILE_ROUTING_MODES:
-            pytest.skip("Set PROFILE_ROUTING_MODES=True to run profiling")
+        torch.manual_seed(0)
+        config = small_config(mosrah_overallocation_factor=2.0)
+        router = MoSRAHRouter(config).to(device)
+        compiled_router = torch.compile(router, fullgraph=True, dynamic=False)
+        opt = torch.optim.SGD(router.parameters(), lr=0.01)
 
-        import time
+        x = torch.randn(2, 16, config.embedding_width, device=device)
+        active_mask = torch.ones(2, 16, dtype=torch.bool, device=device)
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        WARMUP = 50
-        TIMED = 100
-        B, N = 2, 64
+        opt.zero_grad()
+        _, routing_probs, diagnostics = compiled_router(x, active_mask, None)
+        loss = routing_probs.sum() + diagnostics["load_balance_loss"]
+        loss.backward()
 
-        results = {}
-        for mode in ("default", "integral"):
-            config = small_config(routing_mode=mode)
-            router = MoSRAHRouter(config).eval().to(device)
-            compiled_router = torch.compile(router, fullgraph=True, dynamic=False)
-
-            x = torch.randn(B, N, config.embedding_width, device=device)
-            active_mask = torch.ones(B, N, dtype=torch.bool, device=device)
-
-            for label, fn in [("eager", router), ("compiled", compiled_router)]:
-                for _ in range(WARMUP):
-                    with torch.no_grad():
-                        fn(x, active_mask, None)
-
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-
-                t0 = time.perf_counter()
-                for _ in range(TIMED):
-                    with torch.no_grad():
-                        fn(x, active_mask, None)
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                elapsed_ms = (time.perf_counter() - t0) / TIMED * 1000
-
-                results[(mode, label)] = elapsed_ms
-
-        print(f"\nRouting mode profile ({device}, ms/iter):")
-        print(f"{'mode':<12} {'compile':<12} {'ms/iter':>10}")
-        print("-" * 36)
-        for (mode, label), ms in results.items():
-            print(f"{mode:<12} {label:<12} {ms:>10.3f}")
+        assert router.routing_weight.grad is not None, (
+            "routing_weight.grad must be populated after compiled backward"
+        )

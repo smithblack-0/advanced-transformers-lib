@@ -233,8 +233,8 @@ class TestRealExecution:
 # ---------------------------------------------------------------------------
 
 class TestGradientFlow:
-    def test_sparse_output_backward_reaches_the_real_output_path_but_not_balance_weight(self, device):
-        """Sparse-output gradients must reach routing_weight but must not reach balance_weight."""
+    def test_sparse_output_backward_reaches_routing_parameters(self, device):
+        """Sparse-output gradients must reach routing parameters."""
         torch.manual_seed(0)
         config = make_config("main_sequence")
         layer = MoSRAHLayer(config).to(device)
@@ -262,14 +262,8 @@ class TestGradientFlow:
         assert bea_q_grad is not None
         assert torch.isfinite(bea_q_grad).all()
 
-        # The sparse output must not backpropagate through the load-balance pathway
-        # into balance_weight. That path is intentionally excluded from the output
-        # reduction contract.
-        balance_weight_grad = layer.router.balance_weight.grad
-        assert balance_weight_grad is None or torch.all(balance_weight_grad == 0)
-
-    def test_load_balance_loss_backward_reaches_balance_weight_but_not_routing_weight(self, device):
-        """load_balance_loss must reach balance_weight and must not reach routing_weight."""
+    def test_load_balance_loss_backward_reaches_router_parameters_not_bea(self, device):
+        """load_balance_loss must reach router parameters but must not reach BEA parameters."""
         torch.manual_seed(0)
         config = make_config("main_sequence")
         layer = MoSRAHLayer(config).to(device)
@@ -286,9 +280,9 @@ class TestGradientFlow:
 
         load_balance_loss.backward()
 
-        balance_weight_grad = layer.router.balance_weight.grad
-        assert balance_weight_grad is not None
-        assert torch.isfinite(balance_weight_grad).all()
+        assert any(p.grad is not None for p in layer.router.parameters())
 
-        routing_weight_grad = layer.router.routing_weight.grad
-        assert routing_weight_grad is None or torch.all(routing_weight_grad == 0)
+        assert all(
+            p.grad is None or torch.all(p.grad == 0)
+            for p in layer.bea.parameters()
+        )

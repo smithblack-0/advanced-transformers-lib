@@ -108,7 +108,7 @@ def make_cache(
 
 class TestOutputContract:
     def test_forward_returns_expected_output_dict_keys(self, device):
-        """ShramModel should expose the preserved output keys plus load_balance_loss and max_vio."""
+        """ShramModel must expose exactly the contracted output keys."""
         config = small_config()
         model = make_model(config, device, seed=0)
 
@@ -122,10 +122,7 @@ class TestOutputContract:
             "hidden_states",
             "load_balance_loss",
             "max_vio",
-            "bias_std",
-            "raw_logit_std",
             "logit_std",
-            "bias_alignment",
         }
 
     def test_last_hidden_state_shape_and_load_balance_loss_scalar_are_valid(self, device):

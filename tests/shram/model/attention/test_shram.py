@@ -577,9 +577,9 @@ class TestConfigurationResponse:
 
 # ---------------------------------------------------------------------------
 # The final responsibility preserved by the hybrid boundary is gradient
-# separation. Gradients from the summed hybrid output should reach both real
-# model-space paths, while gradients from load_balance_loss should reach the
-# sparse balancing path without involving the local path.
+# routing. Gradients from the summed hybrid output must reach both real
+# model-space paths. Gradients from load_balance_loss must not reach
+# the local attention path.
 # ---------------------------------------------------------------------------
 
 class TestGradientBehavior:
@@ -590,7 +590,6 @@ class TestGradientBehavior:
 
         local_param = first_parameter(layer.local_attention)
         sparse_output_param = layer.sparse_attention.bea.q_proj
-        sparse_balance_param = layer.sparse_attention.router.balance_weight
 
         hybrid_output, router_diagnostics = layer(
             hidden_states=hidden_states,
@@ -611,20 +610,10 @@ class TestGradientBehavior:
         assert sparse_output_param.grad is not None
         assert torch.isfinite(sparse_output_param.grad).all()
 
-        # The hybrid output should reach the sparse output path, not the sparse
-        # balancing-only parameter.
-        balance_grad = sparse_balance_param.grad
-        assert balance_grad is None or torch.all(balance_grad == 0)
-
     def test_load_balance_loss_backward_reaches_the_sparse_balancing_path_and_causes_movement(self, device):
-        """The returned load-balance loss should survive the hybrid layer and update balance_weight."""
+        """The returned load-balance loss should survive the hybrid layer and update router parameters."""
         hidden_states, position_ids, active_mask = make_inputs(device, requires_grad=True, start_position=0)
         layer = make_layer(make_config(), device, seed=0)
-
-        local_param = first_parameter(layer.local_attention)
-        sparse_output_param = layer.sparse_attention.bea.q_proj
-        balance_weight = layer.sparse_attention.router.balance_weight
-        balance_weight_before = balance_weight.detach().clone()
 
         optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
 
@@ -641,14 +630,15 @@ class TestGradientBehavior:
         load_balance_loss.backward()
         optimizer.step()
 
-        assert balance_weight.grad is not None
-        assert torch.isfinite(balance_weight.grad).all()
-        assert not torch.allclose(balance_weight, balance_weight_before)
+        assert any(p.grad is not None for p in layer.sparse_attention.router.parameters())
 
-        # The hybrid layer should not redirect the sparse balancing signal into
-        # the local path or the sparse output-path parameters.
-        local_grad = local_param.grad
-        assert local_grad is None or torch.all(local_grad == 0)
-
-        sparse_output_grad = sparse_output_param.grad
-        assert sparse_output_grad is None or torch.all(sparse_output_grad == 0)
+        # The hybrid layer must not redirect the sparse balancing signal into
+        # the local path or the sparse BEA parameters.
+        assert all(
+            p.grad is None or torch.all(p.grad == 0)
+            for p in layer.local_attention.parameters()
+        )
+        assert all(
+            p.grad is None or torch.all(p.grad == 0)
+            for p in layer.sparse_attention.bea.parameters()
+        )

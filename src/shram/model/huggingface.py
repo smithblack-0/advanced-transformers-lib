@@ -54,17 +54,14 @@ class ShramCausalLMOutput(CausalLMOutputWithPast):
     ## Python dataclass inheritance violation: CausalLMOutputWithPast defaults all
     ## fields to None, which forces every subclass field to also carry a default.
     ## The = None below is a language constraint, not a semantic statement. In
-    ## practice, load_balance_loss, max_vio, bias_std, raw_logit_std, logit_std,
-    ## and bias_alignment are always populated by ShramForCausalLM.forward().
-    ## ce_loss is genuinely optional — present only when labels are supplied.
+    ## practice, load_balance_loss, max_vio, and logit_std are always populated
+    ## by ShramForCausalLM.forward(). ce_loss is genuinely optional — present
+    ## only when labels are supplied.
 
     ce_loss: torch.FloatTensor | None = None
     load_balance_loss: torch.FloatTensor | None = None
     max_vio: torch.FloatTensor | None = None
-    bias_std: torch.Tensor | None = None
-    raw_logit_std: torch.Tensor | None = None
     logit_std: torch.Tensor | None = None
-    bias_alignment: torch.Tensor | None = None
 
 class ShramForCausalLM(PreTrainedModel, GenerationMixin):
     """HuggingFace-facing causal language model wrapper for SHRAM.
@@ -513,9 +510,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             - ``hidden_states`` when requested,
             - ``load_balance_loss`` — raw unweighted load-balance loss from the backbone,
             - ``max_vio`` — detached worst-case routing imbalance across layers,
-            - ``bias_std``, ``raw_logit_std``, ``logit_std``, ``bias_alignment`` —
-              detached load-balance health scalars averaged across decoder layers;
-              see ``ShramModel`` for interpretation.
+            - ``logit_std`` — detached mean per-token routing logit spread across layers.
         """
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         output_hidden_states = (
@@ -622,8 +617,5 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             hidden_states=backbone_outputs["hidden_states"],
             load_balance_loss=backbone_outputs["load_balance_loss"],
             max_vio=backbone_outputs["max_vio"],
-            bias_std=backbone_outputs["bias_std"],
-            raw_logit_std=backbone_outputs["raw_logit_std"],
             logit_std=backbone_outputs["logit_std"],
-            bias_alignment=backbone_outputs["bias_alignment"],
         )

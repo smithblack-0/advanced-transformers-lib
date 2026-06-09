@@ -1,6 +1,6 @@
 """Log-probability auxiliary loss functions for MoSRAH load balancing.
 
-This module provides three load-balance loss formulations, two token-reduction
+This module provides four load-balance loss formulations, two token-reduction
 helpers, and a factory that selects among the formulations. All formulations
 share the same external contract:
 
@@ -10,9 +10,8 @@ share the same external contract:
         active_mask:     Tensor[B, N],
     ) -> scalar Tensor
 
-    logits:          Load-balancing logits, shape (B, N, L). These are the raw
-                     pre-softmax scores from logits.detach() + expert_bias.
-                     Gradient flows to expert_bias through this tensor.
+    logits:          Pre-softmax routing scores, shape (B, N, L). Gradient flows
+                     through this tensor.
     assignment_mask: Per-token head-assignment indicators. assignment_mask[b, n, l]
                      is 1.0 if token (b, n) was assigned to head l. Dead tokens
                      should carry zero entries.
@@ -22,17 +21,19 @@ share the same external contract:
 Token reduction is split into two helpers with distinct roles:
 
     reduce_frequency_tokens — produces per-batch-item routing frequencies f_bl (B, L).
-        Called by all three formulations. Output is detached; f_bl carries no gradient.
+        Called by gshard, ce, and bce. Output is detached; f_bl carries no gradient.
 
     reduce_probability_tokens — produces per-batch-item mean assignment probabilities
-        p_bl (B, L). Called only by gshard and bce. Gradient flows to expert_bias
-        through the internal softmax over logits.
+        p_bl (B, L). Called only by gshard and bce. Gradient flows through the
+        internal softmax over logits.
 
 CE delegates probability computation to F.cross_entropy, which handles its own
 log_softmax and operates directly on the raw (B, N, L) logits.
 
-The factory is the intended entry point. MoSRAHRouter constructs the loss callable
-once at init and invokes it each forward pass.
+``make_load_balance_loss`` is the sole public entry point. The individual loss
+functions are internal implementation details; their signatures may change between
+units. Callers and tests must construct loss callables through the factory, not by
+importing or invoking the loss functions directly.
 """
 
 import torch
@@ -206,30 +207,181 @@ def bce_loss(
     """
     f_bl = reduce_frequency_tokens(assignment_mask, active_mask)
     p_bl = reduce_probability_tokens(logits, active_mask)
-    # Clamp p_bl for numerical safety: F.binary_cross_entropy requires input in
-    # (0, 1) and will produce inf for exactly 0 or 1. Softmax outputs are
-    # strictly positive in normal operation; the clamp guards the all-dead-tokens
-    # edge case where the mean defaults to zero.
-    return F.binary_cross_entropy(
-        p_bl.clamp(min=1e-7, max=1.0 - 1e-7),
-        1.0 - f_bl,
-        reduction='mean',
-    )
+    # Clamp for numerical safety: softmax outputs are strictly positive in
+    # normal operation; the clamp guards the all-dead-tokens edge case where
+    # the mean defaults to zero. log1p(-p) avoids cancellation near p=1.
+    p = p_bl.clamp(min=1e-7, max=1.0 - 1e-7)
+    target = 1.0 - f_bl
+    return -(target * torch.log(p) + (1.0 - target) * torch.log1p(-p)).mean()
+
+
+def _temporal_overcapacity_loss(
+    logits: torch.Tensor,
+    assignment_mask: torch.Tensor,
+    active_mask: torch.Tensor,
+    expected_tokens_rate: float,
+    maximum_expert_overclaim: int,
+) -> torch.Tensor:
+    """Temporal overcapacity loss for MoSRAH load balancing.
+
+    Penalises routing decisions that select a head already overloaded relative to
+    its ideal allocation trajectory. A head is considered overloaded when the number
+    of active tokens before position n assigned to that head exceeds
+    cumulative_active_tokens * M + C, where M is the expected_tokens_rate (K/L) and
+    C is the maximum_expert_overclaim slack.
+
+    Loss is exactly zero when no head exceeds its trajectory, making it safe to
+    weight strongly — it stays out of the way when routing is balanced.
+
+    Args:
+        logits:                   Pre-softmax routing scores, shape (B, N, L).
+        assignment_mask:          Per-token head-assignment indicators, shape (B, N, L).
+                                  1.0 if token (b, n) is assigned to head l.
+        active_mask:              Boolean active-token mask, shape (B, N).
+        expected_tokens_rate (M): Ideal per-head allocation rate K/L. Pre-computed
+                                  by the factory so the division is not repeated each
+                                  forward pass.
+        maximum_expert_overclaim (C): Slack above the ideal trajectory before
+                                  imbalance fires. Larger C tolerates more deviation.
+
+    Returns:
+        Scalar loss tensor. Exactly 0.0 when no head exceeds its allowed trajectory.
+    """
+    # ── Algorithm overview ──────────────────────────────────────────────────────
+    #
+    # Problem: token routing is stateless — each token's TopK selection is blind to
+    # how many times each expert has already been chosen earlier in the sequence. A
+    # router that develops a strong preference for certain experts will overload them
+    # far beyond their K/L fair share with no correction signal at the moment of
+    # selection.
+    #
+    # Approach: track per-head assignment history as exclusive cumulative counts
+    # (assignments by all active tokens strictly before position n) and compare
+    # against an ideal trajectory S·M, where S is the inclusive cumulative active
+    # token count and M is the amount of tokens expected given ideal balancing
+    #  A head is overloaded when its prior count exceeds that trajectory
+    # by more than C. When a token selects an already-overloaded head, the loss
+    # moment — mean(violating logits) minus mean(non-overloaded logits) — penalises
+    # the gap and pushes future routing toward underloaded alternatives.
+
+    # ── Routing history and imbalance threshold ──────────────────────────────────
+    #
+    # prior_assignment_counts is the exclusive routing history at each position:
+    # active assignments to each head by all tokens strictly before position n.
+    # Exclusive because it reflects only what was known when token n was being routed.
+    # cumulative_active_tokens grows by 1 per active token; the ideal per-head
+    # allocation at n is S·M. Exceeding that by more than C triggers imbalance.
+
+    active_float = active_mask.float()                                              # (B, N)
+    active_assignments = assignment_mask * active_float.unsqueeze(-1)               # (B, N, L)
+
+    # exclusive cumsums: subtract self to exclude position n
+    prior_assignment_counts = active_assignments.cumsum(dim=1) - active_assignments  # (B, N, L)
+    cumulative_active_tokens = active_float.cumsum(dim=1) - active_float             # (B, N)
+
+    maximum_supportable_assignments = (
+        cumulative_active_tokens.unsqueeze(-1) * expected_tokens_rate
+        + maximum_expert_overclaim
+    )                                                                                # (B, N, 1) → broadcasts to (B, N, L)
+
+    # ── Mask construction ────────────────────────────────────────────────────────
+    #
+    # Three derived masks:
+    #   imbalance_mask:           any head exceeding its trajectory.
+    #   violating_selection_mask: selected AND imbalanced — the penalty target.
+    #   non_overloaded_head_mask: NOT imbalanced, regardless of selection.
+    #
+    # Masking is deliberately assymetric. We have a problem when something is over
+    # capacity AND gets chosen by topk. We can transfer it elsewhere only if we
+    # are not overcapacity.
+
+    imbalance_mask           = prior_assignment_counts > maximum_supportable_assignments  # (B, N, L)
+    violating_selection_mask = assignment_mask.bool() & imbalance_mask                   # (B, N, L)
+    non_overloaded_head_mask = ~imbalance_mask                                            # (B, N, L)
+    has_violation_mask       = violating_selection_mask.any(dim=-1)                       # (B, N)
+
+    # ── Loss moment ────────────────────────────────────────────────────────
+    #
+    # Epsilons on the count denominators guard against NaN when violation_count or
+    # non_overloaded_count is zero. has_violation_mask zeros positions with no
+    # violations at the gating step, so the epsilon-inflated denominator never
+    # contributes to the loss.
+    #
+    # One notable property of this moment is it keeps the amount of transferred
+    # logit mass constant. That is the gradient reduces violating logits and increases
+    # non-overloaded logits by equal magnitude. Routing is redirected, not suppressed.
+
+    violation_count           = violating_selection_mask.float().sum(dim=-1).clamp(min=1.0)   # (B, N)
+    non_overloaded_count      = non_overloaded_head_mask.float().sum(dim=-1).clamp(min=1.0)   # (B, N)
+    mean_violating_logit      = (violating_selection_mask.float() * logits).sum(dim=-1) / violation_count      # (B, N)
+    mean_non_overloaded_logit = (non_overloaded_head_mask.float() * logits).sum(dim=-1) / non_overloaded_count  # (B, N)
+    raw_loss                  = mean_violating_logit - mean_non_overloaded_logit                                 # (B, N)
+
+    # ── Loss reduction ───────────────────────────────────────────────────────────
+    #
+    # Reduction is over active positions only; dead tokens are excluded from both
+    # numerator (gated by active_float) and denominator (active_count_per_seq).
+    # clamp(min=1.0) handles the all-dead-tokens edge case: gated_loss is zero
+    # there since active_float gates it, so the result is 0/1 = 0.
+    #
+    # Exact-zero guarantee: when no head exceeds its trajectory, has_violation_mask
+    # is all-False, gated_loss is zeroed everywhere, and the scalar return is
+    # exactly 0.0. The loss is inert when routing is balanced.
+
+    gated_loss           = active_float * has_violation_mask.float() * raw_loss           # (B, N)
+    active_count_per_seq = active_float.sum(dim=1).clamp(min=1.0)                         # (B,)
+    sequence_loss        = gated_loss.sum(dim=1) / active_count_per_seq                   # (B,)
+    final_loss           = sequence_loss.mean()
+    return final_loss
 
 
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-_LOSS_REGISTRY: dict[str, Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]] = {
-    "gshard": gshard_loss,
-    "ce": ce_loss,
-    "bce": bce_loss,
+def _gshard_factory(**kwargs: object) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    return gshard_loss
+
+
+def _ce_factory(**kwargs: object) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    return ce_loss
+
+
+def _bce_factory(**kwargs: object) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    return bce_loss
+
+
+def _temporal_overcapacity_factory(
+    num_selected_heads: int,
+    num_total_heads: int,
+    maximum_expert_overclaim: int,
+    **kwargs: object,
+) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    expected_tokens_rate = num_selected_heads / num_total_heads
+    def _runtime(
+        logits: torch.Tensor,
+        assignment_mask: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return _temporal_overcapacity_loss(
+            logits, assignment_mask, active_mask,
+            expected_tokens_rate=expected_tokens_rate,
+            maximum_expert_overclaim=maximum_expert_overclaim,
+        )
+    return _runtime
+
+
+_LOSS_REGISTRY: dict[str, Callable[..., Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]]] = {
+    "gshard": _gshard_factory,
+    "ce": _ce_factory,
+    "bce": _bce_factory,
+    "temporal_overcapacity": _temporal_overcapacity_factory,
 }
 
 
 def make_load_balance_loss(
     loss_type: str,
+    **loss_parameters: object,
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """Return a load-balance loss callable for the requested formulation.
 
@@ -241,11 +393,14 @@ def make_load_balance_loss(
             active_mask:     Tensor[B, N],
         ) -> scalar Tensor
 
-    The caller is responsible for computing logits as logits.detach() + expert_bias
-    to ensure gradient isolation to expert_bias.
+    Keyword arguments are forwarded to the selected factory. The gshard, ce, and bce
+    factories silently ignore all kwargs; this allows callers to pass loss-type-specific
+    parameters (e.g. for temporal_overcapacity) without branching on loss_type.
 
     Args:
-        loss_type: One of ``"gshard"``, ``"ce"``, or ``"bce"``.
+        loss_type:        One of ``"gshard"``, ``"ce"``, ``"bce"``, or
+                          ``"temporal_overcapacity"``.
+        **loss_parameters: Construction-time parameters forwarded to the factory.
 
     Returns:
         Loss callable matching the shared contract.
@@ -258,4 +413,4 @@ def make_load_balance_loss(
         raise ValueError(
             f"load_balance_loss_type must be one of {supported}, got {loss_type!r}."
         )
-    return _LOSS_REGISTRY[loss_type]
+    return _LOSS_REGISTRY[loss_type](**loss_parameters)

@@ -316,6 +316,7 @@ class TestSerialisation:
         assert restored.tie_word_embeddings == original.tie_word_embeddings
         assert restored.mosrah_overallocation_factor == original.mosrah_overallocation_factor
         assert restored.max_bid_rounds == original.max_bid_rounds
+        assert restored.maximum_expert_overclaim == original.maximum_expert_overclaim
 
 
 # ---------------------------------------------------------------------------
@@ -401,10 +402,15 @@ class TestMaxBidRounds:
 # ---------------------------------------------------------------------------
 
 class TestLoadBalanceLossType:
-    def test_default_is_ce(self):
-        """load_balance_loss_type must default to 'ce'."""
+    def test_default_is_temporal_overcapacity(self):
+        """load_balance_loss_type must default to 'temporal_overcapacity'."""
         config = ShramConfig()
-        assert config.load_balance_loss_type == "ce"
+        assert config.load_balance_loss_type == "temporal_overcapacity"
+
+    def test_temporal_overcapacity_is_valid(self):
+        """'temporal_overcapacity' must be accepted without error."""
+        config = small_config(load_balance_loss_type="temporal_overcapacity")
+        assert config.load_balance_loss_type == "temporal_overcapacity"
 
     def test_roundtrip(self):
         """load_balance_loss_type must survive to_dict/from_dict serialisation."""
@@ -419,29 +425,34 @@ class TestLoadBalanceLossType:
 
 
 # ---------------------------------------------------------------------------
-# routing_mode
+# maximum_expert_overclaim
 # ---------------------------------------------------------------------------
 
-class TestRoutingMode:
-    def test_routing_mode_default_is_integral(self):
-        """routing_mode must default to 'integral' — integral routing is on by default."""
+class TestMaximumExpertOverclaim:
+    def test_default_is_twenty(self):
+        """maximum_expert_overclaim must default to 20."""
         config = ShramConfig()
-        assert config.routing_mode == "integral"
+        assert config.maximum_expert_overclaim == 20
 
-    def test_routing_mode_integral_roundtrips_serialization(self):
-        """routing_mode='integral' must survive to_dict/from_dict serialisation."""
-        config = small_config(routing_mode="integral")
+    def test_stored(self):
+        """maximum_expert_overclaim passed at construction must be stored as given."""
+        config = small_config(maximum_expert_overclaim=5)
+        assert config.maximum_expert_overclaim == 5
+
+    def test_zero_is_valid(self):
+        """maximum_expert_overclaim=0 must be accepted — violations fire immediately."""
+        config = small_config(maximum_expert_overclaim=0)
+        assert config.maximum_expert_overclaim == 0
+
+    def test_negative_raises(self):
+        """Negative maximum_expert_overclaim must raise ValueError at construction."""
+        with pytest.raises(ValueError, match="maximum_expert_overclaim"):
+            small_config(maximum_expert_overclaim=-1)
+
+    def test_roundtrip(self):
+        """maximum_expert_overclaim must survive to_dict/from_dict serialisation."""
+        config = small_config(maximum_expert_overclaim=7)
         restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.routing_mode == "integral"
+        assert restored.maximum_expert_overclaim == 7
 
-    def test_routing_mode_default_roundtrips_serialization(self):
-        """routing_mode='default' must survive to_dict/from_dict serialisation."""
-        config = small_config(routing_mode="default")
-        restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.routing_mode == "default"
-
-    def test_routing_mode_invalid_raises(self):
-        """An unrecognised routing_mode must raise ValueError at construction."""
-        with pytest.raises(ValueError, match="routing_mode"):
-            small_config(routing_mode="invalid")
 

@@ -195,14 +195,14 @@ class TestLoss:
         expected = 2.0 * out.ce_loss + 0.5 * out.load_balance_loss
         torch.testing.assert_close(out.loss, expected)
 
-    def test_balance_weight_receives_gradient(self, device) -> None:
-        """balance_weight must receive a gradient through out.loss so the router trains correctly."""
+    def test_routing_weight_receives_gradient(self, device) -> None:
+        """Router parameters must receive a gradient through out.loss so the router trains correctly."""
         m = ShramForCausalLM(small_config()).train().to(device)
         ids = torch.randint(0, m.config.vocab_size, (1, 4), device=device)
         out = m(ids, labels=ids, use_cache=False)
         out.loss.backward()
-        balance_weight = m.model.layers[0].attention.sparse_attention.router.balance_weight
-        assert balance_weight.grad is not None
+        router = m.model.layers[0].attention.sparse_attention.router
+        assert any(p.grad is not None for p in router.parameters())
 
 
 # ---------------------------------------------------------------------------

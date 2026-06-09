@@ -6,8 +6,11 @@ Invariants verified:
 - reduce_probability_tokens produces correct per-batch-item mean softmax probabilities,
   carries gradient from logits, excludes dead tokens, and returns zeros on the
   all-dead-tokens edge case
-- Factory returns a callable for each of the three valid type strings
+- Factory returns a callable for each of the four valid type strings
 - Factory raises ValueError for an invalid type string
+- temporal_overcapacity_loss is exactly zero when no head exceeds its allowed trajectory
+- temporal_overcapacity_loss computes the correct correction moment for one or more violating heads
+- Inactive tokens are excluded from prior counts and batch reduction
 - gshard_loss computes (1/L) * Σ_l f_bl * p_bl per batch item, averaged over B
 - ce_loss computes -(1/(L-1)) * Σ_l (1-f_bl) * log(p_bl) per batch item, averaged over B
 - bce_loss computes -(1/L) * Σ_l [(1-f_bl)*log(p_bl) + f_bl*log(1-p_bl)] per batch item,
@@ -265,6 +268,51 @@ class TestFactory:
         with pytest.raises(ValueError, match="load_balance_loss_type"):
             make_load_balance_loss("invalid_type")
 
+    def test_gshard_ignores_temporal_kwargs(self) -> None:
+        """gshard factory must accept and silently ignore temporal-specific kwargs."""
+        fn = make_load_balance_loss(
+            "gshard", num_selected_heads=2, num_total_heads=4, maximum_expert_overclaim=5,
+        )
+        assert callable(fn)
+        logits, assignment_mask, active_mask = make_single_token_inputs()
+        loss = fn(logits, assignment_mask, active_mask)
+        assert loss.shape == ()
+        assert torch.isfinite(loss)
+
+    def test_ce_ignores_temporal_kwargs(self) -> None:
+        """ce factory must accept and silently ignore temporal-specific kwargs."""
+        fn = make_load_balance_loss(
+            "ce", num_selected_heads=2, num_total_heads=4, maximum_expert_overclaim=5,
+        )
+        assert callable(fn)
+        logits, assignment_mask, active_mask = make_single_token_inputs()
+        loss = fn(logits, assignment_mask, active_mask)
+        assert loss.shape == ()
+        assert torch.isfinite(loss)
+
+    def test_bce_ignores_temporal_kwargs(self) -> None:
+        """bce factory must accept and silently ignore temporal-specific kwargs."""
+        fn = make_load_balance_loss(
+            "bce", num_selected_heads=2, num_total_heads=4, maximum_expert_overclaim=5,
+        )
+        assert callable(fn)
+        logits, assignment_mask, active_mask = make_single_token_inputs()
+        loss = fn(logits, assignment_mask, active_mask)
+        assert loss.shape == ()
+        assert torch.isfinite(loss)
+
+    def test_returns_callable_for_temporal_overcapacity(self) -> None:
+        """Factory must return a callable for loss_type='temporal_overcapacity'."""
+        fn = make_load_balance_loss(
+            "temporal_overcapacity",
+            num_selected_heads=1, num_total_heads=4, maximum_expert_overclaim=5,
+        )
+        assert callable(fn)
+        logits, assignment_mask, active_mask = make_single_token_inputs()
+        loss = fn(logits, assignment_mask, active_mask)
+        assert loss.shape == ()
+        assert torch.isfinite(loss)
+
 
 # ---------------------------------------------------------------------------
 # TestFormulas
@@ -400,9 +448,8 @@ class TestBatchCorrectness:
 class TestGradientIsolation:
     """Verify that gradients flow to logits but not assignment_mask.
 
-    logits is constructed by the caller as logits.detach() + expert_bias, so the
-    only differentiable path into the loss is through expert_bias. assignment_mask
-    comes from discrete TopK selections and carries no gradient.
+    logits must receive gradient; assignment_mask must not. assignment_mask comes
+    from discrete TopK selections and carries no gradient.
     """
 
     def _test_isolation(self, loss_type: str) -> None:
@@ -434,3 +481,182 @@ class TestGradientIsolation:
     def test_bce_gradient_flows_to_logits_only(self) -> None:
         """bce_loss must propagate gradient to logits; assignment_mask is blocked."""
         self._test_isolation("bce")
+
+
+
+# ---------------------------------------------------------------------------
+# TestTemporalOvercapacityFormulas
+# ---------------------------------------------------------------------------
+
+class TestTemporalOvercapacityFormulas:
+    """Verify the temporal_overcapacity formulation against hand-calculated expected values.
+
+    All tests go through make_load_balance_loss to exercise the full factory path.
+    Each test uses a small tensor where imbalance state is fully determined by inspection,
+    and the expected loss is derived analytically from the formula.
+    """
+
+    def test_no_violations_loss_is_zero(self) -> None:
+        """Loss must be exactly zero when no head exceeds its allowed trajectory."""
+        # B=1, N=3, L=2, K=1, C=10. Head 0 always selected. All active.
+        # Max prior count = 2; threshold ≥ 10 at every position → no imbalance.
+        assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
+        logits = torch.zeros(1, 3, 2)
+        active_mask = torch.ones(1, 3, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "temporal_overcapacity",
+            num_selected_heads=1, num_total_heads=2, maximum_expert_overclaim=10,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_one_violating_expert(self) -> None:
+        """Must compute correct loss moment for a single violating head."""
+        # B=1, N=3, L=2, K=1, C=0. Head 0 always selected. All active.
+        # S_excl (exclusive cumsum): [0, 1, 2]; threshold M*S_excl+C: [0, 0.5, 1.0]
+        # n=0: prior=[0,0], 0>0? No.
+        # n=1: prior=[1,0], 1>0.5? Yes → violation; loss_moment=2.0/1−0.0/1=2.0.
+        # n=2: prior=[2,0], 2>1.0? Yes → violation; loss_moment=2.0/1−0.0/1=2.0.
+        # gated = [0, 2.0, 2.0]; active_count=3; Expected loss = 4.0 / 3.
+        assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
+        logits = torch.tensor([[[2.0, 0.0], [2.0, 0.0], [2.0, 0.0]]])
+        active_mask = torch.ones(1, 3, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "temporal_overcapacity",
+            num_selected_heads=1, num_total_heads=2, maximum_expert_overclaim=0,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(4.0 / 3.0, abs=1e-5)
+
+    def test_multiple_violating_experts(self) -> None:
+        """Must average loss moment across multiple violating heads."""
+        # B=1, N=4, L=3, K=2, C=0. Heads 0,1 always selected. All active.
+        # S_excl: [0, 1, 2, 3]; threshold M*S_excl (M=2/3): [0, 2/3, 4/3, 2.0]
+        # n=0: prior=[0,0,0], no violations.
+        # n=1: prior=[1,1,0], 1>2/3? Yes for heads 0,1 → both violate.
+        # n=2: prior=[2,2,0], 2>4/3? Yes for heads 0,1 → both violate.
+        # n=3: prior=[3,3,0], 3>2.0? Yes for heads 0,1 → both violate.
+        # Each firing position: violation_count=2, non_overloaded_count=1 (head 2).
+        # loss_moment = (3.0+1.0)/2 − 0.0/1 = 2.0 at every firing position.
+        # gated = [0, 2.0, 2.0, 2.0]; active_count=4; Expected loss = 6.0 / 4 = 1.5.
+        assignment_mask = torch.tensor([[
+            [1.0, 1.0, 0.0], [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0], [1.0, 1.0, 0.0],
+        ]])  # (1, 4, 3)
+        logits = torch.tensor([[
+            [3.0, 1.0, 0.0], [3.0, 1.0, 0.0],
+            [3.0, 1.0, 0.0], [3.0, 1.0, 0.0],
+        ]])  # (1, 4, 3)
+        active_mask = torch.ones(1, 4, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "temporal_overcapacity",
+            num_selected_heads=2, num_total_heads=3, maximum_expert_overclaim=0,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(1.5, abs=1e-5)
+
+    def test_inactive_tokens_excluded(self) -> None:
+        """Dead tokens must not contribute to prior counts or batch reduction."""
+        # B=1, N=4, L=2, K=1, C=0. Token n=1 inactive. Head 0 in assignment_mask for all n.
+        # active_float=[1,0,1,1]; dead n=1 is excluded from active_assignments.
+        # S_excl (exclusive): [0, 1, 1, 2] (n=1 dead, does not increment count).
+        # prior[head0]: [0, 1, 1, 2] (only active assignments before each position).
+        # threshold M*S_excl (M=0.5): [0, 0.5, 0.5, 1.0]
+        # n=0: 0>0? No. n=1: 1>0.5? Yes — but dead, gated to 0 by active_float.
+        # n=2: 1>0.5? Yes → violation; loss_moment=2.0. n=3: 2>1.0? Yes → violation.
+        # gated = [0, 0, 2.0, 2.0]; active_count=3; Expected loss = 4.0 / 3.
+        assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
+        logits = torch.tensor([[[2.0, 0.0], [2.0, 0.0], [2.0, 0.0], [2.0, 0.0]]])
+        active_mask = torch.tensor([[True, False, True, True]])
+        loss_fn = make_load_balance_loss(
+            "temporal_overcapacity",
+            num_selected_heads=1, num_total_heads=2, maximum_expert_overclaim=0,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(4.0 / 3.0, abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# TestTemporalOvercapacityGradient
+# ---------------------------------------------------------------------------
+
+class TestTemporalOvercapacityGradient:
+    """Verify gradient paths for the temporal_overcapacity formulation."""
+
+    def test_gradient_flows_to_logits(self) -> None:
+        """logits must receive a finite gradient after backward."""
+        # Uses the one-violating-expert scenario to guarantee non-zero loss.
+        logits = torch.tensor(
+            [[[2.0, 0.0], [2.0, 0.0], [2.0, 0.0]]], requires_grad=True,
+        )
+        assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
+        active_mask = torch.ones(1, 3, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "temporal_overcapacity",
+            num_selected_heads=1, num_total_heads=2, maximum_expert_overclaim=0,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+        loss.backward()
+
+        assert logits.grad is not None, "logits must receive gradient"
+        assert torch.isfinite(logits.grad).all(), "logits gradient must be finite"
+
+    def test_assignment_mask_receives_no_gradient(self) -> None:
+        """assignment_mask must not receive gradient — it comes from discrete TopK."""
+        logits = torch.tensor(
+            [[[2.0, 0.0], [2.0, 0.0], [2.0, 0.0]]], requires_grad=True,
+        )
+        assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
+        active_mask = torch.ones(1, 3, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "temporal_overcapacity",
+            num_selected_heads=1, num_total_heads=2, maximum_expert_overclaim=0,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+        loss.backward()
+
+        assert assignment_mask.grad is None, "assignment_mask must not receive gradient"
+
+
+# ---------------------------------------------------------------------------
+# TestTemporalOvercapacityCompile
+# ---------------------------------------------------------------------------
+
+class TestTemporalOvercapacityCompile:
+    """Verify the temporal_overcapacity factory callable is compatible with torch.compile."""
+
+    def test_compile_forward_backward(self, device: str) -> None:
+        """torch.compile must run forward and backward without error on CUDA."""
+        if device == "cpu":
+            pytest.skip("Compile test requires CUDA")
+
+        torch.manual_seed(0)
+        B, N, L = 1, 4, 2
+        logits = torch.randn(B, N, L, device=device, requires_grad=True)
+        assignment_mask = torch.zeros(B, N, L, device=device)
+        assignment_mask[:, :, 0] = 1.0
+        active_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+        loss_fn = make_load_balance_loss(
+            "temporal_overcapacity",
+            num_selected_heads=1, num_total_heads=L, maximum_expert_overclaim=0,
+        )
+
+        compiled = torch.compile(loss_fn, fullgraph=True, dynamic=False)
+        loss = compiled(logits, assignment_mask, active_mask)
+        loss.backward()
+
+        assert logits.grad is not None
