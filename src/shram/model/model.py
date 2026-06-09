@@ -138,7 +138,7 @@ class ShramModel(nn.Module):
             "last_hidden_state": hidden_states,
             "past_key_values": cache,
             "hidden_states": all_hidden_states,
-            "load_balance_loss": total_load_balance_loss,
+            "load_balance_loss": total_load_balance_loss/num_layers,
             "max_vio": max_vio,
             "logit_std": total_logit_std / num_layers,
         }
