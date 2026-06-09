@@ -106,7 +106,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 26.A — Restore Coupled Routing
 - [X] Unit 26.B — Temporal Overcapacity Loss
 - [X] Unit 26.C — Temporal Overcapacity Integration
-- [ ] Unit 26 — Final Audit
+- [ ] Unit 27 — Final Audit
 
 ---
 
@@ -3211,7 +3211,7 @@ All token/expert assignments are considered independently for each sequence in t
 - $a_{b, n,l}\in\{0,1\}$ indicate whether expert $l$ is selected by TopK at position $n$ in batch $b$  
 - $d_{b, n} \in\{0,1\}$ indicates whether a token in a batch $b$ was active or not (active=1). 
 - $c_{b, n,l}=\sum_{t<n} d_{b, t} a_{b,t,l}.$ is the number of experts selected cumulatively and exclusively up to token $n$ for expert $l$ in batch $b$. This can be vectorized using a cumsum.
-- $S_{b, n} = \sum_{t<=n} d_{b, t}$, the count of unmasked (active) tokens up to a given position.  
+- $S_{b, n} = \sum_{t<n} d_{b, t}$, the count of unmasked (active) tokens up to a given position.  
 - $K$ be the number of experts selected per token.  
 - $L$ be the total number of experts.  
 - $C$ be the permitted excess above ideal allocation.  

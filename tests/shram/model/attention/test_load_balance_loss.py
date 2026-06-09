@@ -516,10 +516,11 @@ class TestTemporalOvercapacityFormulas:
     def test_one_violating_expert(self) -> None:
         """Must compute correct loss moment for a single violating head."""
         # B=1, N=3, L=2, K=1, C=0. Head 0 always selected. All active.
-        # n=2: prior=[2,0], S=3, threshold=1.5 → head 0 violates (2 > 1.5).
-        # violation_count=1, non_overloaded_count=1 (head 1).
-        # loss_moment[n=2] = 2.0/1 − 0.0/1 = 2.0; active_count=3.
-        # Expected loss = 2.0 / 3.
+        # S_excl (exclusive cumsum): [0, 1, 2]; threshold M*S_excl+C: [0, 0.5, 1.0]
+        # n=0: prior=[0,0], 0>0? No.
+        # n=1: prior=[1,0], 1>0.5? Yes → violation; loss_moment=2.0/1−0.0/1=2.0.
+        # n=2: prior=[2,0], 2>1.0? Yes → violation; loss_moment=2.0/1−0.0/1=2.0.
+        # gated = [0, 2.0, 2.0]; active_count=3; Expected loss = 4.0 / 3.
         assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
         logits = torch.tensor([[[2.0, 0.0], [2.0, 0.0], [2.0, 0.0]]])
         active_mask = torch.ones(1, 3, dtype=torch.bool)
@@ -531,15 +532,19 @@ class TestTemporalOvercapacityFormulas:
         loss = loss_fn(logits, assignment_mask, active_mask)
 
         assert loss.shape == ()
-        assert loss.item() == pytest.approx(2.0 / 3.0, abs=1e-5)
+        assert loss.item() == pytest.approx(4.0 / 3.0, abs=1e-5)
 
     def test_multiple_violating_experts(self) -> None:
         """Must average loss moment across multiple violating heads."""
         # B=1, N=4, L=3, K=2, C=0. Heads 0,1 always selected. All active.
-        # n=3: prior=[3,3,0], S=4, threshold=4*(2/3)≈2.667 → heads 0,1 both violate.
-        # violation_count=2, non_overloaded_count=1 (head 2).
-        # loss_moment[n=3] = (3.0+1.0)/2 − 0.0/1 = 2.0; active_count=4.
-        # Expected loss = 2.0 / 4 = 0.5.
+        # S_excl: [0, 1, 2, 3]; threshold M*S_excl (M=2/3): [0, 2/3, 4/3, 2.0]
+        # n=0: prior=[0,0,0], no violations.
+        # n=1: prior=[1,1,0], 1>2/3? Yes for heads 0,1 → both violate.
+        # n=2: prior=[2,2,0], 2>4/3? Yes for heads 0,1 → both violate.
+        # n=3: prior=[3,3,0], 3>2.0? Yes for heads 0,1 → both violate.
+        # Each firing position: violation_count=2, non_overloaded_count=1 (head 2).
+        # loss_moment = (3.0+1.0)/2 − 0.0/1 = 2.0 at every firing position.
+        # gated = [0, 2.0, 2.0, 2.0]; active_count=4; Expected loss = 6.0 / 4 = 1.5.
         assignment_mask = torch.tensor([[
             [1.0, 1.0, 0.0], [1.0, 1.0, 0.0],
             [1.0, 1.0, 0.0], [1.0, 1.0, 0.0],
@@ -557,16 +562,18 @@ class TestTemporalOvercapacityFormulas:
         loss = loss_fn(logits, assignment_mask, active_mask)
 
         assert loss.shape == ()
-        assert loss.item() == pytest.approx(0.5, abs=1e-5)
+        assert loss.item() == pytest.approx(1.5, abs=1e-5)
 
     def test_inactive_tokens_excluded(self) -> None:
         """Dead tokens must not contribute to prior counts or batch reduction."""
         # B=1, N=4, L=2, K=1, C=0. Token n=1 inactive. Head 0 in assignment_mask for all n.
-        # With n=1 dead, prior counts at n=3 reflect only n=0 and n=2: prior[n=3,head0]=2.
-        # S[n=3]=3 (n=0,2,3 active) → threshold=1.5 → 2>1.5 → violation at n=3.
-        # n=1 fires imbalance too but active_float[n=1]=0 zeros its contribution.
-        # loss_moment[n=3] = 2.0/1 − 0.0/1 = 2.0; active_count=3.
-        # Expected loss = 2.0 / 3.
+        # active_float=[1,0,1,1]; dead n=1 is excluded from active_assignments.
+        # S_excl (exclusive): [0, 1, 1, 2] (n=1 dead, does not increment count).
+        # prior[head0]: [0, 1, 1, 2] (only active assignments before each position).
+        # threshold M*S_excl (M=0.5): [0, 0.5, 0.5, 1.0]
+        # n=0: 0>0? No. n=1: 1>0.5? Yes — but dead, gated to 0 by active_float.
+        # n=2: 1>0.5? Yes → violation; loss_moment=2.0. n=3: 2>1.0? Yes → violation.
+        # gated = [0, 0, 2.0, 2.0]; active_count=3; Expected loss = 4.0 / 3.
         assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
         logits = torch.tensor([[[2.0, 0.0], [2.0, 0.0], [2.0, 0.0], [2.0, 0.0]]])
         active_mask = torch.tensor([[True, False, True, True]])
@@ -578,7 +585,7 @@ class TestTemporalOvercapacityFormulas:
         loss = loss_fn(logits, assignment_mask, active_mask)
 
         assert loss.shape == ()
-        assert loss.item() == pytest.approx(2.0 / 3.0, abs=1e-5)
+        assert loss.item() == pytest.approx(4.0 / 3.0, abs=1e-5)
 
 
 # ---------------------------------------------------------------------------

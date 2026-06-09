@@ -220,7 +220,7 @@ def _temporal_overcapacity_loss(
     assignment_mask: torch.Tensor,
     active_mask: torch.Tensor,
     expected_tokens_rate: float,
-    maximum_expert_overclaim: float,
+    maximum_expert_overclaim: int,
 ) -> torch.Tensor:
     """Temporal overcapacity loss for MoSRAH load balancing.
 
@@ -273,15 +273,16 @@ def _temporal_overcapacity_loss(
     # allocation at n is S·M. Exceeding that by more than C triggers imbalance.
 
     active_float = active_mask.float()                                              # (B, N)
-    active_assignments = assignment_mask * active_float.unsqueeze(-1)              # (B, N, L)
-    prior_assignment_counts = (
-        active_assignments.cumsum(dim=1) - active_assignments                      # exclusive: subtract self to exclude position n
-    )                                                                               # (B, N, L)
-    cumulative_active_tokens = active_float.cumsum(dim=1)                          # (B, N)
+    active_assignments = assignment_mask * active_float.unsqueeze(-1)               # (B, N, L)
+
+    # exclusive cumsums: subtract self to exclude position n
+    prior_assignment_counts = active_assignments.cumsum(dim=1) - active_assignments  # (B, N, L)
+    cumulative_active_tokens = active_float.cumsum(dim=1) - active_float             # (B, N)
+
     maximum_supportable_assignments = (
         cumulative_active_tokens.unsqueeze(-1) * expected_tokens_rate
         + maximum_expert_overclaim
-    )                                                                               # (B, N, 1) → broadcasts to (B, N, L)
+    )                                                                                # (B, N, 1) → broadcasts to (B, N, L)
 
     # ── Mask construction ────────────────────────────────────────────────────────
     #
@@ -310,8 +311,8 @@ def _temporal_overcapacity_loss(
     # logit mass constant. That is the gradient reduces violating logits and increases
     # non-overloaded logits by equal magnitude. Routing is redirected, not suppressed.
 
-    violation_count           = violating_selection_mask.float().sum(dim=-1) + 1e-6  # (B, N)
-    non_overloaded_count      = non_overloaded_head_mask.float().sum(dim=-1) + 1e-6  # (B, N)
+    violation_count           = violating_selection_mask.float().sum(dim=-1).clamp(min=1.0)   # (B, N)
+    non_overloaded_count      = non_overloaded_head_mask.float().sum(dim=-1).clamp(min=1.0)   # (B, N)
     mean_violating_logit      = (violating_selection_mask.float() * logits).sum(dim=-1) / violation_count      # (B, N)
     mean_non_overloaded_logit = (non_overloaded_head_mask.float() * logits).sum(dim=-1) / non_overloaded_count  # (B, N)
     raw_loss                  = mean_violating_logit - mean_non_overloaded_logit                                 # (B, N)
@@ -353,7 +354,7 @@ def _bce_factory(**kwargs: object) -> Callable[[torch.Tensor, torch.Tensor, torc
 def _temporal_overcapacity_factory(
     num_selected_heads: int,
     num_total_heads: int,
-    maximum_expert_overclaim: float,
+    maximum_expert_overclaim: int,
     **kwargs: object,
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     expected_tokens_rate = num_selected_heads / num_total_heads
