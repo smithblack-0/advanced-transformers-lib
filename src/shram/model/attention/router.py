@@ -4,71 +4,38 @@ This module implements the routing mechanism described in Appendix A.Routing of 
 paper. Given an input hidden state x, the router produces two outputs used downstream:
 
   - selected_heads (I): which K of the L available expert heads each token routes to,
-    determined by TopK over capacity-balanced semantic routing scores.
+    determined by TopK over capacity-balanced routing scores.
   - routing_probs (P): the weights used for the weighted output reduction, gathered from
-    the semantic routing scores at the selected indices and renormalized to sum to 1
-    per token.
+    the routing scores at the selected indices and renormalized to sum to 1 per token.
 
-Base routing uses two learnable projection matrices and two gradient-isolated pathways:
+Routing uses a single learnable projection:
 
-  - routing_weight (A): shape (L, embedding_width). Maps input to per-head routing
-    scores. Receives gradients from task loss; balance_weight is isolated.
-  - balance_weight (B): shape (L, embedding_width). Maps input to per-head load-balance
-    correction scores. Receives gradients from load_balance_loss; routing_weight is
-    isolated.
+  - routing_weight: shape (L, embedding_width). Maps input to per-head routing scores.
+    Both task loss and load_balance_loss train this parameter directly — there is no
+    gradient isolation between the two signals.
 
-The two gradient-isolated base pathways over numerically identical values:
+This coupled design is intentional. SHRAM has an unusually strong task-level incentive
+to concentrate tokens into the same expert bucket (sparse attention only occurs among
+tokens routed to the same expert), so any indirect balancing pathway will be outlearned.
+Coupling the gradients allows the load balance loss to act with full strength directly
+on the parameter that determines routing.
 
-  - semantic_logits = A·x + (B·x).detach(): task gradients reach routing_weight;
-    balance_weight is isolated from task loss.
-  - load_balancing_logits = (A·x).detach() + B·(x.detach()): load balance gradients
-    reach balance_weight; routing_weight and x are isolated from load balance loss.
+routing_weight is nn.Parameter so that HuggingFace _init_weights does not override
+its kaiming initialization at construction.
 
-Integral routing extension (routing_mode == "integral"):
+routing_probs are computed before balance_capacity applies -1e8 sentinels. Post-capacity
+softmax would corrupt routing_probs for over-capacity experts (near-zero probability
+after masking does not reflect genuine routing preference).
 
-Standard routing is parallel — each token routes based on its own hidden state alone,
-with no direct read on what earlier tokens in the sequence have already selected.
-Integral routing adds a cumulative-sum signal that gives each token a view of the
-prior routing history within the sequence.
-
-Two additional (L, L) parameter matrices are introduced:
-
-  - routing_integral_weight (A'): shape (L, L). Maps the cumulative logit history to
-    per-head semantic corrections. Receives gradients from task loss.
-  - balance_integral_weight (B'): shape (L, L). Maps the cumulative logit history to
-    per-head load-balance corrections. Receives gradients from load_balance_loss.
-
-The cumulative history signal u is the exclusive cumsum of the base logits along the
-sequence dimension: u[n] = sum(logits[0..n-1]), shape (B, N, L). Position 0 receives
-zeros (no prior history). The same gradient isolation pattern as A/B applies:
-
-  - semantic_logits   += A'·u_semantic + (B'·u_semantic).detach()
-  - lb_logits         += (A'·u_load).detach() + B'·u_load
-
-Detaching the full B'·u_semantic result (rather than just B') mirrors the
-(B·x).detach() pattern in the base pathway and prevents double-counting the
-cumsum gradient path back to routing_weight.
-
-Both base matrices and both integral matrices are nn.Parameter so that HuggingFace
-_init_weights does not override their kaiming initialization at construction.
-
-Assignment probabilities are computed before balance_capacity applies -1e8 sentinels.
-Post-capacity softmax would invert the load balance gradient for over-capacity experts
-(near-zero probability after masking signals "increase corrections" for an already-
-overloaded expert).
-
-The router also computes and returns the load balance loss via a log-probability auxiliary
-loss (see load_balance_loss.py). The loss formulation is selected by config; the default
-is cross-entropy.
-
-The router additionally computes and returns MaxVio, a detached scalar summarising
-routing imbalance for the current forward pass:
-
-    MaxVio = mean_b( L · max_l(f_bl − 1/L) )
-
-where f_bl is the per-batch-item realised routing frequency of head l and 1/L is the
-perfectly balanced target. MaxVio is averaged over batch items and is a monitoring
-quantity only; it never contributes gradients.
+The router computes and returns:
+  - load_balance_loss: scalar auxiliary loss (see load_balance_loss.py); gradient flows
+    to routing_weight.
+  - max_vio: detached scalar summarising routing imbalance:
+      MaxVio = mean_b( L · max_l(f_bl − 1/L) )
+    where f_bl is the per-batch-item realised routing frequency of head l. Zero means
+    perfect balance; 1.0 means the most loaded head received double its fair share.
+  - logit_std: detached scalar; mean per-token standard deviation of routing logits.
+    Monitoring metric for routing sharpness.
 
 Paper ref: Appendix A.Routing, Appendix A.Load Balancing, §MaxVio.
 """
@@ -83,28 +50,23 @@ from .load_balance_loss import make_load_balance_loss, reduce_frequency_tokens
 class MoSRAHRouter(nn.Module):
     """Token-choice router for MoSRAH sparse attention.
 
-    Each input token independently selects K of the L available expert heads. Both
-    selection and routing_probs incorporate balance_weight via two gradient-isolated
-    pathways over numerically identical values. See module docstring for the
-    two-pathway architecture and the integral routing extension.
+    Each input token independently selects K of the L available expert heads.
+    A single routing projection maps input hidden states to per-head scores; both
+    task loss and load_balance_loss train this projection directly.
 
-    All four learnable matrices are nn.Parameter rather than nn.Linear so that
-    HuggingFace _init_weights does not override their kaiming initialization at
-    construction.
+    routing_weight is nn.Parameter rather than nn.Linear so that HuggingFace
+    _init_weights does not override its kaiming initialization at construction.
 
     Attributes:
-        routing_weight: A, shape (L, embedding_width). Task-loss pathway.
-        balance_weight: B, shape (L, embedding_width). Load-balance pathway.
-        routing_integral_weight: A', shape (L, L). Integral task-loss pathway.
-            Present only when ``routing_mode == "integral"``.
-        balance_integral_weight: B', shape (L, L). Integral load-balance pathway.
-            Present only when ``routing_mode == "integral"``.
-        routing_mode: ``"integral"`` or ``"default"``, from config.
+        routing_weight: Shape (L, embedding_width). Maps input hidden states to
+            per-head routing scores. Receives gradients from both task loss and
+            load_balance_loss.
 
     Args:
         config: Model configuration. Must expose ``embedding_width``,
-            ``num_mosrah_heads`` (L), ``num_selected_heads`` (K), and
-            ``routing_mode``.
+            ``num_mosrah_heads`` (L), ``num_selected_heads`` (K),
+            ``load_balance_loss_type``, ``max_bid_rounds``, ``use_cache``,
+            ``mosrah_cache_length``, and ``mosrah_packed_length``.
     """
 
     def __init__(self, config: ShramConfig) -> None:
@@ -117,40 +79,14 @@ class MoSRAHRouter(nn.Module):
             self.capacity = config.mosrah_packed_length
 
         self.max_bid_rounds = config.max_bid_rounds
-        self.routing_mode = config.routing_mode
         self._load_balance_loss = make_load_balance_loss(config.load_balance_loss_type)
 
-        # W_r (A): semantic routing matrix. Maps input (B, N, d) to per-head routing
-        # scores (B, N, L) for selection and routing_probs. nn.Parameter ensures
-        # HuggingFace _init_weights does not override kaiming initialization.
+        # Routing projection: maps input (B, N, d) to per-head routing scores (B, N, L).
+        # nn.Parameter ensures HuggingFace _init_weights does not override kaiming init.
         self.routing_weight = nn.Parameter(
             torch.empty(config.num_mosrah_heads, config.embedding_width)
         )
         nn.init.kaiming_normal_(self.routing_weight)
-
-        # W_b (B): load-balancing projection matrix. Maps input (B, N, d) to per-head
-        # correction scores (B, N, L). Receives gradients only from load_balance_loss.
-        # nn.Parameter ensures HuggingFace _init_weights does not override kaiming init.
-        self.balance_weight = nn.Parameter(
-            torch.empty(config.num_mosrah_heads, config.embedding_width)
-        )
-        nn.init.kaiming_normal_(self.balance_weight)
-
-        if self.routing_mode == "integral":
-            L = config.num_mosrah_heads
-            # A': integral semantic matrix. Maps cumulative logit history (B, N, L) to
-            # per-head semantic corrections (B, N, L). Shape (L, L). Receives gradients
-            # from task loss; balance_integral_weight is isolated from task loss.
-            # Zero-initialized so that corrections start at zero and grow from gradient
-            # updates — kaiming init produces corrections that immediately overwhelm the
-            # base routing signal via the cumsum feedback path.
-            self.routing_integral_weight = nn.Parameter(torch.zeros(L, L))
-
-            # B': integral load-balance matrix. Maps cumulative logit history (B, N, L)
-            # to per-head load-balance corrections (B, N, L). Shape (L, L). Receives
-            # gradients from load_balance_loss; routing_integral_weight is isolated.
-            # Zero-initialized for the same reason as routing_integral_weight.
-            self.balance_integral_weight = nn.Parameter(torch.zeros(L, L))
 
     @staticmethod
     def get_best_proposals(
@@ -395,226 +331,87 @@ class MoSRAHRouter(nn.Module):
         Returns:
             selected_heads: Head indices I of shape (batch, seq_len, num_selected_heads).
                 Each token's K selected head indices, determined by TopK on
-                capacity-balanced semantic scores.
+                capacity-balanced routing scores.
             routing_probs: Routing probabilities P of shape (batch, seq_len,
-                num_selected_heads). Gathered from pre-capacity semantic softmax at
+                num_selected_heads). Gathered from pre-capacity routing softmax at
                 selected_heads indices and renormalized to sum to 1 per token.
             router_diagnostics: Dict of routing feedback scalars. Keys:
                 - ``load_balance_loss``: scalar load-balance loss with gradient.
                 - ``max_vio``: detached scalar routing-imbalance summary.
-                - ``raw_logit_std``: mean per-token std of routing_logits; natural
-                  routing preference scale and baseline for interpreting bias_std.
-                - ``bias_std``: mean per-token std of balance_logits; near-zero
-                  means balance corrections have not built up relative to routing scale.
-                - ``logit_std``: mean per-token std of semantic_logits; lower than
-                  raw_logit_std means balance is flattening preferences (healthy correction).
-                - ``bias_alignment``: mean cosine similarity of routing_logits vs
-                  balance_logits per token. Negative means balance opposes routing direction
-                  (healthy correction); positive means runaway reinforcement.
+                - ``logit_std``: detached mean per-token std of routing logits;
+                  monitoring metric for routing sharpness.
         """
         B, N, _ = x.shape
         L = self.num_mosrah_heads
         K = self.num_selected_heads
 
-        logits = self._compute_routing_logits(x, active_mask)
+        # ── Phase: pre-capacity scoring ───────────────────────────────────────
+        #
+        # Establishes the clean pre-sentinel distribution that all downstream
+        # consumers draw from. logit_std must be captured here — balance_capacity
+        # injects -1e8 sentinels that would corrupt the standard deviation.
+        # routing_scores is the pre-capacity probability distribution; both the
+        # load balance signal and the final routing_probs gather from it.
+        routing_logits = self._compute_routing_logits(x)                       # (B, N, L)
+        logit_std      = routing_logits.std(dim=-1).mean().detach()
+        routing_scores = F.softmax(routing_logits, dim=-1)                     # (B, N, L)
 
-        # Diagnostic scalars characterising the two routing pathways. Must be computed
-        # before balance_capacity injects -1e8 sentinels that would corrupt std and
-        # cosine similarity. Extracted to _compute_bias_diagnostics to keep the forward
-        # body free of non-(B,N,L) reduction logic.
-        bias_diagnostics = self._compute_bias_diagnostics(
-            logits["routing_logits"], logits["balance_logits"], logits["semantic_logits"]
+        # ── Phase: load balance signal ────────────────────────────────────────
+        #
+        # The loss must observe the unconstrained routing decision — the genuine
+        # routing pressure before capacity enforcement masks any imbalance.
+        # pre_cap_heads and assignment_mask exist solely to give the loss this
+        # honest view; nothing downstream uses them.
+        pre_cap_heads   = routing_scores.topk(K, dim=-1).indices               # (B, N, K)
+        assignment_mask = torch.zeros(B, N, L, device=x.device, dtype=x.dtype)
+        assignment_mask.scatter_(-1, pre_cap_heads, 1.0)
+
+        load_balance_loss = self._load_balance_loss(
+            routing_logits, assignment_mask, active_mask
         )
 
-        # Pre-capacity semantic softmax for gathering routing_probs. Computed before
-        # balance_capacity so that gathered probabilities reflect genuine preference
-        # magnitudes rather than hard-masked sentinel values.
-        routing_scores = F.softmax(logits["semantic_logits"], dim=-1)          # (B, N, L)
-
-        # Capacity-balanced semantic logits for selection. Injects -1e8 into positions
-        # that would exceed per-expert token budget, enforcing the packing constraint.
-        balanced_semantic_logits = self.balance_capacity(
-            logits["semantic_logits"],
+        # ── Phase: capacity enforcement and final selection ───────────────────
+        #
+        # Produces the capacity-enforced routing that all downstream consumers
+        # depend on. max_vio is computed here because it measures realized routing
+        # imbalance — the actual post-capacity assignment, not the unconstrained
+        # preference. routing_probs are gathered from the pre-capacity routing_scores
+        # (not the balanced distribution) to avoid sentinel corruption — overloaded
+        # experts would otherwise receive near-zero probability regardless of genuine
+        # routing preference.
+        balanced_logits = self.balance_capacity(
+            routing_logits,
             used_capacity,
             self.capacity,
             self.num_selected_heads,
             self.max_bid_rounds,
         )
-        selection_scores = F.softmax(balanced_semantic_logits, dim=-1)    # (B, N, L)
+        selected_heads = F.softmax(balanced_logits, dim=-1).topk(K, dim=-1).indices  # (B, N, K)
 
-        # selected_heads I = TopK over capacity-balanced semantic scores.
-        selected_heads = selection_scores.topk(K, dim=-1).indices          # (B, N, K)
+        realized_mask = torch.zeros(B, N, L, device=x.device, dtype=x.dtype)
+        realized_mask.scatter_(-1, selected_heads, 1.0)
+        max_vio = self._compute_max_vio(realized_mask, active_mask, L)
 
-        # Routing probabilities P: gathered from pre-capacity semantic softmax at
-        # selected_heads positions, renormalized so they sum to 1 per token.
         gathered      = routing_scores.gather(dim=-1, index=selected_heads)    # (B, N, K)
         routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)          # P, (B, N, K)
 
-        # assignment_mask: (B, N, L) float — 1.0 at each token's K selected heads, 0 elsewhere.
-        # The discrete routing decision; no gradient flows through it. Passed alongside
-        # load_balancing_logits and active_mask to the loss and max_vio methods, which
-        # own all frequency aggregation and reduction internally.
-        assignment_mask = torch.zeros(B, N, L, device=x.device, dtype=x.dtype)
-        assignment_mask.scatter_(-1, selected_heads, 1.0)
-
-        load_balance_loss = self._load_balance_loss(
-            logits["load_balancing_logits"], assignment_mask, active_mask
-        )
-
-        # MaxVio: detached monitoring scalar averaged over batch items. Computed from
-        # the same (B, N, L) assignment_mask so frequencies are consistent with the loss.
-        max_vio = self._compute_max_vio(assignment_mask, active_mask, L)
-
         router_diagnostics = {
             "load_balance_loss": load_balance_loss,
-            "max_vio": max_vio,
-            **bias_diagnostics,
+            "max_vio":           max_vio,
+            "logit_std":         logit_std,
         }
         return selected_heads, routing_probs, router_diagnostics
 
-    @staticmethod
-    def exclusive_cumsum(logits: torch.Tensor) -> torch.Tensor:
-        """Compute the exclusive cumulative sum along the sequence dimension.
-
-        u[n] = sum(logits[0..n-1]): position n receives the accumulated sum of all
-        prior positions, giving it a read on the routing preferences expressed by
-        earlier tokens in the sequence. Position 0 always receives zeros — no prior
-        history exists at the first position.
-
-        Args:
-            logits: Shape (B, N, L). Any per-head score tensor along a sequence.
-
-        Returns:
-            Exclusive cumsum, shape (B, N, L). Same dtype and device as input.
-        """
-        shifted = torch.cat(
-            [torch.zeros_like(logits[:, :1, :]), logits[:, :-1, :]], dim=1
-        )
-        return shifted.cumsum(dim=1)
-
-    def _compute_routing_logits(
-        self, x: torch.Tensor, active_mask: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        """Compute the gradient-isolated logit pathways from input hidden states.
-
-        Base pathways (both modes):
-
-          Two gradient-isolated pathways over numerically identical values:
-          - semantic_logits = A·x + (B·x).detach(): task gradients reach routing_weight;
-            balance_weight is isolated from task loss.
-          - load_balancing_logits = (A·x).detach() + B·(x.detach()): load balance
-            gradients reach balance_weight; routing_weight and x are isolated.
-
-        Integral extension (routing_mode == "integral"):
-
-          Dead tokens are zeroed out of the logits before computing the cumsum, so
-          inactive positions do not contribute to the routing history of downstream
-          live tokens. u_semantic and u_load therefore represent history from live
-          tokens only.
-
-          u_semantic = exclusive_cumsum(semantic_logits * active_mask)    — (B, N, L)
-          u_load     = exclusive_cumsum(load_balancing_logits * active_mask) — (B, N, L)
-
-          semantic_logits       += A'·u_semantic + (B'·u_semantic).detach()
-          load_balancing_logits += (A'·u_load).detach() + B'·u_load
-
-          Detaching the full (B'·u_semantic) result mirrors the (B·x).detach() base
-          pattern: it isolates balance_integral_weight from task loss AND prevents
-          double-counting the cumsum gradient path back to routing_weight.
-          The same reasoning applies to (A'·u_load).detach() in the load-balance
-          pathway — u_load already has no path to routing_weight (routing_logits is
-          detached in load_balancing_logits), and the detach additionally blocks
-          routing_integral_weight.
+    def _compute_routing_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute per-head routing logits from input hidden states.
 
         Args:
             x: Input hidden states, shape (batch, seq_len, embedding_width).
-            active_mask: Boolean active-token mask, shape (batch, seq_len). Dead tokens
-                are excluded from the cumsum history in integral mode.
 
         Returns:
-            Dict with keys:
-            - ``routing_logits``:        A·x, shape (B, N, L).
-            - ``balance_logits``:        B·x, shape (B, N, L).
-            - ``semantic_logits``:       combined task-loss pathway, shape (B, N, L).
-            - ``load_balancing_logits``: combined load-balance pathway, shape (B, N, L).
+            Routing logits, shape (batch, seq_len, num_mosrah_heads).
         """
-        routing_logits = F.linear(x, self.routing_weight)                     # (B, N, L)
-        balance_logits = F.linear(x, self.balance_weight)                     # (B, N, L)
-        semantic_logits       = routing_logits + balance_logits.detach()
-        load_balancing_logits = routing_logits.detach() + F.linear(x.detach(), self.balance_weight)
-
-        if self.routing_mode == "integral":
-            # Zero out dead token positions before cumsum so inactive tokens do not
-            # contaminate the routing history of subsequent live tokens.
-            live = active_mask.unsqueeze(-1)                                   # (B, N, 1)
-            u_semantic = self.exclusive_cumsum(semantic_logits * live)         # (B, N, L)
-            u_load     = self.exclusive_cumsum(load_balancing_logits * live)   # (B, N, L)
-
-            # Semantic pathway: A' trains on task loss; B' term is fully detached to
-            # isolate balance_integral_weight from task loss and prevent double-counting
-            # the cumsum gradient path back to routing_weight.
-            semantic_logits = (
-                semantic_logits
-                + F.linear(u_semantic, self.routing_integral_weight)
-                + F.linear(u_semantic, self.balance_integral_weight).detach()
-            )
-
-            # Load-balance pathway: B' trains on load_balance_loss; A' term is fully
-            # detached to isolate routing_integral_weight from load_balance_loss.
-            load_balancing_logits = (
-                load_balancing_logits
-                + F.linear(u_load, self.routing_integral_weight).detach()
-                + F.linear(u_load, self.balance_integral_weight)
-            )
-
-        return {
-            "routing_logits":        routing_logits,
-            "balance_logits":        balance_logits,
-            "semantic_logits":       semantic_logits,
-            "load_balancing_logits": load_balancing_logits,
-        }
-
-    @staticmethod
-    def _compute_bias_diagnostics(
-        routing_logits: torch.Tensor,
-        balance_logits: torch.Tensor,
-        semantic_logits: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Compute detached diagnostic scalars characterising the two routing pathways.
-
-        All scalars must be computed from pre-capacity logits; balance_capacity
-        applies -1e8 sentinels that would corrupt std and cosine similarity.
-        Extracted from forward to keep the main body free of reduction logic.
-
-        Args:
-            routing_logits:  A·x, routing pathway output, shape (B, N, L).
-            balance_logits:  B·x, balance pathway output, shape (B, N, L).
-            semantic_logits: A·x + (B·x).detach(), combined signal, shape (B, N, L).
-
-        Returns:
-            Dict with keys:
-            - ``raw_logit_std``:  Mean per-token std of routing_logits. Natural
-                                   routing preference scale; reference baseline for
-                                   interpreting bias_std.
-            - ``bias_std``:       Mean per-token std of balance_logits. Near-zero
-                                   means balance corrections have not built up
-                                   relative to the routing scale.
-            - ``logit_std``:      Mean per-token std of semantic_logits. Lower than
-                                   raw_logit_std indicates balance is flattening
-                                   preferences (healthy correction signal).
-            - ``bias_alignment``: Mean cosine similarity of routing_logits vs
-                                   balance_logits per token. Range [-1, 1]. Negative
-                                   means balance opposes routing direction (healthy
-                                   correction); positive means runaway reinforcement.
-        """
-        return {
-            "raw_logit_std":  routing_logits.std(dim=-1).mean().detach(),
-            "bias_std":       balance_logits.std(dim=-1).mean().detach(),
-            "logit_std":      semantic_logits.std(dim=-1).mean().detach(),
-            "bias_alignment": F.cosine_similarity(
-                routing_logits, balance_logits, dim=-1
-            ).mean().detach(),
-        }
+        return F.linear(x, self.routing_weight)                                # (B, N, L)
 
     @staticmethod
     def _compute_max_vio(

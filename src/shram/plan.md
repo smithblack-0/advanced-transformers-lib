@@ -103,6 +103,9 @@ is being achieved, one verified unit at a time.
 - [X] Unit 25.A — Load balancing loss fix
 - [X] Unit 25.B — Balancing offset mechanism rebuild
 - [X] Unit 25.C — Integral Routing
+- [X] Unit 26.A — Restore Coupled Routing
+- [ ] Unit 26.B — Temporal Overcapacity Loss
+- [ ] Unit 26.C — Temporal Overcapacity Integration
 - [ ] Unit 26 — Final Audit
 
 ---
@@ -3287,8 +3290,8 @@ $$
   
 The maximum expert overclaim`$C$` allows short-lived semantic specialization. Sustained concentration activates the loss, while the loss automatically shuts off once the growing ideal allocation trajectory catches up with the expert’s cumulative usage.
 
-### Unit 26.A — Restore Coupled Routing  
-  
+### Unit 26.A — Restore Coupled Routing
+
 **Responsibility**  
   
 Restore the MoSRAH router to a single coupled routing pathway. Semantic training and load-balancing training must act on the same routing projection.  
@@ -3409,7 +3412,7 @@ Hard capacity balancing remains a downstream recovery mechanism. It prevents an 
   
 * `ShramConfig` exposes `maximum_expert_overclaim` as a nonnegative integer and preserves it through serialization.  It explains it is how many tokens over ideal load balancing an expert can claim before it starts taking loss. 
 * `load_balance_loss_type` defaults to `"temporal_overcapacity"`.  
-* `MoSRAHRouter` constructs the selected load-balance loss by passing `num_selected_heads`, `num_mosrah_heads`, and `maximum_expert_overclaim` to `make_load_balance_loss`.  
+* `MoSRAHRouter` constructs the selected load-balance loss by passing `num_selected_heads`, `num_mosrah_heads`, and `maximum_expert_overclaim` to `make_load_balance_loss`.  maximum_expert_overclaim is 20 by default
 * The loss continues to be computed after the logit projection but before the hard load balancing. The hard load balancing allows recovery of training from extreme upsets and limits crashes, but should not be thought of as a full solution.
 * Existing loss propagation, loss weighting, routing probabilities, capacity enforcement, and final assignment behavior remain unchanged.  
 

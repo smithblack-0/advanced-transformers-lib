@@ -418,30 +418,3 @@ class TestLoadBalanceLossType:
             small_config(load_balance_loss_type="invalid")
 
 
-# ---------------------------------------------------------------------------
-# routing_mode
-# ---------------------------------------------------------------------------
-
-class TestRoutingMode:
-    def test_routing_mode_default_is_integral(self):
-        """routing_mode must default to 'integral' — integral routing is on by default."""
-        config = ShramConfig()
-        assert config.routing_mode == "integral"
-
-    def test_routing_mode_integral_roundtrips_serialization(self):
-        """routing_mode='integral' must survive to_dict/from_dict serialisation."""
-        config = small_config(routing_mode="integral")
-        restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.routing_mode == "integral"
-
-    def test_routing_mode_default_roundtrips_serialization(self):
-        """routing_mode='default' must survive to_dict/from_dict serialisation."""
-        config = small_config(routing_mode="default")
-        restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.routing_mode == "default"
-
-    def test_routing_mode_invalid_raises(self):
-        """An unrecognised routing_mode must raise ValueError at construction."""
-        with pytest.raises(ValueError, match="routing_mode"):
-            small_config(routing_mode="invalid")
-

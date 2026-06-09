@@ -29,10 +29,7 @@ Returns a plain dict with keys:
 - "hidden_states": tuple of per-layer activations if output_hidden_states=True, else None
 - "load_balance_loss": scalar sum of per-layer SHRAM load-balance losses
 - "max_vio": detached scalar maximum routing-imbalance across all decoder layers
-- "bias_std": detached scalar mean per-layer std of the expert bias vector
-- "raw_logit_std": detached scalar mean per-layer per-token routing logit spread
-- "logit_std": detached scalar mean per-layer per-token combined (logit + bias) spread
-- "bias_alignment": detached scalar mean per-layer cosine similarity of bias vs logits
+- "logit_std": detached scalar mean per-layer per-token routing logit spread
 """
 
 import torch
@@ -109,30 +106,15 @@ class ShramModel(nn.Module):
             - ``"max_vio"``: detached scalar maximum routing-imbalance across
               all decoder layers. Zero means perfectly balanced routing across
               every layer; higher values identify the worst-case head imbalance.
-            - ``"bias_std"``: detached scalar — mean across layers of the std
-              of each layer's expert bias vector. Near-zero means corrections
-              have not built up; large relative to ``raw_logit_std`` means the
-              bias dominates routing.
-            - ``"raw_logit_std"``: detached scalar — mean across layers of the
-              per-token routing logit spread before bias addition. Baseline
-              natural routing preference scale.
             - ``"logit_std"``: detached scalar — mean across layers of the
-              per-token combined (logit + bias) spread. Lower than
-              ``raw_logit_std`` indicates healthy flattening; higher indicates
-              amplification.
-            - ``"bias_alignment"``: detached scalar — mean across layers of the
-              per-token cosine similarity between the expert bias vector and the
-              routing logits. Negative is healthy correction; positive is
-              runaway feedback.
+              per-token routing logit spread. Monitoring metric for routing
+              sharpness.
         """
         hidden_states = inputs_embeds
         all_hidden_states = (hidden_states,) if output_hidden_states else None
         total_load_balance_loss = inputs_embeds.new_zeros(())
         max_vio = inputs_embeds.new_zeros(())
-        total_bias_std = inputs_embeds.new_zeros(())
-        total_raw_logit_std = inputs_embeds.new_zeros(())
         total_logit_std = inputs_embeds.new_zeros(())
-        total_bias_alignment = inputs_embeds.new_zeros(())
 
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache.layers[layer_idx]
@@ -144,10 +126,7 @@ class ShramModel(nn.Module):
             )
             total_load_balance_loss = total_load_balance_loss + layer_diagnostics["load_balance_loss"]
             max_vio = torch.maximum(max_vio, layer_diagnostics["max_vio"])
-            total_bias_std = total_bias_std + layer_diagnostics["bias_std"]
-            total_raw_logit_std = total_raw_logit_std + layer_diagnostics["raw_logit_std"]
             total_logit_std = total_logit_std + layer_diagnostics["logit_std"]
-            total_bias_alignment = total_bias_alignment + layer_diagnostics["bias_alignment"]
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -161,8 +140,5 @@ class ShramModel(nn.Module):
             "hidden_states": all_hidden_states,
             "load_balance_loss": total_load_balance_loss,
             "max_vio": max_vio,
-            "bias_std": total_bias_std / num_layers,
-            "raw_logit_std": total_raw_logit_std / num_layers,
             "logit_std": total_logit_std / num_layers,
-            "bias_alignment": total_bias_alignment / num_layers,
         }
