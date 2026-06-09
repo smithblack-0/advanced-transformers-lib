@@ -17,7 +17,7 @@ Invariants verified:
 - dead outer tokens do not affect load_balance_loss
 - dead outer tokens do not affect max_vio
 - router forward max_vio matches _compute_max_vio called directly on all-live inputs
-- each loss mode (gshard, ce, bce) reduces routing concentration over training
+- each loss mode (gshard, ce, bce, temporal_overcapacity) reduces routing concentration over training
 """
 
 import math
@@ -35,7 +35,8 @@ from src.shram.model.attention.router import MoSRAHRouter
 
 def small_config(**kwargs) -> ShramConfig:
     """Small config valid for router tests. num_selected_heads < num_mosrah_heads
-    so TopK is genuinely sparse."""
+    so TopK is genuinely sparse. maximum_expert_overclaim=0 ensures the temporal
+    overcapacity loss fires on any imbalance, keeping gradient tests meaningful."""
     defaults = dict(
         embedding_width=64,
         num_mosrah_heads=8,
@@ -45,6 +46,7 @@ def small_config(**kwargs) -> ShramConfig:
         window_size=16,
         mlp_width=128,
         num_decoder_layers=2,
+        maximum_expert_overclaim=0,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
@@ -1225,6 +1227,29 @@ class TestLoadBalanceConvergence:
     def test_bce_reduces_concentration(self):
         """Router trained with bce loss must reach lower max_vio than at initialization."""
         self._run_convergence("bce")
+
+    def test_temporal_overcapacity_reduces_concentration(self):
+        """Router trained with temporal_overcapacity loss must reach lower max_vio than at
+        initialization. maximum_expert_overclaim=0 ensures violations fire immediately so
+        the loss is active from the first imbalanced position."""
+        torch.manual_seed(42)
+        config = small_config(
+            load_balance_loss_type="temporal_overcapacity",
+            maximum_expert_overclaim=0,
+            mosrah_overallocation_factor=2.0,
+        )
+        router = MoSRAHRouter(config)
+        x = torch.randn(self.B, self.N, config.embedding_width)
+        active_mask = torch.ones(self.B, self.N, dtype=torch.bool)
+
+        max_vio_before = self._measure_max_vio(router, x, active_mask)
+        self._train_router(router, x, active_mask, self.NUM_STEPS, self.LR)
+        max_vio_after = self._measure_max_vio(router, x, active_mask)
+
+        assert max_vio_after < max_vio_before, (
+            f"load_balance_loss ('temporal_overcapacity') must reduce concentration: "
+            f"max_vio before={max_vio_before:.4f}, after={max_vio_after:.4f}"
+        )
 
 
 # ---------------------------------------------------------------------------

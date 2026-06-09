@@ -105,7 +105,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 25.C — Integral Routing
 - [X] Unit 26.A — Restore Coupled Routing
 - [X] Unit 26.B — Temporal Overcapacity Loss
-- [ ] Unit 26.C — Temporal Overcapacity Integration
+- [X] Unit 26.C — Temporal Overcapacity Integration
 - [ ] Unit 26 — Final Audit
 
 ---

@@ -65,8 +65,8 @@ class MoSRAHRouter(nn.Module):
     Args:
         config: Model configuration. Must expose ``embedding_width``,
             ``num_mosrah_heads`` (L), ``num_selected_heads`` (K),
-            ``load_balance_loss_type``, ``max_bid_rounds``, ``use_cache``,
-            ``mosrah_cache_length``, and ``mosrah_packed_length``.
+            ``load_balance_loss_type``, ``maximum_expert_overclaim``, ``max_bid_rounds``,
+            ``use_cache``, ``mosrah_cache_length``, and ``mosrah_packed_length``.
     """
 
     def __init__(self, config: ShramConfig) -> None:
@@ -79,7 +79,12 @@ class MoSRAHRouter(nn.Module):
             self.capacity = config.mosrah_packed_length
 
         self.max_bid_rounds = config.max_bid_rounds
-        self._load_balance_loss = make_load_balance_loss(config.load_balance_loss_type)
+        self._load_balance_loss = make_load_balance_loss(
+            config.load_balance_loss_type,
+            num_selected_heads=config.num_selected_heads,
+            num_total_heads=config.num_mosrah_heads,
+            maximum_expert_overclaim=config.maximum_expert_overclaim,
+        )
 
         # Routing projection: maps input (B, N, d) to per-head routing scores (B, N, L).
         # nn.Parameter ensures HuggingFace _init_weights does not override kaiming init.
