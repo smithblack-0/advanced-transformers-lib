@@ -10,9 +10,8 @@ share the same external contract:
         active_mask:     Tensor[B, N],
     ) -> scalar Tensor
 
-    logits:          Load-balancing logits, shape (B, N, L). These are the raw
-                     pre-softmax scores from logits.detach() + expert_bias.
-                     Gradient flows to expert_bias through this tensor.
+    logits:          Pre-softmax routing scores, shape (B, N, L). Gradient flows
+                     through this tensor.
     assignment_mask: Per-token head-assignment indicators. assignment_mask[b, n, l]
                      is 1.0 if token (b, n) was assigned to head l. Dead tokens
                      should carry zero entries.
@@ -218,15 +217,28 @@ def bce_loss(
 # Factory
 # ---------------------------------------------------------------------------
 
-_LOSS_REGISTRY: dict[str, Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]] = {
-    "gshard": gshard_loss,
-    "ce": ce_loss,
-    "bce": bce_loss,
+def _gshard_factory(**kwargs: object) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    return gshard_loss
+
+
+def _ce_factory(**kwargs: object) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    return ce_loss
+
+
+def _bce_factory(**kwargs: object) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    return bce_loss
+
+
+_LOSS_REGISTRY: dict[str, Callable[..., Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]]] = {
+    "gshard": _gshard_factory,
+    "ce": _ce_factory,
+    "bce": _bce_factory,
 }
 
 
 def make_load_balance_loss(
     loss_type: str,
+    **loss_parameters: object,
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """Return a load-balance loss callable for the requested formulation.
 
@@ -238,11 +250,13 @@ def make_load_balance_loss(
             active_mask:     Tensor[B, N],
         ) -> scalar Tensor
 
-    The caller is responsible for computing logits as logits.detach() + expert_bias
-    to ensure gradient isolation to expert_bias.
+    Keyword arguments are forwarded to the selected factory. The gshard, ce, and bce
+    factories silently ignore all kwargs; this allows callers to pass loss-type-specific
+    parameters (e.g. for temporal_overcapacity) without branching on loss_type.
 
     Args:
-        loss_type: One of ``"gshard"``, ``"ce"``, or ``"bce"``.
+        loss_type:        One of ``"gshard"``, ``"ce"``, or ``"bce"``.
+        **loss_parameters: Construction-time parameters forwarded to the factory.
 
     Returns:
         Loss callable matching the shared contract.
@@ -255,4 +269,4 @@ def make_load_balance_loss(
         raise ValueError(
             f"load_balance_loss_type must be one of {supported}, got {loss_type!r}."
         )
-    return _LOSS_REGISTRY[loss_type]
+    return _LOSS_REGISTRY[loss_type](**loss_parameters)

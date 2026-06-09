@@ -265,6 +265,39 @@ class TestFactory:
         with pytest.raises(ValueError, match="load_balance_loss_type"):
             make_load_balance_loss("invalid_type")
 
+    def test_gshard_ignores_temporal_kwargs(self) -> None:
+        """gshard factory must accept and silently ignore temporal-specific kwargs."""
+        fn = make_load_balance_loss(
+            "gshard", num_selected_heads=2, num_total_heads=4, maximum_expert_overclaim=5,
+        )
+        assert callable(fn)
+        logits, assignment_mask, active_mask = make_single_token_inputs()
+        loss = fn(logits, assignment_mask, active_mask)
+        assert loss.shape == ()
+        assert torch.isfinite(loss)
+
+    def test_ce_ignores_temporal_kwargs(self) -> None:
+        """ce factory must accept and silently ignore temporal-specific kwargs."""
+        fn = make_load_balance_loss(
+            "ce", num_selected_heads=2, num_total_heads=4, maximum_expert_overclaim=5,
+        )
+        assert callable(fn)
+        logits, assignment_mask, active_mask = make_single_token_inputs()
+        loss = fn(logits, assignment_mask, active_mask)
+        assert loss.shape == ()
+        assert torch.isfinite(loss)
+
+    def test_bce_ignores_temporal_kwargs(self) -> None:
+        """bce factory must accept and silently ignore temporal-specific kwargs."""
+        fn = make_load_balance_loss(
+            "bce", num_selected_heads=2, num_total_heads=4, maximum_expert_overclaim=5,
+        )
+        assert callable(fn)
+        logits, assignment_mask, active_mask = make_single_token_inputs()
+        loss = fn(logits, assignment_mask, active_mask)
+        assert loss.shape == ()
+        assert torch.isfinite(loss)
+
 
 # ---------------------------------------------------------------------------
 # TestFormulas
@@ -400,9 +433,8 @@ class TestBatchCorrectness:
 class TestGradientIsolation:
     """Verify that gradients flow to logits but not assignment_mask.
 
-    logits is constructed by the caller as logits.detach() + expert_bias, so the
-    only differentiable path into the loss is through expert_bias. assignment_mask
-    comes from discrete TopK selections and carries no gradient.
+    logits must receive gradient; assignment_mask must not. assignment_mask comes
+    from discrete TopK selections and carries no gradient.
     """
 
     def _test_isolation(self, loss_type: str) -> None:
