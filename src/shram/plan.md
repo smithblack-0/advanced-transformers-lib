@@ -106,7 +106,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 26.A — Restore Coupled Routing
 - [X] Unit 26.B — Temporal Overcapacity Loss
 - [X] Unit 26.C — Temporal Overcapacity Integration
-- [ ] Unit 27 — Final Audit
+- [ ] Unit 27 — Causal Overcapacity Loss
+- [ ] Unit 28 — Final Audit
 
 ---
 
@@ -3438,7 +3439,177 @@ Hard capacity balancing remains a downstream recovery mechanism. It prevents an 
 * Minor telemetry updates may be needed. 
 - Other changes will likely be needed.
 
-### Unit 26 — Final Audit
+## Unit 27 — Causal Overcapacity Loss
+
+6/10/2026
+
+**Responsibility**
+
+Implement the Causal Overcapacity Loss
+
+**Context of Correctness**
+
+The last version of the load balancing loss had problems.
+
+While it did indeed initially appear that turning up the gain sufficiently was enough to balance any situation, further investigation revealed that in fact given enough training, the temporal imbalance loss would ultimately collapse at any strength. Something was wrong with the foundations of the loss itself.
+
+It turns out it was the assumption the loss could be corrected by greedy reallocation.
+
+While the temporal imbalance loss was predicated on the idea that maintaining balance was a matter of redirecting towards better options at the timestep that the imbalance occurred, this was underconsidered. It is possible for scenarios to occur in which no valid alternative move exists within the timestep, and instead the chain of action leading up to the situation has to change. Because of this flaw all training runs, eventually, settled into an equilibrium where the lack of valid moves inhibited correction.
+
+For this reason, a mere greedy temporal loss is insufficient. A causal overcapacity loss is needed instead, encouraging the model to take another path than the one that painted it into a corner. 
+
+**Mathematics**  
+  
+The Causal Overcapacity Loss is designed to correct this issue by providing feedback to the model on the pathway which reached the site of the imbalance.
+
+ Let:  
+  
+- $z_{b, n,l}$ be the routing logit for expert `$l$` at token position $n$ in batch $b$  
+- $a_{b, n,l}\in\{0,1\}$ indicate whether expert $l$ is selected by TopK at position $n$ in batch $b$  
+- $d_{b, n} \in\{0,1\}$ indicates whether a token in a batch $b$ was active or not (active=1). 
+- $c_{b, n,l}=\sum_{t<n} d_{b, t} a_{b,t,l}.$ is the number of experts selected cumulatively and exclusively up to token $n$ for expert $l$ in batch $b$. This can be vectorized using a cumsum.
+- $f_{b, n, l} =  z_{b, n, l} - \log(\sum_k exp(z_{b, n, k}))$. The log softmax over experts.
+- $S_{b, n} = \sum_{t<n} d_{b, t}$, the count of unmasked (active) tokens up to a given position.  
+- $K$ be the number of experts selected per token.  
+- $L$ be the total number of experts.  
+- $C$ be the permitted excess above ideal allocation.  
+- $B$ be the size of the batch
+
+*Imbalance Mask*
+
+Under uniform routing, the expected number of prior assignments to each expert is $\frac{nK}{L}.$ Accommodating a total of $C$ extra expert selection allows us to claim that in a well-balanced system it should be the case that
+
+$$
+c_{b, n, l} <= \frac{S_{b,n} K}{L} + C
+$$
+
+Correspondingly, we can build the imbalance mask $u_{b, n, l}$ as 
+
+$$
+u_{b, n,l} = \mathbf{1}[c_{b, n, l} > \frac{S_{b, n}K}{L} + C]
+$$
+
+A "violation" is said to occur when both the mask is imbalanced and an entry would be chosen
+
+$$
+v_{b, n, l} = u_{b, n, l} * a_{b, n, l}
+$$
+
+While a "Compliant" choice is said to occur when an element is chosen which is not imbalanced.
+
+$$
+\tilde{v}_{b, n, l} = (1-u_{b, n, l}) a_{b, n, l}
+$$
+
+Note critically and intentionally it is the case that these are not inverses of each other
+
+$$
+\neg \tilde{v}_{b,n,l} \neq v_{b, n, l} 
+$$
+
+Instead, this is the inversion only within the subset of choices that were chosen by topk.
+
+*Trajectory*
+
+The raw trajectory is given by the sum of chosen log softmax. Note that a mean-like normalization is needed to ensure blame is distributed evenly among the possible choices leading up to the violation.
+
+$$\sum_{t <= n} a_{b, t,l} d_{b, t} f_{b, t, l}$$
+
+However, this form has the unfortunate side effect of increasing the amount of change produced by gradients with increasing length. In reality, when performing gradient descent we wish to distribute this blame among the choices leading up to the current situation. As such, the mean trajectory, $k_{b, n, l}$, is stated as:
+
+$$k_{b, n, l} = \frac{1}{\sum_{t<=n} a_{b, t, l} d_{b, t}}\sum_{t <= n} a_{b, t,l} d_{b, t} f_{b, t, l}$$
+
+This trajectory will distribute blame among the choices leading up to a particular location. It also has the beneficial side effect of making different timestamps roughly comparable in magnitude.
+
+ In practice, log softmax would be computed using the relevant torch function.
+
+*Causal Overallocation Loss*
+The loss consists of two portions. One is the portion which actually performs the backpropagation, and the other is a detached reference which lets us compare how close the loss is to a relative ideal. Using $v$ masks, compliant or violating sets are selected then manipulated to provide feedback on the pathways that resulted in a violation.
+
+Note that numeric clamping is not shown in the following reduction steps, but would have to be included for any real implementation.
+
+The compliant and noncompliant groups are first gathered using masking then reduced by mean. 
+
+$$
+A_{b, n} = \frac{1}{\sum_l v_{b, n, l}} \sum_l v_{b, n, l} k_{b, n, l}
+$$
+$$
+\tilde{A}_{b, n} = \frac{1}{\sum_l \tilde{v}_{b, n, l}}\sum_l \tilde{v}_{b, n, l}*k_{b,n,l}
+$$
+
+A similar process then reduces sequence and batch dimensions
+
+$$
+D_{b} = \frac{1}{\sum_n d_{b, n}}\sum_n d_{b, n} A_{b, n}
+$$
+$$
+\tilde{D}_{b} = \frac{1}{\sum_n d_{b, n}}\sum_n d_{b, n} \tilde{A}_{b, n}
+$$
+
+$$
+E = \frac{1}{B} \sum_b D_{b}
+$$
+$$
+\tilde{E} = \frac{1}{B} \sum_b \tilde{D}_{b}
+$$
+
+The loss itself is now, with stop grad preventing gradient flow, and with a shutoff gate for when no violations are occuring, is
+
+$$
+L_{CO} = \text{any}(d_{b,n} v_{b, n, l} > 0) (E - \text{stop\_grad}(\tilde{E}))
+$$
+
+This has the interpretation of detecting how much more likely the bad pathway is on average than the good one, while having extremely robust gradients at all scales. 
+
+**Invariants**
+
+- Install the Causal Overcapacity Loss in `load_balance_loss.py`
+- Loss is accessed through mode `causal_overcapacity`
+- Default loss mode is `causal_overcapacity` in config.
+- Maintain code quality standards at level of prior entry.
+- Variable names are not as in the math, but have been mapped to sane names in the code.
+- Comment quality is high, and includes docstring for contracts, an algorithm overview, then blocks with good commentary explaining the why, not the how. Code is otherwise largely self-documentating due to organization and good variable naming.
+- Numeric clamping has been properly thought through. 
+
+Make sure to consult the imbalance overcapacity loss to see how to do this correctly.
+
+**Tests**
+
+  
+* Add tests by test addition that the temporal loss matches the Mathematics section for a series of hand-calculated example. Coverage should include:
+  * no violations;  
+  * one violating expert;  
+  * multiple violating experts;  
+  * inactive token positions.   
+* Verify eager and compiled forward and backward behavior.
+
+**Preliminary Implementation Strategy**
+
+- Most of the effort of writing this will not go on the page. It will require carefully thinking through the design ahead of time to implement to standards. Implementing a working algorithm is one of the least significant parts of the problem. Commenting and verifying correctness is much harder. 
+- log softmax should be computed with the torch kernel, not directly as stated in the math
+- Considerable effort should be spent mapping variables to sane names before coding. I would not write without a plan for variables
+- Consult frequently if help is needed.
+
+
+
+
+**Naming Decision (Chunk 2)**
+
+The original plan entry used `"causal_overcapacity"` as the access key for the mean-trajectory
+variant. During Chunk 2 it was recognised that omitting the mode suffix makes the name ambiguous
+— both variants are causal overcapacity losses distinguished only by trajectory mode. The
+concrete access patterns are:
+
+- `"causal_overcapacity_mean"` — mean trajectory mode (default); one unit of blame distributed
+  evenly across the causal chain, magnitude independent of sequence length
+- `"causal_overcapacity_sum"` — sum trajectory mode; raw accumulation, for ablation
+
+`"causal_overcapacity"` alone is not a valid type string.
+
+---
+
+## Unit 28 — Final Audit
 
 This unit can only be completed once the paper is done and results are back. It involves resolving the paper to the codebase. 
 
