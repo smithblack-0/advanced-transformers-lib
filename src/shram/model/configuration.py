@@ -91,17 +91,19 @@ class ShramConfig(PretrainedConfig):
             correctness guard — exhausting it raises ``RuntimeError``. Must be >= 1.
             Default 10.
         load_balance_loss_type: Formula used for the load-balance auxiliary loss.
-            One of ``"gshard"``, ``"ce"``, ``"bce"``, or ``"temporal_overcapacity"``.
-            ``"temporal_overcapacity"`` is the default; it fires only when an expert
-            exceeds its allowed trajectory (controlled by ``maximum_expert_overclaim``)
-            and shuts off automatically once routing is balanced, allowing it to be
-            used with a strong weight without interfering with task training during
-            balanced routing. Default ``"temporal_overcapacity"``.
+            One of ``"gshard"``, ``"ce"``, ``"bce"``, ``"temporal_overcapacity"``, or
+            ``"causal_overcapacity"``. ``"causal_overcapacity"`` (the default) attributes
+            violations to the causal trajectory that produced them — each expert
+            accumulates a running mean of its selection log-probability and the loss
+            penalises the gap between overloaded and typical trajectories. Like
+            ``"temporal_overcapacity"``, it fires only when a violation exists and shuts
+            off automatically, making it safe to weight strongly. Default
+            ``"causal_overcapacity"``.
         maximum_expert_overclaim: Maximum number of tokens an expert may receive above
-            its ideal allocation trajectory before the temporal overcapacity loss
-            fires. A value of 0 means violations trigger immediately at any imbalance.
+            its ideal allocation trajectory before either overcapacity loss fires.
+            A value of 0 means violations trigger immediately at any imbalance.
             Larger values permit short-lived semantic specialization before correction.
-            Only used when ``load_balance_loss_type="temporal_overcapacity"``.
+            Used by both ``"temporal_overcapacity"`` and ``"causal_overcapacity"``.
             Must be non-negative. Default 20.
     """
 
@@ -137,7 +139,7 @@ class ShramConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         mosrah_overallocation_factor: float = 2.0,
         max_bid_rounds: int = 10,
-        load_balance_loss_type: str = "temporal_overcapacity",
+        load_balance_loss_type: str = "causal_overcapacity",
         maximum_expert_overclaim: int = 20,
         **kwargs
     ):
@@ -185,7 +187,7 @@ class ShramConfig(PretrainedConfig):
                 f"got {maximum_expert_overclaim}."
             )
 
-        _supported_loss_types = {"gshard", "ce", "bce", "temporal_overcapacity"}
+        _supported_loss_types = {"gshard", "ce", "bce", "temporal_overcapacity", "causal_overcapacity"}
         if load_balance_loss_type not in _supported_loss_types:
             supported = ", ".join(f'"{t}"' for t in sorted(_supported_loss_types))
             raise ValueError(

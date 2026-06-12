@@ -402,10 +402,15 @@ class TestMaxBidRounds:
 # ---------------------------------------------------------------------------
 
 class TestLoadBalanceLossType:
-    def test_default_is_temporal_overcapacity(self):
-        """load_balance_loss_type must default to 'temporal_overcapacity'."""
+    def test_default_is_causal_overcapacity(self):
+        """load_balance_loss_type must default to 'causal_overcapacity'."""
         config = ShramConfig()
-        assert config.load_balance_loss_type == "temporal_overcapacity"
+        assert config.load_balance_loss_type == "causal_overcapacity"
+
+    def test_causal_overcapacity_is_valid(self):
+        """'causal_overcapacity' must be accepted without error."""
+        config = small_config(load_balance_loss_type="causal_overcapacity")
+        assert config.load_balance_loss_type == "causal_overcapacity"
 
     def test_temporal_overcapacity_is_valid(self):
         """'temporal_overcapacity' must be accepted without error."""

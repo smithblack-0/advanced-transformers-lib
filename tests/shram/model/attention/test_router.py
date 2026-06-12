@@ -17,7 +17,7 @@ Invariants verified:
 - dead outer tokens do not affect load_balance_loss
 - dead outer tokens do not affect max_vio
 - router forward max_vio matches _compute_max_vio called directly on all-live inputs
-- each loss mode (gshard, ce, bce, temporal_overcapacity) reduces routing concentration over training
+- each loss mode (gshard, ce, bce, temporal_overcapacity, causal_overcapacity) reduces routing concentration over training
 """
 
 import math
@@ -1248,6 +1248,29 @@ class TestLoadBalanceConvergence:
 
         assert max_vio_after < max_vio_before, (
             f"load_balance_loss ('temporal_overcapacity') must reduce concentration: "
+            f"max_vio before={max_vio_before:.4f}, after={max_vio_after:.4f}"
+        )
+
+    def test_causal_overcapacity_reduces_concentration(self):
+        """Router trained with causal_overcapacity loss must reach lower max_vio than at
+        initialization. maximum_expert_overclaim=0 ensures violations fire immediately so
+        the loss is active from the first imbalanced position."""
+        torch.manual_seed(42)
+        config = small_config(
+            load_balance_loss_type="causal_overcapacity",
+            maximum_expert_overclaim=0,
+            mosrah_overallocation_factor=2.0,
+        )
+        router = MoSRAHRouter(config)
+        x = torch.randn(self.B, self.N, config.embedding_width)
+        active_mask = torch.ones(self.B, self.N, dtype=torch.bool)
+
+        max_vio_before = self._measure_max_vio(router, x, active_mask)
+        self._train_router(router, x, active_mask, self.NUM_STEPS, self.LR)
+        max_vio_after = self._measure_max_vio(router, x, active_mask)
+
+        assert max_vio_after < max_vio_before, (
+            f"load_balance_loss ('causal_overcapacity') must reduce concentration: "
             f"max_vio before={max_vio_before:.4f}, after={max_vio_after:.4f}"
         )
 
