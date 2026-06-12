@@ -106,7 +106,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 26.A — Restore Coupled Routing
 - [X] Unit 26.B — Temporal Overcapacity Loss
 - [X] Unit 26.C — Temporal Overcapacity Integration
-- [ ] Unit 27 — Final Audit
+- [ ] Unit 27 — Causal Overcapacity Loss
+- [ ] Unit 28 — Final Audit
 
 ---
 
@@ -3438,7 +3439,161 @@ Hard capacity balancing remains a downstream recovery mechanism. It prevents an 
 * Minor telemetry updates may be needed. 
 - Other changes will likely be needed.
 
-### Unit 26 — Final Audit
+## Unit 27 — Causal Imbalance Loss  
+  
+6/10/2026  
+  
+**Responsibility**  
+  
+Implement the Causal Imbalance Loss  
+  
+**Context of Correctness**  
+  
+The last version of the load balancing loss had problems.  
+  
+While it did indeed initially appear that turning up the gain sufficiently was enough to balance any situation, further investigation revealed that in fact given enough training, the temporal imbalance loss would ultimately collapse at any strength. Something was wrong with the foundations of the loss itself.  
+  
+It turns out it was the assumption the loss could be corrected by greedy reallocation.  
+  
+While the temporal imbalance loss was predicated on the idea that maintaining balance was a matter of redirecting towards better options at the timestep that the imbalance occurred, this was underconsidered. It is possible for scenarios to occur in which no valid alternative move exists within the timestep, and instead the chain of action leading up to the situation has to change. Because of this flaw all training runs, eventually, settled into an equilibrium where the lack of valid moves inhibited correction.  
+  
+For this reason, a mere greedy temporal loss is insufficient. A causal overcapacity loss is needed instead, encouraging the model to take another path than the one that painted it into a corner.   
+  
+  **Mathematics**
+
+The underlying idea behind the mathematics used for this loss are to treat the sequence of actions leading up to a violation as a joint probability in logspace. We then ask to reduce the probability of the violating chain of events. Care is taken to keep the loss interpretable in terms of nats.
+
+The loss is designed to be hard. It pushes strongly when violating. But it also is designed to turn off. Once violations seize it will just stay out of the way not influencing the gradients at all.
+
+*Setup*
+
+Let Batch size be $B$, sequence length be $N$, head (expert) count be $L$, with selected experts $K$ The loss consumes:
+
+-   routing logits $z \in \mathbb{R}^{B \times N \times L}$ — the only gradient-carrying input,
+-   selection indicators $A \in {0,1}^{B \times N \times L}$, $A_{n,\ell} = 1$ iff token $n$ selected head $\ell$,
+-   active-token mask $m \in {0,1}^{B \times N}$,
+-   ideal per-head rate $M = K/L$ and integer slack $C \ge 0$.
+
+We omit the batch dimension $b$ from display for brevity. Two important additional quantities are defined here. We define the log probability across timestep n as.
+
+$$ \log p_{n,\ell} = \log \operatorname{softmax}_\ell(z_{n,\cdot}) $$
+
+These are the log probability being bid on expert (n, l). Note this does not strictly corrolate to a standard action system as by virtue of K multiple actions are taken at once. 
+
+We additionally require an accurate count of active tokens which were selected, tokens which could have been selected for normalization purposes, and a mask showing tokens which were both active and selected
+
+$$ \tilde{A}_{n,l} = m_n A_{n, l} \qquad S_{n,\ell} = \sum_{i \leq n}  \tilde{A}_{i,l}   \qquad T_n = \sum_{i \leq n} m_i. $$
+
+Note these sums should be handled carefully numerically. 
+
+*Mask Construction**
+
+A set of three very important masks are needed in order to correctly construct this loss. Those masks are the violations mask  $V_{b, n,\ell}$, the violations at positions mask $g_{b, n}$, and the violations in sequence mask $e_{b}$. They respectively indicate at what (b, n, l) we exceeded the allowed expert budget , whether at the indicated batch and sequence any violations occurred, and whether violations in the sequence occurred anywhere at all. 
+
+Conceptually, the violations mask maintains that the rate of expert usage should be proportional to $\frac{K}{L}$ when well balanced. As such ,it allows at most C extra experts from the ideal ratio $M$ before considering it a violation. 
+
+The budget at $n$ and the violation mask are
+
+$$ \tau_n = M*T_n + C$$
+$$\qquad V_{n,\ell} =\mathbb{1}\left[S_{n,\ell} > \tau_n\right] \wedge A_{n, \ell} \wedge m_{n} $$
+
+This considers violations locations of (n, l) that are overbudget and get selected on an active token. The batch gate $g_b$ then simply verifies if any violations occurred at all within the sequence
+
+$$
+g_{b, n} = \text{any}_{l}(V_{b, n, l}) \qquad e_{b} = \text{any}_{n}(g_{b, n})
+$$
+
+These masks will then be utilized to appropriately select and reduce the right elements of the trajectory. 
+
+*The Trajectory*
+
+The heart of this loss is the trajectory. The trajectory is a measure of the nats of the sequence of events involving selecting only a certain expert up to a certain point. It should be handled carefully for numeric safety. The central idea of this system is that when the trajectory leads to a violating outcome, the nats should be adjusted to make that trajectory less likely. This imposes a causal prior on the system.
+
+Each head accumulates the log-probability it was selected with, over its own selections, inclusively. It is then divided by the number of valid selections up to the point to get the nats of the sequence
+
+$$ W_{n,\ell} = \sum_{i \le n} \tilde A_{i,\ell}\log p_{i,\ell},  \qquad E_{n,\ell} = \frac{W_{n,\ell}}{\max(S_{n,\ell},1)}. $$
+
+
+$E_{n,\ell}$ is the mean log-probability with which head $\ell$ has won its selections so far. The accumulation is inclusive as part of being selected in top k is the current step's probabilities. 
+
+*Contrast*
+
+We then form a contrast between the typical nats at location n, and the violating quantities. Specifically, the contrast between the mean of the violators and the mean overall at sequence position n.
+
+$$
+Q_{n} = \frac{\sum_{l} V_{n, l} E_{n, l}}{max(\sum_{l} V_{n, l}, 1)} \qquad \bar{Q}_{n} = \frac{\sum_{l} E_{n, l}}{L}
+$$
+The core contrast driving the entire loss is then 
+
+$$
+F_{n} = Q_{n} - \bar{Q}_{n}
+$$
+
+This measures, in essence, at this step $n$ the difference between the nats of the violating set vs the typical set, and thus encourages gradients to raise the typical outcome while lowering the outcome for the violating set. This is equivalent to looking at a probability ratio between them.
+
+We now reintroduce the batch dimension for analysis and discussion during reduction
+
+$$
+F_{b, n} = Q_{b, n} - \bar{Q}_{b, n}
+$$
+
+*Reduction*
+
+Reduction is by mean and only includes comparisons with active violations. Critically, to avoid dilution of gradients, reduction only ever selects elements with actual violations to correct. 
+
+ The first reduction is into sequence form and forms a mean out of the elements with valid contrasts. If there are no violations, that comparison is not included. This prevents unfair biasing of an anchor with nothing to contrast it with.
+
+$$
+D_{b} = \frac{\sum_{n} F_{b, n}*g_{b,n}}{\text{max}(\sum_{n} g_{b, n}, 1)}
+$$
+The second stage of reduction again only includes cases where there is actually a violation. This finally produces the loss itself
+
+$$
+\mathcal{L}_{CO}  = \frac{\sum_{b} e_{b} * D_{b}}{\text{max}(\sum_{b} e_b, 1)} 
+$$
+
+*Properties**
+
+1. **Exact inactivity.** When no violations occur, the loss contributes exactly zero and produces no gradient. This allows the loss weight to be large without affecting already-valid routing behavior. This loss was designed as a strong constraint.
+2.  **Causal credit assignment.** A violation at position $n$ penalizes the selected trajectory that led expert $\ell$ to exceed capacity, not merely the local choice at $n$. Earlier selected uses of the same expert receive gradient through the cumulative log-probability term telling them to be less confident
+3. **Log-space persistence.** While a violating trajectory remains selected, reducing its log-probability does not suffer the same vanishing behavior as directly penalizing probability. The penalized selected log-probability retains a bounded, non-vanishing gradient as $p_{n,\ell}$ becomes small. This
+
+4. Exact inactivity. This loss is completely off with no gradient when no violations occur. This allows one of the required properties to be fulfilled; the loss can be extremely strong but not sabotage training.
+5. Persistence. While active, probabilities cannot get arbitrarily small to shut off gradients as we operate in logspace. 
+6. Interpretability. The loss should indicate how many nats more the violating choices tend to be. 
+
+  
+**Invariants**  
+  
+- Install the Causal Overcapacity Loss in `load_balance_loss.py`  
+- Loss is accessed through mode `causal_overcapacity`  
+- Default loss mode is `causal_overcapacity` in config.  
+- Maintain code quality standards at level of prior entry.  
+- Variable names are not as in the math, but have been mapped to sane names in the code.  
+- Comment quality is high, and includes docstring for contracts, an algorithm overview, then blocks with good commentary explaining the why, not the how. Code is otherwise largely self-documentating due to organization and good variable naming.  
+- Numeric clamping has been properly thought through.   
+  
+Make sure to consult the imbalance overcapacity loss to see how to do this correctly.  
+  
+**Tests**  
+  
+  * Add tests by test addition that the temporal loss matches the Mathematics section for a series of hand-calculated example. Coverage should include:  
+  * no violations;    
+  * one violating expert;    
+  * multiple violating experts;    
+  * inactive token positions.     
+* Verify eager and compiled forward and backward behavior.  
+  
+**Preliminary Implementation Strategy**  
+  
+- Most of the effort of writing this will not go on the page. It will require carefully thinking through the design ahead of time to implement to standards. Implementing a working algorithm is one of the least significant parts of the problem. Commenting and verifying correctness is much harder.   
+- log softmax should be computed with the torch kernel, not directly.
+- Considerable effort should be spent mapping variables to sane names before coding. I would not write without a plan for variables  
+- Consult frequently if help is needed.
+
+---
+
+## Unit 28 — Final Audit
 
 This unit can only be completed once the paper is done and results are back. It involves resolving the paper to the codebase. 
 

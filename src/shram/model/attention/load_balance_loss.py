@@ -1,6 +1,6 @@
 """Log-probability auxiliary loss functions for MoSRAH load balancing.
 
-This module provides four load-balance loss formulations, two token-reduction
+This module provides five load-balance loss formulations, two token-reduction
 helpers, and a factory that selects among the formulations. All formulations
 share the same external contract:
 
@@ -335,6 +335,139 @@ def _temporal_overcapacity_loss(
     return final_loss
 
 
+def _causal_overcapacity_loss(
+    logits: torch.Tensor,
+    assignment_mask: torch.Tensor,
+    active_mask: torch.Tensor,
+    expected_tokens_rate: float,
+    maximum_expert_overclaim: int,
+) -> torch.Tensor:
+    """Causal overcapacity loss for MoSRAH load balancing.
+
+    Penalises selected expert trajectories that exceed their ideal cumulative
+    allocation budget. A selected expert assignment is over capacity when its
+    inclusive active assignment count exceeds cumulative_active_tokens * M + C,
+    where M is the expected_tokens_rate (K/L) and C is the
+    maximum_expert_overclaim slack.
+
+    The loss consumes discrete TopK assignment structure but only routes gradients
+    through logits. It returns an fp32 scalar and is exactly inactive when no active
+    selected expert exceeds its allowed trajectory.
+
+    Args:
+        logits:                   Pre-softmax routing scores, shape (B, N, L).
+                                  Gradient flows through this tensor.
+        assignment_mask:          Per-token head-assignment indicators, shape (B, N, L).
+                                  1.0 if token (b, n) is assigned to head l.
+        active_mask:              Boolean active-token mask, shape (B, N).
+        expected_tokens_rate (M): Ideal per-head allocation rate K/L. Pre-computed
+                                  by the factory so the division is not repeated each
+                                  forward pass.
+        maximum_expert_overclaim (C): Slack above the ideal trajectory before
+                                  overcapacity fires. Larger C tolerates more deviation.
+
+    Returns:
+        Scalar fp32 loss tensor. Exactly 0.0 when no active selected expert exceeds
+        its allowed trajectory. Can be interpreted as the difference in nats of preference
+        between the violating and typical paths.
+    """
+    # ── Algorithm overview ──────────────────────────────────────────────────────
+    #
+    # Expert selections form causal trajectories through the sequence. Each trajectory
+    # is scored by the mean signed nats of the selected routing events that produced
+    # it: larger trajectory nats mean the router preferred that path more strongly.
+    #
+    # When a selected trajectory exceeds its cumulative budget, the loss forms a
+    # preference contrast between the violating trajectory field and the baseline
+    # trajectory field. Minimizing that contrast suppresses the over-preferred path
+    # while lifting alternatives through the router softmax.
+    #
+    # This is not precisely equivalent to log likihood due to the selection
+    # of multiple experts per round, but we deem this issue to be insignificant.
+
+    # ── Process setup ────────────────────────────────────────────────────────────
+    #
+    # A small amount of standardization is needed before the loss-specific trajectory
+    # logic begins. Active selected assignments define the event structure. Routing
+    # log-probabilities remain the only differentiable source and are computed in fp32
+    # so the downstream trajectory accumulation does not inherit reduced precision.
+
+    selected_assignment_mask = assignment_mask.bool()                              # (B, N, L)
+    active_assignment_mask = selected_assignment_mask & active_mask.unsqueeze(-1)   # (B, N, L)
+    routing_log_probability = F.log_softmax(logits.float(), dim=-1)                 # (B, N, L)
+
+    # ── Mask construction ────────────────────────────────────────────────────────
+    #
+    # The corrective target set is defined by active selected assignments whose
+    # inclusive count crosses the allowed causal budget. Position and sequence masks
+    # identify where that target set exists; they are reduction structure, not a
+    # separate source of gradient.
+
+    inclusive_assignment_count = active_assignment_mask.to(torch.int32).cumsum(dim=1)  # (B, N, L)
+    inclusive_active_token_count = active_mask.to(torch.int32).cumsum(dim=1)           # (B, N)
+
+    maximum_allowed_assignment_count = (
+        inclusive_active_token_count.float().unsqueeze(-1) * expected_tokens_rate
+        + maximum_expert_overclaim
+    )                                                                                 # (B, N, 1) → broadcasts to (B, N, L)
+
+    violating_assignment_mask = (                                                    # (B, N, L)
+        active_assignment_mask
+        & (inclusive_assignment_count.float() > maximum_allowed_assignment_count)
+    )
+    has_violation_at_position = violating_assignment_mask.any(dim=-1)                 # (B, N)
+    has_violation_in_sequence = has_violation_at_position.any(dim=-1)                 # (B,)
+
+    # ── Trajectory construction ──────────────────────────────────────────────────
+    #
+    # The current selection is part of the trajectory being judged, so the trajectory
+    # score is inclusive. Empty histories intentionally receive the neutral zero score;
+    # this keeps the later baseline compact without introducing a second eligibility
+    # system.
+
+    selected_trajectory_nat_sum = (                                                   # (B, N, L)
+        active_assignment_mask.float() * routing_log_probability
+    ).cumsum(dim=1)
+    mean_selected_trajectory_nats = (                                                  # (B, N, L)
+        selected_trajectory_nat_sum
+        / inclusive_assignment_count.clamp(min=1).float()
+    )
+
+    # ── Contrast construction ────────────────────────────────────────────────────
+    #
+    # This is the correction moment. The violating trajectory field is compared to
+    # the baseline trajectory field at the same sequence position, producing a signed
+    # preference contrast measured in nats.
+
+    violating_assignment_count = violating_assignment_mask.float().sum(dim=-1).clamp(min=1.0)  # (B, N)
+    mean_violating_trajectory_nats = (                                                 # (B, N)
+        (violating_assignment_mask.float() * mean_selected_trajectory_nats).sum(dim=-1)
+        / violating_assignment_count
+    )
+    mean_baseline_trajectory_nats = mean_selected_trajectory_nats.mean(dim=-1)          # (B, N)
+    contrastive_preference_nats = (                                                      # (B, N)
+        mean_violating_trajectory_nats
+        - mean_baseline_trajectory_nats
+    )
+
+    # ── Violation-only reduction ─────────────────────────────────────────────────
+    #
+    # Non-violating positions and sequences are not anchors for this loss. The scalar
+    # is an average violation contrast, not total violation mass, and the entire loss
+    # remains exactly inactive when no corrective target exists.
+
+    violation_position_count = has_violation_at_position.float().sum(dim=-1).clamp(min=1.0)  # (B,)
+    sequence_preference_nats = (                                                    # (B,)
+        (contrastive_preference_nats * has_violation_at_position.float()).sum(dim=-1)
+        / violation_position_count
+    )
+    violating_sequence_count = has_violation_in_sequence.float().sum().clamp(min=1.0)  # scalar
+    final_loss = (                                                                    # scalar
+        sequence_preference_nats * has_violation_in_sequence.float()
+    ).sum() / violating_sequence_count
+    return final_loss
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -371,11 +504,32 @@ def _temporal_overcapacity_factory(
     return _runtime
 
 
+def _causal_overcapacity_factory(
+    num_selected_heads: int,
+    num_total_heads: int,
+    maximum_expert_overclaim: int,
+    **kwargs: object,
+) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    expected_tokens_rate = num_selected_heads / num_total_heads
+    def _runtime(
+        logits: torch.Tensor,
+        assignment_mask: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return _causal_overcapacity_loss(
+            logits, assignment_mask, active_mask,
+            expected_tokens_rate=expected_tokens_rate,
+            maximum_expert_overclaim=maximum_expert_overclaim,
+        )
+    return _runtime
+
+
 _LOSS_REGISTRY: dict[str, Callable[..., Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]]] = {
     "gshard": _gshard_factory,
     "ce": _ce_factory,
     "bce": _bce_factory,
     "temporal_overcapacity": _temporal_overcapacity_factory,
+    "causal_overcapacity": _causal_overcapacity_factory,
 }
 
 
@@ -395,11 +549,11 @@ def make_load_balance_loss(
 
     Keyword arguments are forwarded to the selected factory. The gshard, ce, and bce
     factories silently ignore all kwargs; this allows callers to pass loss-type-specific
-    parameters (e.g. for temporal_overcapacity) without branching on loss_type.
+    parameters (e.g. for overcapacity losses) without branching on loss_type.
 
     Args:
-        loss_type:        One of ``"gshard"``, ``"ce"``, ``"bce"``, or
-                          ``"temporal_overcapacity"``.
+        loss_type:        One of ``"gshard"``, ``"ce"``, ``"bce"``,
+                          ``"temporal_overcapacity"``, or ``"causal_overcapacity"``.
         **loss_parameters: Construction-time parameters forwarded to the factory.
 
     Returns:

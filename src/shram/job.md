@@ -1,4 +1,4 @@
-3# Specification: advanced-transformers-lib — SHRAM Research Baseline
+# Specification: advanced-transformers-lib — SHRAM Research Baseline
 
 ## Purpose
 

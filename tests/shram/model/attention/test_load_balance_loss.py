@@ -6,11 +6,15 @@ Invariants verified:
 - reduce_probability_tokens produces correct per-batch-item mean softmax probabilities,
   carries gradient from logits, excludes dead tokens, and returns zeros on the
   all-dead-tokens edge case
-- Factory returns a callable for each of the four valid type strings
+- Factory returns a callable for each of the five valid type strings
 - Factory raises ValueError for an invalid type string
 - temporal_overcapacity_loss is exactly zero when no head exceeds its allowed trajectory
 - temporal_overcapacity_loss computes the correct correction moment for one or more violating heads
 - Inactive tokens are excluded from prior counts and batch reduction
+- causal_overcapacity_loss is exactly zero when no inclusive count exceeds its trajectory budget
+- causal_overcapacity_loss matches hand-calculated expected values for one violating expert,
+  multiple violating experts, and scenarios with inactive tokens
+- logits receives gradient after backward through causal_overcapacity_loss; assignment_mask does not
 - gshard_loss computes (1/L) * Σ_l f_bl * p_bl per batch item, averaged over B
 - ce_loss computes -(1/(L-1)) * Σ_l (1-f_bl) * log(p_bl) per batch item, averaged over B
 - bce_loss computes -(1/L) * Σ_l [(1-f_bl)*log(p_bl) + f_bl*log(1-p_bl)] per batch item,
@@ -305,6 +309,18 @@ class TestFactory:
         """Factory must return a callable for loss_type='temporal_overcapacity'."""
         fn = make_load_balance_loss(
             "temporal_overcapacity",
+            num_selected_heads=1, num_total_heads=4, maximum_expert_overclaim=5,
+        )
+        assert callable(fn)
+        logits, assignment_mask, active_mask = make_single_token_inputs()
+        loss = fn(logits, assignment_mask, active_mask)
+        assert loss.shape == ()
+        assert torch.isfinite(loss)
+
+    def test_returns_callable_for_causal_overcapacity(self) -> None:
+        """Factory must return a callable for loss_type='causal_overcapacity'."""
+        fn = make_load_balance_loss(
+            "causal_overcapacity",
             num_selected_heads=1, num_total_heads=4, maximum_expert_overclaim=5,
         )
         assert callable(fn)
@@ -652,6 +668,340 @@ class TestTemporalOvercapacityCompile:
         active_mask = torch.ones(B, N, dtype=torch.bool, device=device)
         loss_fn = make_load_balance_loss(
             "temporal_overcapacity",
+            num_selected_heads=1, num_total_heads=L, maximum_expert_overclaim=0,
+        )
+
+        compiled = torch.compile(loss_fn, fullgraph=True, dynamic=False)
+        loss = compiled(logits, assignment_mask, active_mask)
+        loss.backward()
+
+        assert logits.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# TestCausalOvercapacityFormulas
+# ---------------------------------------------------------------------------
+
+class TestCausalOvercapacityFormulas:
+    """Verify causal_overcapacity_loss against hand-calculated expected values.
+
+    These tests focus on the representative causal-overcapacity regime: the violating
+    trajectory is more preferred by the router than already-used nonviolating
+    alternatives. Expected values are closed-form calculations from the Unit 27 math,
+    not reimplementations of the tensor algorithm.
+    """
+
+    def test_no_violations_loss_is_zero(self) -> None:
+        """Loss must be exactly zero when no inclusive count exceeds its trajectory budget."""
+        # B=1, N=3, L=2, K=1, C=10. Head 0 always selected, all active.
+        # T_n=[1,2,3], tau=M*T_n+C=[10.5,11,11.5] with M=0.5.
+        # S_n_0=[1,2,3]: never exceeds tau → no violations anywhere.
+        assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
+        logits = torch.zeros(1, 3, 2)
+        active_mask = torch.ones(1, 3, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "causal_overcapacity",
+            num_selected_heads=1,
+            num_total_heads=2,
+            maximum_expert_overclaim=10,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_representative_violating_trajectory_has_positive_preference_contrast(self) -> None:
+        """Must be positive when the violating trajectory is preferred over used alternatives."""
+        # B=1, N=6, L=3, K=1, C=1.
+        #
+        # Assignments:
+        #   n0 -> head 1
+        #   n1 -> head 2
+        #   n2 -> head 0
+        #   n3 -> head 0
+        #   n4 -> head 0  # violation starts
+        #   n5 -> head 0  # violation continues
+        #
+        # With M=1/3 and C=1:
+        #   T=[1,2,3,4,5,6]
+        #   tau=T/3+1=[4/3,5/3,2,7/3,8/3,3]
+        #   S_head0=[0,0,1,2,3,4]
+        # Head 0 violates only at n4 and n5.
+        #
+        # Heads 1 and 2 are selected once with weaker trajectory nats:
+        #   a = 0 - log(exp(0) + 2*exp(-1))
+        #
+        # Head 0 is selected with stronger trajectory nats:
+        #   b = 4 - log(exp(4) + 2)
+        #
+        # At each violating position:
+        #   Q = b
+        #   Qbar = (b + a + a) / 3
+        #   F = b - Qbar = 2*(b-a)/3
+        #
+        # Both violating positions have the same contrast, so the final loss is F.
+        weak_selected_nat = 0.0 - math.log(math.exp(0.0) + 2.0 * math.exp(-1.0))
+        strong_selected_nat = 4.0 - math.log(math.exp(4.0) + 2.0)
+        expected = 2.0 * (strong_selected_nat - weak_selected_nat) / 3.0
+
+        assignment_mask = torch.tensor([[
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ]])
+        logits = torch.tensor([[
+            [-1.0, 0.0, -1.0],
+            [-1.0, -1.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ]])
+        active_mask = torch.ones(1, 6, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "causal_overcapacity",
+            num_selected_heads=1,
+            num_total_heads=3,
+            maximum_expert_overclaim=1,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        assert expected > 0.0
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(expected, abs=1e-4), (
+            f"torch={loss.item():.6f} expected={expected:.6f}"
+        )
+
+    def test_multiple_violating_trajectories_have_positive_preference_contrast(self) -> None:
+        """Must average multiple violating trajectories against used nonviolating alternatives."""
+        # B=1, N=7, L=4, K=2, C=1.
+        #
+        # Assignments:
+        #   n0,n1 -> heads 2 and 3
+        #   n2..n6 -> heads 0 and 1
+        #
+        # With M=K/L=0.5 and C=1:
+        #   tau = 0.5*T + 1
+        # Head 0 and head 1 first violate at n6:
+        #   T=7, tau=4.5, S_head0=S_head1=5.
+        #
+        # Early alternatives have weaker selected trajectory nats under uniform logits:
+        #   a = -log(4)
+        #
+        # Violating heads have stronger selected trajectory nats:
+        #   b = 6 - log(2*exp(6) + 2)
+        #
+        # At the violating position:
+        #   Q = (b+b)/2 = b
+        #   Qbar = (b+b+a+a)/4 = (b+a)/2
+        #   F = b - (b+a)/2 = (b-a)/2
+        weak_selected_nat = -math.log(4.0)
+        strong_selected_nat = 6.0 - math.log(2.0 * math.exp(6.0) + 2.0)
+        expected = (strong_selected_nat - weak_selected_nat) / 2.0
+
+        assignment_mask = torch.tensor([[
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+        ]])
+        logits = torch.tensor([[
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [6.0, 6.0, 0.0, 0.0],
+            [6.0, 6.0, 0.0, 0.0],
+            [6.0, 6.0, 0.0, 0.0],
+            [6.0, 6.0, 0.0, 0.0],
+            [6.0, 6.0, 0.0, 0.0],
+        ]])
+        active_mask = torch.ones(1, 7, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "causal_overcapacity",
+            num_selected_heads=2,
+            num_total_heads=4,
+            maximum_expert_overclaim=1,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        assert expected > 0.0
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(expected, abs=1e-4), (
+            f"torch={loss.item():.6f} expected={expected:.6f}"
+        )
+
+    def test_inactive_tokens_excluded_from_representative_positive_case(self) -> None:
+        """Dead tokens must not contribute to counts, trajectories, masks, or reduction."""
+        # Same conceptual setup as the representative positive test, but n1 is dead.
+        #
+        # Active assignments:
+        #   active n0 -> head 1
+        #   dead   n1 -> ignored, despite assignment/logits
+        #   active n2 -> head 2
+        #   active n3 -> head 0
+        #   active n4 -> head 0
+        #   active n5 -> head 0  # violation starts
+        #   active n6 -> head 0  # violation continues
+        #
+        # Active T across positions is [1,1,2,3,4,5,6].
+        # For head 0, active S is [0,0,0,1,2,3,4].
+        # With M=1/3 and C=1, head 0 violates at n5 and n6 only.
+        #
+        # The dead token must not alter the expected contrast:
+        #   F = 2*(b-a)/3
+        weak_selected_nat = 0.0 - math.log(math.exp(0.0) + 2.0 * math.exp(-1.0))
+        strong_selected_nat = 4.0 - math.log(math.exp(4.0) + 2.0)
+        expected = 2.0 * (strong_selected_nat - weak_selected_nat) / 3.0
+
+        assignment_mask = torch.tensor([[
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],  # dead token: ignored
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ]])
+        logits = torch.tensor([[
+            [-1.0, 0.0, -1.0],
+            [10.0, -10.0, -10.0],  # dead token: ignored
+            [-1.0, -1.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ]])
+        active_mask = torch.tensor([[True, False, True, True, True, True, True]])
+        loss_fn = make_load_balance_loss(
+            "causal_overcapacity",
+            num_selected_heads=1,
+            num_total_heads=3,
+            maximum_expert_overclaim=1,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        assert expected > 0.0
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(expected, abs=1e-4), (
+            f"torch={loss.item():.6f} expected={expected:.6f}"
+        )
+    def test_unused_baseline_edge_case_can_be_negative(self) -> None:
+        """Loss may be negative when the baseline is dominated by unused expert histories."""
+        # B=1, N=3, L=2, K=1, C=0. Head 0 always selected, all active.
+        # T_n=[1,2,3], tau=M*T_n=[0.5,1.0,1.5] with M=0.5.
+        # S_n_0=[1,2,3]: head 0 violates at every position.
+        #
+        # Head 1 is never selected, so its trajectory score is the empty-history zero.
+        # This is an intentional baseline edge case:
+        #   E_0 = log_p_0
+        #   E_1 = 0
+        #   Q = log_p_0
+        #   Qbar = (log_p_0 + 0) / 2
+        #   F = Q - Qbar = log_p_0 / 2
+        #
+        # Since log_p_0 < 0, the signed preference contrast is negative here.
+        log_p_0 = 1.0 - math.log(math.exp(1.0) + 1.0)
+        expected = log_p_0 / 2.0
+
+        assignment_mask = torch.tensor([[
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+        ]])
+        logits = torch.tensor([[
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+        ]])
+        active_mask = torch.ones(1, 3, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "causal_overcapacity",
+            num_selected_heads=1,
+            num_total_heads=2,
+            maximum_expert_overclaim=0,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+
+        assert expected < 0.0
+        assert loss.shape == ()
+        assert loss.item() == pytest.approx(expected, abs=1e-4), (
+            f"torch={loss.item():.6f} expected={expected:.6f}"
+        )
+
+# ---------------------------------------------------------------------------
+# TestCausalOvercapacityGradient
+# ---------------------------------------------------------------------------
+
+class TestCausalOvercapacityGradient:
+    """Verify gradient paths for the causal_overcapacity formulation."""
+
+    def test_gradient_flows_to_logits(self) -> None:
+        """logits must receive a finite gradient after backward through causal_overcapacity_loss."""
+        # Uses the one-violating-expert scenario to guarantee non-zero loss and gradient.
+        logits = torch.tensor(
+            [[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]], requires_grad=True,
+        )
+        assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
+        active_mask = torch.ones(1, 3, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "causal_overcapacity",
+            num_selected_heads=1, num_total_heads=2, maximum_expert_overclaim=0,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+        loss.backward()
+
+        assert logits.grad is not None, "logits must receive gradient"
+        assert torch.isfinite(logits.grad).all(), "logits gradient must be finite"
+
+    def test_assignment_mask_receives_no_gradient(self) -> None:
+        """assignment_mask must not receive gradient — it comes from discrete TopK."""
+        logits = torch.tensor(
+            [[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]], requires_grad=True,
+        )
+        assignment_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]])
+        active_mask = torch.ones(1, 3, dtype=torch.bool)
+        loss_fn = make_load_balance_loss(
+            "causal_overcapacity",
+            num_selected_heads=1, num_total_heads=2, maximum_expert_overclaim=0,
+        )
+
+        loss = loss_fn(logits, assignment_mask, active_mask)
+        loss.backward()
+
+        assert assignment_mask.grad is None, "assignment_mask must not receive gradient"
+
+
+# ---------------------------------------------------------------------------
+# TestCausalOvercapacityCompile
+# ---------------------------------------------------------------------------
+
+class TestCausalOvercapacityCompile:
+    """Verify the causal_overcapacity factory callable is compatible with torch.compile."""
+
+    def test_compile_forward_backward(self, device: str) -> None:
+        """torch.compile must run forward and backward without error on CUDA."""
+        if device == "cpu":
+            pytest.skip("Compile test requires CUDA")
+
+        torch.manual_seed(0)
+        B, N, L = 1, 4, 2
+        logits = torch.randn(B, N, L, device=device, requires_grad=True)
+        assignment_mask = torch.zeros(B, N, L, device=device)
+        assignment_mask[:, :, 0] = 1.0
+        active_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+        loss_fn = make_load_balance_loss(
+            "causal_overcapacity",
             num_selected_heads=1, num_total_heads=L, maximum_expert_overclaim=0,
         )
 
