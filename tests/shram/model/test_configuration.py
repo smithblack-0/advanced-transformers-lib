@@ -2,7 +2,7 @@
 
 Each test verifies a specific invariant documented in the plan. The grouping mirrors
 the invariant categories: instantiation, parameter storage, structural validation,
-rope parameters, scale property, serialisation, and router initialisation.
+rope parameters, scale property, block_length property, and serialisation.
 """
 
 import pytest
@@ -171,6 +171,15 @@ class TestStructuralValidation:
         with pytest.raises(ValueError, match="inference_sequence_length"):
             small_config(inference_sequence_length=0)
 
+    def test_num_mosrah_heads_not_divisible_by_num_selected_heads_raises(self):
+        """num_mosrah_heads must be divisible by num_selected_heads for block balancing.
+
+        Block length W = num_mosrah_heads // num_selected_heads must be an exact
+        integer; a non-zero remainder means no perfect-cover block exists.
+        """
+        with pytest.raises(ValueError, match="num_mosrah_heads must be exactly divisible"):
+            small_config(num_mosrah_heads=9, num_selected_heads=4)
+
 
 # ---------------------------------------------------------------------------
 # Rope parameter defaults
@@ -289,7 +298,6 @@ class TestSerialisation:
             window_size=64,
             rope_mode="semantic_sequence",
             head_dim=16,
-            mosrah_overallocation_factor=1.3,
         )
         restored = ShramConfig.from_dict(original.to_dict())
 
@@ -314,150 +322,38 @@ class TestSerialisation:
         assert restored.use_cache == original.use_cache
         assert restored.output_hidden_states == original.output_hidden_states
         assert restored.tie_word_embeddings == original.tie_word_embeddings
-        assert restored.mosrah_overallocation_factor == original.mosrah_overallocation_factor
-        assert restored.max_bid_rounds == original.max_bid_rounds
-        assert restored.maximum_expert_overclaim == original.maximum_expert_overclaim
 
 
 # ---------------------------------------------------------------------------
-# mosrah_overallocation_factor and mosrah_packed_length
+# block_length
 # ---------------------------------------------------------------------------
 
-class TestMosrahPackedLength:
-    def test_overallocation_factor_default(self):
-        """mosrah_overallocation_factor must default to 2.0."""
-        config = ShramConfig()
-        assert config.mosrah_overallocation_factor == 2.0
+class TestBlockLength:
+    """block_length is a computed property equal to num_mosrah_heads // num_selected_heads.
 
-    def test_overallocation_factor_stored(self):
-        config = small_config(mosrah_overallocation_factor=1.2)
-        assert config.mosrah_overallocation_factor == 1.2
+    It is the authoritative source for the routing block size W used in mechanical
+    load balancing. All consumers must read it from config rather than recomputing.
+    """
 
-    def test_overallocation_factor_exactly_one_raises(self):
-        """Values <= 1.0 must raise — a factor of exactly 1.0 provides no overflow margin."""
-        with pytest.raises(ValueError, match="mosrah_overallocation_factor"):
-            small_config(mosrah_overallocation_factor=1.0)
+    def test_block_length_correct(self):
+        """block_length must equal num_mosrah_heads // num_selected_heads."""
+        config = small_config(num_mosrah_heads=8, num_selected_heads=4)
+        assert config.block_length == 2
 
-    def test_overallocation_factor_less_than_one_raises(self):
-        with pytest.raises(ValueError, match="mosrah_overallocation_factor"):
-            small_config(mosrah_overallocation_factor=0.5)
+    def test_block_length_when_k_equals_l(self):
+        """When K == L every token selects all heads; block length must be 1."""
+        config = small_config(num_mosrah_heads=16, num_selected_heads=16)
+        assert config.block_length == 1
 
-    def test_mosrah_packed_length_correct(self):
-        """mosrah_packed_length must equal ceil(N * K / L * factor)."""
-        import math
-        config = small_config(
-            training_sequence_length=1024,
-            num_selected_heads=8,
-            num_mosrah_heads=16,
-            mosrah_overallocation_factor=1.1,
-        )
-        expected = math.ceil(1024 * 8 / 16 * 1.1)
-        assert config.mosrah_packed_length == expected
+    def test_block_length_varies_with_heads(self):
+        """block_length must reflect any valid (L, K) combination."""
+        config = small_config(num_mosrah_heads=12, num_selected_heads=4)
+        assert config.block_length == 3
 
-    def test_mosrah_packed_length_is_not_stored(self):
-        """mosrah_packed_length must be a computed property, not a stored field."""
-        config = small_config()
-        assert "mosrah_packed_length" not in config.to_dict()
+    def test_block_length_is_not_stored(self):
+        """block_length must be a computed property, not a stored field."""
+        config = small_config(num_mosrah_heads=8, num_selected_heads=4)
+        assert "block_length" not in config.to_dict()
 
-    def test_overallocation_factor_roundtrip(self):
-        """mosrah_overallocation_factor must survive to_dict/from_dict roundtrip."""
-        config = small_config(mosrah_overallocation_factor=1.25)
-        restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.mosrah_overallocation_factor == 1.25
-
-
-# ---------------------------------------------------------------------------
-# max_bid_rounds
-# ---------------------------------------------------------------------------
-
-class TestMaxBidRounds:
-    def test_default_is_ten(self):
-        """max_bid_rounds must default to 10."""
-        config = ShramConfig()
-        assert config.max_bid_rounds == 10
-
-    def test_stored(self):
-        config = small_config(max_bid_rounds=20)
-        assert config.max_bid_rounds == 20
-
-    def test_zero_raises(self):
-        """max_bid_rounds=0 must raise — at least one round is required."""
-        with pytest.raises(ValueError, match="max_bid_rounds"):
-            small_config(max_bid_rounds=0)
-
-    def test_one_is_valid(self):
-        """max_bid_rounds=1 is the minimum valid value."""
-        config = small_config(max_bid_rounds=1)
-        assert config.max_bid_rounds == 1
-
-    def test_roundtrip(self):
-        """max_bid_rounds must survive to_dict/from_dict roundtrip."""
-        config = small_config(max_bid_rounds=25)
-        restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.max_bid_rounds == 25
-
-
-# ---------------------------------------------------------------------------
-# load_balance_loss_type
-# ---------------------------------------------------------------------------
-
-class TestLoadBalanceLossType:
-    def test_default_is_causal_overcapacity(self):
-        """load_balance_loss_type must default to 'causal_overcapacity'."""
-        config = ShramConfig()
-        assert config.load_balance_loss_type == "causal_overcapacity"
-
-    def test_causal_overcapacity_is_valid(self):
-        """'causal_overcapacity' must be accepted without error."""
-        config = small_config(load_balance_loss_type="causal_overcapacity")
-        assert config.load_balance_loss_type == "causal_overcapacity"
-
-    def test_temporal_overcapacity_is_valid(self):
-        """'temporal_overcapacity' must be accepted without error."""
-        config = small_config(load_balance_loss_type="temporal_overcapacity")
-        assert config.load_balance_loss_type == "temporal_overcapacity"
-
-    def test_roundtrip(self):
-        """load_balance_loss_type must survive to_dict/from_dict serialisation."""
-        config = small_config(load_balance_loss_type="bce")
-        restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.load_balance_loss_type == "bce"
-
-    def test_invalid_type_raises(self):
-        """An unrecognised load_balance_loss_type must raise ValueError at construction."""
-        with pytest.raises(ValueError, match="load_balance_loss_type"):
-            small_config(load_balance_loss_type="invalid")
-
-
-# ---------------------------------------------------------------------------
-# maximum_expert_overclaim
-# ---------------------------------------------------------------------------
-
-class TestMaximumExpertOverclaim:
-    def test_default_is_twenty(self):
-        """maximum_expert_overclaim must default to 20."""
-        config = ShramConfig()
-        assert config.maximum_expert_overclaim == 20
-
-    def test_stored(self):
-        """maximum_expert_overclaim passed at construction must be stored as given."""
-        config = small_config(maximum_expert_overclaim=5)
-        assert config.maximum_expert_overclaim == 5
-
-    def test_zero_is_valid(self):
-        """maximum_expert_overclaim=0 must be accepted — violations fire immediately."""
-        config = small_config(maximum_expert_overclaim=0)
-        assert config.maximum_expert_overclaim == 0
-
-    def test_negative_raises(self):
-        """Negative maximum_expert_overclaim must raise ValueError at construction."""
-        with pytest.raises(ValueError, match="maximum_expert_overclaim"):
-            small_config(maximum_expert_overclaim=-1)
-
-    def test_roundtrip(self):
-        """maximum_expert_overclaim must survive to_dict/from_dict serialisation."""
-        config = small_config(maximum_expert_overclaim=7)
-        restored = ShramConfig.from_dict(config.to_dict())
-        assert restored.maximum_expert_overclaim == 7
 
 

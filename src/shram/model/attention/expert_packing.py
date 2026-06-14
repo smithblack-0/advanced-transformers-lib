@@ -284,8 +284,9 @@ def _enforce_no_overflow(tokens_per_expert: torch.Tensor, packed_length: int) ->
 
     This check fires when the number of tokens assigned to any expert in any batch
     item exceeds mosrah_packed_length. When that limit is exceeded, the packed buffer
-    is too small to hold all assignments and data would be dropped. Increase
-    mosrah_overallocation_factor in ShramConfig to resolve.
+    is too small to hold all assignments and data would be dropped. Reduce the input
+    sequence length or increase training_sequence_length (for training) or
+    inference_sequence_length (for inference) in ShramConfig to resolve.
 
     Args:
         tokens_per_expert: Per-expert token counts, shape (B, num_experts).
@@ -295,15 +296,17 @@ def _enforce_no_overflow(tokens_per_expert: torch.Tensor, packed_length: int) ->
         torch._assert_async(
             tokens_per_expert.max() <= packed_length,
             "Expert packing overflow: expert bucket exceeds mosrah_packed_length. "
-            "Increase mosrah_overallocation_factor in ShramConfig.",
+            "Reduce sequence length or increase training_sequence_length / "
+            "inference_sequence_length in ShramConfig.",
         )
     else:
         max_count = tokens_per_expert.max().item()
         if max_count > packed_length:
             raise RuntimeError(
                 "Expert packing overflow: at least one expert bucket contains more "
-                "tokens than mosrah_packed_length allows. Increase "
-                "mosrah_overallocation_factor in ShramConfig to resolve.\n"
+                "tokens than mosrah_packed_length allows. Reduce sequence length or "
+                "increase training_sequence_length / inference_sequence_length in "
+                "ShramConfig to resolve.\n"
                 f"Packed length: {packed_length}\n"
                 f"Head lengths: {tokens_per_expert}\n"
             )

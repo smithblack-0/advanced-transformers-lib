@@ -72,9 +72,11 @@ class SHRAMHybridLayer(nn.Module):
         if cache is None:
             sliding_window_cache = None
             mosrah_cache = None
+            router_cache = None
         else:
             sliding_window_cache = cache.sliding_window_cache
             mosrah_cache = cache.mosrah_cache
+            router_cache = cache.router_cache
 
         # -------------------------------------------------------------------
         # Both attention paths must see the same model-space hidden state for
@@ -93,6 +95,7 @@ class SHRAMHybridLayer(nn.Module):
             position_ids=position_ids,
             active_mask=active_mask,
             cache=mosrah_cache,
+            router_cache=router_cache,
         )
 
         # -------------------------------------------------------------------

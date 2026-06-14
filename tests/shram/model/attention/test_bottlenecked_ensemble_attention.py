@@ -31,7 +31,7 @@ def small_config(**kwargs) -> ShramConfig:
         num_decoder_layers=2,
         num_sliding_window_heads=2,
         num_mosrah_heads=2,
-        num_selected_heads=4,
+        num_selected_heads=1,
         head_dim=4,
         window_size=4,
         rope_mode="main_sequence",

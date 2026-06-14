@@ -1,90 +1,69 @@
 """Token-choice router for the MoSRAH sparse attention path.
 
-This module implements the routing mechanism described in Appendix A.Routing of the
-paper. Given an input hidden state x, the router produces two outputs used downstream:
+This module implements mechanically load-balanced routing for MoSRAH. Given an
+input hidden state x, the router produces two outputs used downstream:
 
-  - selected_heads (I): which K of the L available expert heads each token routes to,
-    determined by TopK over capacity-balanced routing scores.
-  - routing_probs (P): the weights used for the weighted output reduction, gathered from
-    the routing scores at the selected indices and renormalized to sum to 1 per token.
+  - selected_heads (I): which K of the L available expert heads each token
+    routes to, determined by a block-balanced causal solver.
+  - routing_probs (P): the weights used for the weighted output reduction,
+    gathered from the softmax routing scores at the selected indices and
+    renormalized to sum to 1 per token.
 
 Routing uses a single learnable projection:
 
-  - routing_weight: shape (L, embedding_width). Maps input to per-head routing scores.
-    Both task loss and load_balance_loss train this parameter directly — there is no
-    gradient isolation between the two signals.
+  - routing_weight: shape (L, embedding_width). Maps input to per-head routing
+    scores. Task loss trains this parameter through routing_probs; regret_loss
+    trains it to prefer expert assignments at positions of peak preference.
 
-This coupled design is intentional. SHRAM has an unusually strong task-level incentive
-to concentrate tokens into the same expert bucket (sparse attention only occurs among
-tokens routed to the same expert), so any indirect balancing pathway will be outlearned.
-Coupling the gradients allows the load balance loss to act with full strength directly
-on the parameter that determines routing.
+Block-balanced routing partitions the sequence into non-overlapping blocks of
+W = L/K tokens. Within each block every expert is assigned to exactly one token,
+guaranteeing perfect load balance by construction. The L % K == 0 compatibility
+constraint (enforced in ShramConfig) makes W an exact integer.
 
-routing_weight is nn.Parameter so that HuggingFace _init_weights does not override
-its kaiming initialization at construction.
+Selection is causal within each block: at each of the W steps the current
+token chooses its K experts from those not yet claimed by earlier tokens in
+the same block. All W steps execute in parallel across blocks and batch via
+a fully-unrolled Python for loop, keeping the compiled graph flat.
 
-routing_probs are computed before balance_capacity applies -1e8 sentinels. Post-capacity
-softmax would corrupt routing_probs for over-capacity experts (near-zero probability
-after masking does not reflect genuine routing preference).
-
-The router computes and returns:
-  - load_balance_loss: scalar auxiliary loss (see load_balance_loss.py); gradient flows
-    to routing_weight.
-  - max_vio: detached scalar summarising routing imbalance:
-      MaxVio = mean_b( L · max_l(f_bl − 1/L) )
-    where f_bl is the per-batch-item realised routing frequency of head l. Zero means
-    perfect balance; 1.0 means the most loaded head received double its fair share.
-  - logit_std: detached scalar; mean per-token standard deviation of routing logits.
-    Monitoring metric for routing sharpness.
-
-Paper ref: Appendix A.Routing, Appendix A.Load Balancing, §MaxVio.
+Paper ref: Appendix A.Routing.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..cache.router_cache import RouterCache
 from ..configuration import ShramConfig
-from .load_balance_loss import make_load_balance_loss, reduce_frequency_tokens
+
 
 class MoSRAHRouter(nn.Module):
     """Token-choice router for MoSRAH sparse attention.
 
-    Each input token independently selects K of the L available expert heads.
-    A single routing projection maps input hidden states to per-head scores; both
-    task loss and load_balance_loss train this projection directly.
+    Each input token independently selects K of the L available expert heads
+    through a block-balanced causal solver. Within each block of W = L/K
+    consecutive tokens every expert is used exactly once, giving perfect load
+    balance by construction.
 
     routing_weight is nn.Parameter rather than nn.Linear so that HuggingFace
     _init_weights does not override its kaiming initialization at construction.
 
     Attributes:
         routing_weight: Shape (L, embedding_width). Maps input hidden states to
-            per-head routing scores. Receives gradients from both task loss and
-            load_balance_loss.
+            per-head routing scores.
+        block_length: Tokens per routing block W = L / K. Within each block
+            every expert is used exactly once.
 
     Args:
         config: Model configuration. Must expose ``embedding_width``,
-            ``num_mosrah_heads`` (L), ``num_selected_heads`` (K),
-            ``load_balance_loss_type``, ``maximum_expert_overclaim``, ``max_bid_rounds``,
-            ``use_cache``, ``mosrah_cache_length``, and ``mosrah_packed_length``.
+            ``num_mosrah_heads`` (L), ``num_selected_heads`` (K), and
+            ``block_length`` (W).
     """
 
     def __init__(self, config: ShramConfig) -> None:
         super().__init__()
-        self.num_mosrah_heads = config.num_mosrah_heads
+        self.num_mosrah_heads   = config.num_mosrah_heads
         self.num_selected_heads = config.num_selected_heads
-        if config.use_cache:
-            self.capacity = config.mosrah_cache_length
-        else:
-            self.capacity = config.mosrah_packed_length
-
-        self.max_bid_rounds = config.max_bid_rounds
-        self._load_balance_loss = make_load_balance_loss(
-            config.load_balance_loss_type,
-            num_selected_heads=config.num_selected_heads,
-            num_total_heads=config.num_mosrah_heads,
-            maximum_expert_overclaim=config.maximum_expert_overclaim,
-        )
+        self.block_length       = config.block_length
 
         # Routing projection: maps input (B, N, d) to per-head routing scores (B, N, L).
         # nn.Parameter ensures HuggingFace _init_weights does not override kaiming init.
@@ -93,317 +72,185 @@ class MoSRAHRouter(nn.Module):
         )
         nn.init.kaiming_normal_(self.routing_weight)
 
-    @staticmethod
-    def get_best_proposals(
-            tensor: torch.Tensor,
-            dim: int,
-            n: int | torch.Tensor,
-            capacity_scalar: int,
-    ) -> torch.Tensor:
-        """Return a boolean mask selecting the top-n entries along dim.
-
-        Uses topk to select exactly min(n_per_slice, dim_length) True entries
-        per slice along dim. Unlike a threshold comparison, this never
-        over-selects under tied logit values, which occurs when padding tokens
-        contribute identical scores to multiple expert slots.
-
-        Args:
-            tensor: Input tensor. Higher values rank first.
-            dim: Dimension to select along.
-            n: Per-slice selection count. Scalar int or tensor broadcastable
-               to tensor with dim removed. Slices where n=0 produce all-False
-               outputs.
-            capacity_scalar: Static upper bound on n; used to derive topk k as
-               min(tensor.shape[dim], capacity_scalar). Must be a Python int
-           for compile compatibility.
-
-        Returns:
-            Boolean mask of the same shape as tensor.
-        """
-        positive_dim = dim % tensor.ndim
-        dim_length = tensor.shape[positive_dim]
-        k = min(dim_length, capacity_scalar)
-
-        topk_indices = tensor.topk(k, dim=dim).indices
-
-        # Rank tensor broadcast-compatible with topk_indices: rank r along dim
-        # corresponds to the (r+1)-th highest value in that slice.
-        rank_shape = [1] * tensor.ndim
-        rank_shape[positive_dim] = k
-        ranks = torch.arange(k, device=tensor.device, dtype=torch.long).view(rank_shape)
-
-        # element_included: True where this rank falls within the per-slice budget.
-        # For scalar n all k ranks satisfy rank < n (since k = min(dim_length, n)).
-        # For tensor n per-slice budgets differ; rank >= n[slice] yields False,
-        # correctly excluding excess slots including those with n=0.
-        if isinstance(n, int):
-            element_included = ranks < n
-        else:
-            element_included = ranks < n.unsqueeze(positive_dim)
-
-        # Allocate from explicit logical shape rather than using zeros_like. This keeps
-        # the output mask tied to tensor.shape, not to any stride/layout metadata carried
-        # by tensor from earlier view operations or compiler lowering.
-        mask = torch.zeros(
-            tuple(tensor.shape),
-            device=tensor.device,
-            dtype=torch.bool,
-        )
-
-        # Materialize the scatter source shape explicitly. This avoids passing a
-        # broadcast-view source into scatter while preserving the same logical rule:
-        # every selected top-k index receives True iff its rank is within budget.
-        scatter_values = torch.broadcast_to(element_included, topk_indices.shape)
-        mask = mask.scatter(dim, topk_indices, scatter_values)
-        return mask
-
-    @staticmethod
-    def _check_bidding_converged(acceptances: torch.Tensor,
-                                 min_choices: int,
-                                 max_rounds: int) -> None:
-        """Raise if the bidding loop exhausted max_rounds without satisfying all tokens.
-
-        Args:
-            acceptances: bool tensor of shape (B, N, L) indicating what experts L accepted
-                what tokens.
-            min_choices: Convergence has been reached if acceptances are such that a sum along
-                N always has at least min_choices choices.
-            max_rounds: The iteration ceiling that was applied, for the error message. Used
-                for reporting
-        """
-        msg = (
-            f"balance_capacity bidding did not converge within {max_rounds} rounds. "
-            f"Increase mosrah_overallocation_factor or max_bid_rounds."
-        )
-        converged = (acceptances.sum(dim=-1) >= min_choices).all()
-        torch._assert_async(converged, msg)
-
-    @classmethod
-    def _run_bidding(
-            cls,
-            logits: torch.Tensor,
-            remaining_capacity: int | torch.Tensor,
-            min_choices: int,
-            max_rounds: int,
-            capacity_scalar: int,
-    ) -> torch.Tensor:
-        """Deferred-acceptance (Gale-Shapley) bidding solver for joint capacity enforcement.
-
-        Tokens propose experts in descending preference order; experts provisionally
-        accept their top-``remaining_capacity`` proposed tokens each round. Proposals
-        are monotone (never retracted), so once all tokens are satisfied, subsequent
-        iterations are no-ops. Runs unconditionally for exactly ``max_rounds`` iterations
-        to keep the compiled graph flat and free of data-dependent control flow.
-
-        Both the column bound (per-expert token count ≤ remaining_capacity) and the
-        row bound (per-token expert count ≥ min_choices) are satisfied simultaneously
-        on the returned mask by construction.
-
-        Args:
-            logits: Routing scores of shape (B, N, L).
-            remaining_capacity: Per-expert token budget. Scalar int for training;
-                (B, L) tensor for inference.
-            min_choices: Minimum experts each token must have accepted (K).
-            max_rounds: Number of iterations to run. Convergence is checked after
-                all rounds via ``_check_bidding_converged``; raises if not met.
-            capacity_scalar: Static upper bound on remaining_capacity, passed to
-                ``get_mask`` as the topk k bound for the acceptance step.
-
-        Returns:
-            accepted: (B, N, L) bool — True at positions accepted by the solver.
-        """
-        proposals   = torch.zeros_like(logits, dtype=torch.bool)
-        acceptances = torch.zeros_like(logits, dtype=torch.bool)
-
-        for _ in range(max_rounds):
-            # ── token proposal step ───────────────────────────────────────────
-            #
-            # Tokens with fewer than min_choices accepted experts propose their
-            # next-best unproposed expert(s). The deficit determines how many new
-            # proposals each token makes; satisfied tokens propose nothing
-            # (deficit = 0 → get_mask returns all-False). Proposals are monotone:
-            # once all tokens are satisfied, subsequent iterations are no-ops.
-            accepted_per_token = acceptances.sum(dim=-1)           # (B, N)
-            choices_deficit = (min_choices - accepted_per_token).clamp_min(0)
-
-            unproposed_logits = logits.masked_fill(proposals, float('-inf'))
-            new_proposals = cls.get_best_proposals(
-                unproposed_logits, dim=-1, n=choices_deficit, capacity_scalar=min_choices,
-            )
-            proposals = proposals | new_proposals
-
-            # ── expert acceptance step ────────────────────────────────────────
-            #
-            # Each expert accepts its top-remaining_capacity proposed tokens.
-            # Acceptances are recomputed from scratch each round so that a
-            # stronger new proposal can displace a weaker prior one.
-            proposed_logits = logits.masked_fill(~proposals, float('-inf'))
-            acceptances = cls.get_best_proposals(
-                proposed_logits, dim=-2, n=remaining_capacity, capacity_scalar=capacity_scalar,
-            )
-
-        return acceptances
-
-    @classmethod
-    def balance_capacity(
-            cls,
-            logits: torch.Tensor,
-            used_capacity: torch.Tensor | None,
-            capacity: int,
-            min_choices: int,
-            max_rounds: int,
-            mask_value: float = -1e8,
-    ) -> torch.Tensor:
-        """Mask logits so both capacity constraints hold simultaneously on the output.
-
-        Two constraints must hold:
-          - Column bound: per-expert unmasked token count ≤ remaining_capacity.
-          - Row bound:    per-token unmasked expert count ≥ min_choices.
-
-        A training fast path is attempted before the bidding solver:
-
-        1. Training with N ≤ capacity: return logits unchanged.
-        2. Bidding: deferred-acceptance solver guaranteeing both bounds simultaneously.
-
-        Args:
-            logits: Routing scores of shape (B, N, L).
-            used_capacity: Tokens already accumulated per expert, shape (B, L).
-                ``None`` during training (full capacity available).
-            capacity: Maximum tokens per expert (from config).
-            min_choices: Minimum experts each token must retain (K).
-            max_rounds: Bidding iteration ceiling (from config.max_bid_rounds).
-            mask_value: Value written to masked positions. Default -1e8.
-
-        Returns:
-            Logits with unavailable positions set to ``mask_value``, shape (B, N, L).
-        """
-        # ── Algorithm overview ────────────────────────────────────────────────
-        #
-        # Problem: mask (B, N, L) logits so that both the column bound (each
-        # expert receives at most remaining_capacity tokens) and the row bound
-        # (each token retains at least min_choices expert choices) hold
-        # simultaneously. Satisfying either constraint greedily can violate the
-        # other, requiring a joint solver for the hard case.
-        #
-        # Approach: deferred-acceptance (Gale-Shapley) bidding. Each round,
-        # tokens that still lack min_choices accepted experts propose their
-        # next-best unproposed expert. Each expert then provisionally accepts its
-        # top-remaining_capacity proposed tokens, potentially displacing weaker
-        # prior acceptances. Proposals are monotone (never retracted). The loop
-        # terminates when every token has min_choices accepted experts or
-        # max_bid_rounds is exhausted (RuntimeError in the latter case).
-        #
-        # Training fast path — when N ≤ capacity and all experts start empty,
-        # no expert can overflow regardless of routing. No masking is needed.
-
-        # Training fast path: N ≤ capacity with empty experts → no overflow possible.
-        if used_capacity is None and logits.shape[-2] <= capacity:
-            return logits
-
-        # Compute per-expert remaining budget.
-        # Training (N > capacity path): scalar — all experts start with full capacity.
-        # Inference: subtract already-accumulated tokens; clamp prevents negatives
-        #            when rounding causes used_capacity to slightly exceed capacity.
-        if used_capacity is None:
-            remaining_capacity = capacity
-        else:
-            remaining_capacity = (capacity - used_capacity).clamp(min=0)  # (B, L)
-
-        # Bidding solver: jointly satisfies column and row bounds. Runs under
-        # no_grad because the boolean mask is a hard routing decision and must
-        # not accumulate gradient memory.
-        with torch.no_grad():
-            final_mask = cls._run_bidding(logits, remaining_capacity,
-                                          min_choices, max_rounds, capacity)
-            cls._check_bidding_converged(final_mask, min_choices, max_rounds)
-        return logits.masked_fill(~final_mask, mask_value)
-
     def forward(
         self,
         x: torch.Tensor,
         active_mask: torch.Tensor,
-        used_capacity: torch.Tensor | None
+        router_cache: RouterCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Route input tokens to K expert heads each and compute routing probabilities.
 
         Args:
             x: Input hidden states of shape (batch, seq_len, embedding_width).
             active_mask: Current-chunk active mask of shape (batch, seq_len), where
-                True means the token is semantically live. Dead tokens do not
-                contribute to routing frequencies, load_balance_loss, or max_vio.
-            used_capacity: Used for capacity management during inference, missing during training.
+                True marks a semantically live token. Dead tokens do not contribute
+                to regret_loss or logit_regret.
 
         Returns:
             selected_heads: Head indices I of shape (batch, seq_len, num_selected_heads).
-                Each token's K selected head indices, determined by TopK on
-                capacity-balanced routing scores.
+                Each token's K selected head indices from the block-balanced solver.
             routing_probs: Routing probabilities P of shape (batch, seq_len,
-                num_selected_heads). Gathered from pre-capacity routing softmax at
-                selected_heads indices and renormalized to sum to 1 per token.
-            router_diagnostics: Dict of routing feedback scalars. Keys:
-                - ``load_balance_loss``: scalar load-balance loss with gradient.
-                - ``max_vio``: detached scalar routing-imbalance summary.
-                - ``logit_std``: detached mean per-token std of routing logits;
-                  monitoring metric for routing sharpness.
+                num_selected_heads). Gathered from the pre-balance softmax at
+                selected_heads and renormalized to sum to 1 per token.
+            router_diagnostics: Dict of routing scalars:
+                - ``regret_loss``: gradient-carrying mean regret, mean of
+                  max(p_max_active − p_chosen, 0) over live (B, num_blocks, L)
+                  entries. In [0, 1]. Zero when every expert is assigned at its
+                  peak-preference token within the block.
+                - ``logit_regret``: detached logit-space regret; same formula
+                  applied to routing logits rather than softmax probabilities.
+                  In [0, ∞). Monitoring only.
+                - ``logit_std``: detached mean per-token std of routing logits.
         """
+        # ── Algorithm overview ──────────────────────────────────────────────────────
+        #
+        # Problem: each token independently selects its top-K heads with no knowledge
+        # of what other tokens in the same sequence will choose. Independent selection
+        # means a single popular head can be chosen by every token while another is
+        # never used — statistics-based corrections (auxiliary losses, bias vectors)
+        # can only push routing probabilistically and have proven unstable when tuned
+        # strongly enough to prevent degeneracy.
+        #
+        # Approach: the compatibility constraint E % K == 0 (enforced in ShramConfig)
+        # makes W = E / K an exact integer. A block of W consecutive tokens contains
+        # exactly W × K = E selection slots — one per expert. Enforcing that each
+        # expert is used exactly once per block makes the block perfectly balanced by
+        # construction, eliminating any need for auxiliary losses or correction steps.
+        # Enforcement is causal: at each of the W steps the current position picks its
+        # K experts from those not yet claimed earlier in the same block, by masking
+        # claimed experts with -inf before top-K. All W steps run simultaneously across
+        # blocks and batch via a Python for loop that is fully unrolled at compile time.
+
         B, N, _ = x.shape
         L = self.num_mosrah_heads
         K = self.num_selected_heads
+        W = self.block_length
 
-        # ── Phase: pre-capacity scoring ───────────────────────────────────────
+        # ── Phase: pre-balance scoring ─────────────────────────────────────────
         #
-        # Establishes the clean pre-sentinel distribution that all downstream
-        # consumers draw from. logit_std must be captured here — balance_capacity
-        # injects -1e8 sentinels that would corrupt the standard deviation.
-        # routing_scores is the pre-capacity probability distribution; both the
-        # load balance signal and the final routing_probs gather from it.
+        # Establishes the clean routing distribution before any -inf masking.
+        # logit_std is captured here because the block solver's masking would
+        # corrupt the standard deviation. routing_scores is used both for
+        # regret_loss and for the final routing_probs.
         routing_logits = self._compute_routing_logits(x)                       # (B, N, L)
         logit_std      = routing_logits.std(dim=-1).mean().detach()
         routing_scores = F.softmax(routing_logits, dim=-1)                     # (B, N, L)
 
-        # ── Phase: load balance signal ────────────────────────────────────────
+        # ── Phase: block-balanced causal selection ─────────────────────────────
         #
-        # The loss must observe the unconstrained routing decision — the genuine
-        # routing pressure before capacity enforcement masks any imbalance.
-        # pre_cap_heads and assignment_mask exist solely to give the loss this
-        # honest view; nothing downstream uses them.
-        pre_cap_heads   = routing_scores.topk(K, dim=-1).indices               # (B, N, K)
-        assignment_mask = torch.zeros(B, N, L, device=x.device, dtype=x.dtype)
-        assignment_mask.scatter_(-1, pre_cap_heads, 1.0)
-
-        load_balance_loss = self._load_balance_loss(
-            routing_logits, assignment_mask, active_mask
-        )
-
-        # ── Phase: capacity enforcement and final selection ───────────────────
+        # Three execution modes, distinguished by router_cache and sequence length:
         #
-        # Produces the capacity-enforced routing that all downstream consumers
-        # depend on. max_vio is computed here because it measures realized routing
-        # imbalance — the actual post-capacity assignment, not the unconstrained
-        # preference. routing_probs are gathered from the pre-capacity routing_scores
-        # (not the balanced distribution) to avoid sentinel corruption — overloaded
-        # experts would otherwise receive near-zero probability regardless of genuine
-        # routing preference.
-        balanced_logits = self.balance_capacity(
-            routing_logits,
-            used_capacity,
-            self.capacity,
-            self.num_selected_heads,
-            self.max_bid_rounds,
-        )
-        selected_heads = F.softmax(balanced_logits, dim=-1).topk(K, dim=-1).indices  # (B, N, K)
+        # Training (router_cache is None): the full sequence is available. All W
+        # steps of the block solver run simultaneously across every block in the
+        # sequence. No cache interaction.
+        #
+        # Prefill (router_cache is not None, N > 1): identical to training, but
+        # the partial last-block state is written to the cache so decode steps can
+        # continue within the same block without a gap.
+        #
+        # Decode (router_cache is not None, N == 1): one token arrives at a known
+        # position within the current block. The cached used_in_block mask is
+        # applied before TopK to enforce the one-usage-per-block contract, then
+        # the cache is updated in-place with this step's selections.
 
-        realized_mask = torch.zeros(B, N, L, device=x.device, dtype=x.dtype)
-        realized_mask.scatter_(-1, selected_heads, 1.0)
-        max_vio = self._compute_max_vio(realized_mask, active_mask, L)
+        if router_cache is not None and N == 1:
+            # ── Decode mode ───────────────────────────────────────────────────
+            #
+            # Single token; block position and claimed-expert state come from the
+            # cache. Treating this as a one-token, one-step block means the regret
+            # computation downstream sees a (B, 1, 1, K) assignment tensor and
+            # produces exactly zero regret, which is correct: with only one active
+            # token per "block" there is no alternative assignment with higher
+            # preference.
+            used_in_block = router_cache.get_used_in_block()                   # (B, L)
+            step_logits   = routing_logits[:, 0, :]                            # (B, L)
+            available     = step_logits.masked_fill(used_in_block, float('-inf'))
+            step_heads    = available.topk(K, dim=-1).indices                  # (B, K)
 
+            router_cache.update_decode(step_heads)
+
+            selected_heads = step_heads.unsqueeze(1)                           # (B, 1, K)
+        else:
+            # ── Training / prefill mode ───────────────────────────────────────
+            #
+            # The full N-token sequence is available. Padding extends it to a
+            # multiple of W; padded tokens occupy the tail of the last block and
+            # never consume experts needed by real tokens because the real tokens
+            # preceding them have already had their pick each step. The pad is
+            # discarded after the solver.
+            num_blocks = (N + W - 1) // W
+            N_pad      = num_blocks * W
+            pad_len    = N_pad - N
+
+            if pad_len > 0:
+                padded_logits = torch.cat(
+                    [routing_logits, routing_logits.new_zeros(B, pad_len, L)], dim=1
+                )                                                               # (B, N_pad, L)
+            else:
+                padded_logits = routing_logits
+
+            blocked_logits = padded_logits.view(B, num_blocks, W, L)           # (B, blk, W, L)
+
+            # used_in_block tracks which experts have been claimed within each block.
+            # No gradient here — expert availability is a hard structural constraint,
+            # not a differentiable quantity. Gradient flows through routing_probs.
+            used_in_block   = torch.zeros(B, num_blocks, L, dtype=torch.bool, device=x.device)
+            step_heads_list = []
+
+            for step in range(W):
+                step_logits = blocked_logits[:, :, step, :]                    # (B, blk, L)
+
+                # Claimed experts receive -inf so top-K never selects them.
+                available  = step_logits.masked_fill(used_in_block, float('-inf'))
+                step_heads = available.topk(K, dim=-1).indices                 # (B, blk, K)
+                step_heads_list.append(step_heads)
+
+                # Mark the K chosen experts as unavailable for the rest of this block.
+                used_in_block = used_in_block.scatter(-1, step_heads, True)
+
+            # Stack W steps and reshape to (B, N_pad, K), then unpad.
+            selected_heads_blocked = torch.stack(step_heads_list, dim=2)       # (B, blk, W, K)
+            selected_heads         = selected_heads_blocked.view(B, N_pad, K)[:, :N, :]  # (B, N, K)
+
+            if router_cache is not None:
+                # Prefill: persist the partial last-block state so decode steps
+                # that follow can continue within the same block.
+                router_cache.update_prefill(selected_heads_blocked, N)
+
+        # ── Phase: regret loss ─────────────────────────────────────────────────
+        #
+        # Regret measures how much routing preference was sacrificed at each expert
+        # assignment relative to the peak active preference within the same block.
+        # A non-zero regret at expert l in block bl means some other active token
+        # in that block would have preferred expert l more than the one assigned.
+        # Minimising regret trains the router to save experts for the tokens that
+        # want them most.
+        #
+        # Decode mode returns zeros: regret is only defined over complete W-token
+        # blocks, and a single decode step is not a complete block. Backward is
+        # never called during inference so the zero is a correct no-op.
+        if router_cache is not None and N == 1:
+            regret_loss  = routing_logits.new_zeros(())
+            logit_regret = routing_logits.new_zeros(()).detach()
+        else:
+            regret_loss, logit_regret = self._compute_regret(
+                routing_scores,
+                routing_logits,
+                selected_heads_blocked,
+                active_mask,
+            )
+
+        # ── Phase: routing probabilities ────────────────────────────────────────
+        #
+        # Gathered from the pre-balance routing_scores to reflect genuine routing
+        # preference; renormalized so they sum to 1 per token.
         gathered      = routing_scores.gather(dim=-1, index=selected_heads)    # (B, N, K)
-        routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)          # P, (B, N, K)
+        routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)          # (B, N, K)
 
         router_diagnostics = {
-            "load_balance_loss": load_balance_loss,
-            "max_vio":           max_vio,
-            "logit_std":         logit_std,
+            "regret_loss":  regret_loss,
+            "logit_regret": logit_regret,
+            "logit_std":    logit_std,
         }
         return selected_heads, routing_probs, router_diagnostics
 
@@ -419,31 +266,117 @@ class MoSRAHRouter(nn.Module):
         return F.linear(x, self.routing_weight)                                # (B, N, L)
 
     @staticmethod
-    def _compute_max_vio(
-        assignment_mask: torch.Tensor,
+    def _compute_regret(
+        routing_scores: torch.Tensor,
+        routing_logits: torch.Tensor,
+        selected_heads_blocked: torch.Tensor,
         active_mask: torch.Tensor,
-        num_heads: int,
-    ) -> torch.Tensor:
-        """Compute the MaxVio routing-imbalance scalar.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute regret_loss and logit_regret from a completed block assignment.
 
-        MaxVio = mean_b( L · max_l(f_bl − 1/L) ), where f_bl is the per-batch-item
-        realised routing frequency of head l. Uses reduce_frequency_tokens for consistent
-        per-batch-item frequency computation with dead tokens excluded, matching how the
-        load balance loss computes frequencies. A value of zero indicates perfect balance;
-        a value of 0.5 means the most overloaded head in the average batch item received
-        50% more routed tokens than ideal.
+        Regret at expert l in block bl = max(p_max_active − p_chosen, 0), where
+        p_max_active is the highest routing probability any active token holds for
+        expert l within the block, and p_chosen is the routing probability of the
+        token actually assigned to expert l (0 if that token is dead).
 
-        The result is detached — MaxVio is a monitoring scalar and must not contribute
-        gradients to any parameter.
+        regret_loss is the mean over live (batch, block, expert) triples. A block is
+        live iff it contains at least one active token; all L experts in a live block
+        contribute. Result is in [0, 1].
+
+        logit_regret applies the same formula to routing_logits and is returned
+        detached — it is a monitoring scalar only, in [0, ∞).
 
         Args:
-            assignment_mask: Per-token head-assignment indicators, shape (B, N, L).
-            active_mask:     Boolean active-token mask, shape (B, N).
-            num_heads:       Total number of MoSRAH heads L.
+            routing_scores:         Softmax routing probabilities, shape (B, N, L).
+                                    Gradient flows through this tensor into regret_loss.
+            routing_logits:         Pre-softmax routing logits, shape (B, N, L).
+                                    Used only for the detached logit_regret.
+            selected_heads_blocked: Expert assignments from the block solver,
+                                    shape (B, num_blocks, W, K). Block geometry
+                                    (num_blocks, W) is derived from this shape.
+            active_mask:            Boolean live-token mask, shape (B, N).
 
         Returns:
-            Detached scalar MaxVio tensor.
+            regret_loss:   Gradient-carrying scalar in [0, 1].
+            logit_regret:  Detached scalar in [0, ∞).
         """
-        f_bl = reduce_frequency_tokens(assignment_mask, active_mask)                   # (B, L)
-        per_item_max_vio = num_heads * (f_bl - 1.0 / num_heads).max(dim=-1).values    # (B,)
-        return per_item_max_vio.mean().detach()
+        B, num_blocks, W, _K = selected_heads_blocked.shape
+        L   = routing_scores.shape[-1]
+        N   = routing_scores.shape[1]
+        N_pad = num_blocks * W
+
+        # ── Reshape into block form ─────────────────────────────────────────
+        #
+        # Block geometry is read from selected_heads_blocked — no recomputation
+        # needed here. Padded tail positions receive zero scores and False
+        # activity; they do not contribute to any block metric.
+        if N_pad > N:
+            pad_len = N_pad - N
+            scores_blocked = torch.cat(
+                [routing_scores, routing_scores.new_zeros(B, pad_len, L)], dim=1
+            ).view(B, num_blocks, W, L)                                        # (B, nb, W, L)
+            logits_blocked = torch.cat(
+                [routing_logits, routing_logits.new_zeros(B, pad_len, L)], dim=1
+            ).view(B, num_blocks, W, L)                                        # (B, nb, W, L)
+            active_blocked = torch.cat(
+                [active_mask, active_mask.new_zeros(B, pad_len)], dim=1
+            ).view(B, num_blocks, W)                                           # (B, nb, W)
+        else:
+            scores_blocked = routing_scores.view(B, num_blocks, W, L)
+            logits_blocked = routing_logits.view(B, num_blocks, W, L)
+            active_blocked = active_mask.view(B, num_blocks, W)
+
+        active_float = active_blocked.float()                                  # (B, nb, W)
+        block_active = active_blocked.any(dim=-1)                              # (B, nb)
+
+        # ── Assignment mask ─────────────────────────────────────────────────
+        #
+        # One-hot indicator of which token was assigned to each expert. Block
+        # balance guarantees exactly one entry per (b, bl, l) triple, so
+        # summing over W recovers exactly one score value per expert.
+        assignment_mask = scores_blocked.new_zeros(B, num_blocks, W, L)
+        assignment_mask.scatter_(dim=-1, index=selected_heads_blocked, value=1.0)
+                                                                               # (B, nb, W, L)
+
+        # ── Prob regret (gradient flows through routing_scores) ─────────────
+        #
+        # p_chosen: routing score at the assigned token, gated by active_float
+        # so dead assignments contribute 0 — the expert accrues full regret
+        # against the active maximum rather than no penalty.
+        # p_max: peak routing score over active tokens; dead tokens zeroed before
+        # max (safe because softmax outputs are non-negative).
+        p_chosen = (assignment_mask * active_float.unsqueeze(-1) * scores_blocked).sum(dim=2)
+                                                                               # (B, nb, L)
+        p_max    = (active_float.unsqueeze(-1) * scores_blocked).max(dim=2).values
+                                                                               # (B, nb, L)
+
+        regret = (p_max - p_chosen).clamp(min=0.0)                            # (B, nb, L)
+
+        # Mean over live (B, num_blocks, L) entries. Clamped to 1 for the
+        # all-dead edge case where the numerator is already 0.
+        num_live    = block_active.float().sum()                               # scalar
+        regret_loss = (
+            block_active.float().unsqueeze(-1) * regret
+        ).sum() / num_live.mul(L).clamp(min=1.0)
+
+        # ── Logit regret (detached monitoring) ──────────────────────────────
+        #
+        # Same formula applied to routing_logits. Dead tokens cannot be zeroed
+        # before max (logits may be negative), so they are masked to -inf;
+        # dead blocks are replaced with 0 before subtraction. Detached so it
+        # never influences any parameter during backward.
+        logit_chosen = (
+            assignment_mask * active_float.unsqueeze(-1) * logits_blocked
+        ).sum(dim=2)                                                           # (B, nb, L)
+
+        logit_max = logits_blocked.masked_fill(
+            ~active_blocked.unsqueeze(-1), float('-inf')
+        ).max(dim=2).values                                                    # (B, nb, L)
+        logit_max = logit_max.masked_fill(~block_active.unsqueeze(-1), 0.0)
+
+        logit_regret = (
+            block_active.float().unsqueeze(-1) * (logit_max - logit_chosen).clamp(min=0.0)
+        ).sum() / num_live.mul(L).clamp(min=1.0)
+        logit_regret = logit_regret.detach()
+
+        return regret_loss, logit_regret

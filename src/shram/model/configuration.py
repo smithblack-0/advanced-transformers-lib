@@ -79,32 +79,6 @@ class ShramConfig(PretrainedConfig):
         use_cache: Whether to return past_key_values for KV caching.
         output_hidden_states: Whether to return hidden states after each layer.
         tie_word_embeddings: Whether input embedding and LM head share weights.
-        mosrah_overallocation_factor: Overallocation multiplier for the expert packing
-            buffer. ``mosrah_packed_length`` = ceil(training_sequence_length *
-            num_selected_heads / num_mosrah_heads * mosrah_overallocation_factor).
-            Must be > 1.0 to guarantee a buffer larger than the balanced-routing
-            baseline. Default 2.0.
-        max_bid_rounds: Maximum bidding rounds for the deferred-acceptance capacity
-            solver in ``balance_capacity``. 10 covers convergence at approximately
-            the 98th percentile of routing densities; the top 2% of extreme-density
-            cases are not expected under normal training. The bound exists as a
-            correctness guard — exhausting it raises ``RuntimeError``. Must be >= 1.
-            Default 10.
-        load_balance_loss_type: Formula used for the load-balance auxiliary loss.
-            One of ``"gshard"``, ``"ce"``, ``"bce"``, ``"temporal_overcapacity"``, or
-            ``"causal_overcapacity"``. ``"causal_overcapacity"`` (the default) attributes
-            violations to the causal trajectory that produced them — each expert
-            accumulates a running mean of its selection log-probability and the loss
-            penalises the gap between overloaded and typical trajectories. Like
-            ``"temporal_overcapacity"``, it fires only when a violation exists and shuts
-            off automatically, making it safe to weight strongly. Default
-            ``"causal_overcapacity"``.
-        maximum_expert_overclaim: Maximum number of tokens an expert may receive above
-            its ideal allocation trajectory before either overcapacity loss fires.
-            A value of 0 means violations trigger immediately at any imbalance.
-            Larger values permit short-lived semantic specialization before correction.
-            Used by both ``"temporal_overcapacity"`` and ``"causal_overcapacity"``.
-            Must be non-negative. Default 20.
     """
 
     model_type = "shram"
@@ -137,10 +111,6 @@ class ShramConfig(PretrainedConfig):
         use_cache: bool = True,
         output_hidden_states: bool = False,
         tie_word_embeddings: bool = False,
-        mosrah_overallocation_factor: float = 2.0,
-        max_bid_rounds: int = 10,
-        load_balance_loss_type: str = "causal_overcapacity",
-        maximum_expert_overclaim: int = 20,
         **kwargs
     ):
         if head_dim % 2 != 0:
@@ -169,30 +139,13 @@ class ShramConfig(PretrainedConfig):
                 f"got {inference_sequence_length}."
             )
 
-        if mosrah_overallocation_factor <= 1.0:
+        if num_mosrah_heads % num_selected_heads != 0:
             raise ValueError(
-                f"mosrah_overallocation_factor must be > 1.0 to guarantee a packed "
-                f"buffer larger than the balanced-routing baseline. "
-                f"Got {mosrah_overallocation_factor}."
-            )
-
-        if max_bid_rounds < 1:
-            raise ValueError(
-                f"max_bid_rounds must be at least 1, got {max_bid_rounds}."
-            )
-
-        if maximum_expert_overclaim < 0:
-            raise ValueError(
-                f"maximum_expert_overclaim must be non-negative, "
-                f"got {maximum_expert_overclaim}."
-            )
-
-        _supported_loss_types = {"gshard", "ce", "bce", "temporal_overcapacity", "causal_overcapacity"}
-        if load_balance_loss_type not in _supported_loss_types:
-            supported = ", ".join(f'"{t}"' for t in sorted(_supported_loss_types))
-            raise ValueError(
-                f"load_balance_loss_type must be one of {supported}, "
-                f"got {load_balance_loss_type!r}."
+                f"num_mosrah_heads must be exactly divisible by num_selected_heads. "
+                f"Mechanical load balancing partitions the sequence into blocks of "
+                f"W = num_mosrah_heads // num_selected_heads tokens; each block covers "
+                f"every expert exactly once, which requires an integer W. "
+                f"Got num_mosrah_heads={num_mosrah_heads}, num_selected_heads={num_selected_heads}."
             )
 
         self.vocab_size = vocab_size
@@ -212,10 +165,6 @@ class ShramConfig(PretrainedConfig):
         self.inference_sequence_length = inference_sequence_length
         self.alpha = alpha
         self.beta = beta
-        self.mosrah_overallocation_factor = mosrah_overallocation_factor
-        self.max_bid_rounds = max_bid_rounds
-        self.load_balance_loss_type = load_balance_loss_type
-        self.maximum_expert_overclaim = maximum_expert_overclaim
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
 
@@ -242,10 +191,10 @@ class ShramConfig(PretrainedConfig):
     def mosrah_packed_length(self) -> int:
         """Static packed time dimension T for expert packing.
 
-        The expected tokens per expert under perfectly balanced routing is
-        ``training_sequence_length * num_selected_heads / num_mosrah_heads``.
-        Multiplying by ``mosrah_overallocation_factor`` provides a buffer above
-        that baseline. The ceiling ensures T is always an integer >= 1.
+        Mechanical load balancing guarantees exactly
+        ``training_sequence_length * num_selected_heads / num_mosrah_heads``
+        tokens per expert. The ceiling handles non-integer results when
+        training_sequence_length is not divisible by the block length W.
 
         All consumers of the packed buffer size must read this property rather
         than deriving T independently.
@@ -254,31 +203,41 @@ class ShramConfig(PretrainedConfig):
             self.training_sequence_length
             * self.num_selected_heads
             / self.num_mosrah_heads
-            * self.mosrah_overallocation_factor
-        )
+        ) + self.block_length
 
     @property
     def mosrah_cache_length(self) -> int:
         """Static per-(batch, head) slot capacity for the MoSRAH inference cache.
 
-        The expected tokens per expert over the full inference context under perfectly
-        balanced routing is ``inference_sequence_length * num_selected_heads /
-        num_mosrah_heads``. Multiplying by ``mosrah_overallocation_factor`` provides
-        a buffer above that baseline. The ceiling ensures the result is always an
-        integer >= 1.
+        Mechanical load balancing guarantees exactly
+        ``inference_sequence_length * num_selected_heads / num_mosrah_heads``
+        tokens per expert over the full inference context. The ceiling handles
+        non-integer results when inference_sequence_length is not divisible by
+        the block length W.
 
-        Distinct from ``mosrah_packed_length``, which sizes the training packing buffer
-        using ``training_sequence_length``. This property uses
-        ``inference_sequence_length`` because the cache must hold the full accumulated
-        token history across the entire inference run.
+        Distinct from ``mosrah_packed_length``, which sizes the training packing
+        buffer using ``training_sequence_length``. This property uses
+        ``inference_sequence_length`` because the cache must hold the full
+        accumulated token history across the entire inference run.
 
-        All consumers of the MoSRAH cache buffer size must read this property rather
-        than deriving the capacity independently.
+        All consumers of the MoSRAH cache buffer size must read this property
+        rather than deriving the capacity independently.
         """
         return math.ceil(
             self.inference_sequence_length
             * self.num_selected_heads
             / self.num_mosrah_heads
-            * self.mosrah_overallocation_factor
-        )
+        ) + self.block_length
 
+    @property
+    def block_length(self) -> int:
+        """Routing block length W = num_mosrah_heads // num_selected_heads.
+
+        Within each block of W consecutive tokens every expert is used exactly once,
+        giving perfect load balance by construction. The E % K == 0 constraint
+        enforced at construction guarantees W is an exact integer.
+
+        All consumers of the routing block length must read this property rather
+        than deriving W independently.
+        """
+        return self.num_mosrah_heads // self.num_selected_heads

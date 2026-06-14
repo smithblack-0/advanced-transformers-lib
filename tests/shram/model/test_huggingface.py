@@ -87,8 +87,8 @@ class TestOutputContract:
         ids = torch.randint(0, model.config.vocab_size, (1, 4), device=device)
         out = model(ids, use_cache=False)
         assert out.logits is not None
-        assert out.load_balance_loss is not None
-        assert out.max_vio is not None
+        assert out.regret_loss is not None
+        assert out.logit_regret is not None
 
     def test_logits_shape(self, model: ShramForCausalLM, device) -> None:
         """Logits must have shape (batch, seq_len, vocab_size)."""
@@ -96,30 +96,30 @@ class TestOutputContract:
         out = model(ids, use_cache=False)
         assert out.logits.shape == (2, 8, model.config.vocab_size)
 
-    def test_load_balance_loss_is_scalar_and_finite(
+    def test_regret_loss_is_scalar_and_finite(
         self,
         model: ShramForCausalLM,
         device,
     ) -> None:
-        """load_balance_loss must be a finite scalar on every forward pass."""
+        """regret_loss must be a finite scalar on every forward pass."""
         ids = torch.randint(0, model.config.vocab_size, (1, 6), device=device)
         out = model(ids, use_cache=False)
-        assert out.load_balance_loss is not None
-        assert out.load_balance_loss.shape == ()
-        assert torch.isfinite(out.load_balance_loss)
+        assert out.regret_loss is not None
+        assert out.regret_loss.shape == ()
+        assert torch.isfinite(out.regret_loss)
 
-    def test_max_vio_is_scalar_finite_and_detached(
+    def test_logit_regret_is_scalar_finite_and_detached(
         self,
         model: ShramForCausalLM,
         device,
     ) -> None:
-        """max_vio must be a finite detached scalar — it is a monitoring value, not a loss."""
+        """logit_regret must be a finite detached scalar — it is a monitoring value, not a loss."""
         ids = torch.randint(0, model.config.vocab_size, (1, 6), device=device)
         out = model(ids, use_cache=False)
-        assert out.max_vio is not None
-        assert out.max_vio.shape == ()
-        assert torch.isfinite(out.max_vio)
-        assert out.max_vio.requires_grad is False
+        assert out.logit_regret is not None
+        assert out.logit_regret.shape == ()
+        assert torch.isfinite(out.logit_regret)
+        assert out.logit_regret.requires_grad is False
 
 
 # ---------------------------------------------------------------------------
@@ -177,13 +177,13 @@ class TestLoss:
         assert out.ce_loss is None
 
     def test_loss_combines_ce_and_load_balance(self, model: ShramForCausalLM, device) -> None:
-        """loss must equal ce_weight * ce_loss + load_balance_weight * load_balance_loss."""
+        """loss must equal ce_weight * ce_loss + load_balance_weight * regret_loss."""
         ids = torch.randint(0, model.config.vocab_size, (1, 4), device=device)
         ce_weight, lb_weight = 1.0, 0.01
         with torch.no_grad():
             out = model(ids, labels=ids, use_cache=False,
                         ce_weight=ce_weight, load_balance_weight=lb_weight)
-        expected = ce_weight * out.ce_loss + lb_weight * out.load_balance_loss
+        expected = ce_weight * out.ce_loss + lb_weight * out.regret_loss
         torch.testing.assert_close(out.loss, expected)
 
     def test_custom_weights_scale_loss(self, model: ShramForCausalLM, device) -> None:
@@ -192,7 +192,7 @@ class TestLoss:
         with torch.no_grad():
             out = model(ids, labels=ids, use_cache=False,
                         ce_weight=2.0, load_balance_weight=0.5)
-        expected = 2.0 * out.ce_loss + 0.5 * out.load_balance_loss
+        expected = 2.0 * out.ce_loss + 0.5 * out.regret_loss
         torch.testing.assert_close(out.loss, expected)
 
     def test_routing_weight_receives_gradient(self, device) -> None:
@@ -228,8 +228,7 @@ class TestAttentionMaskBehavior:
             masked = model(ids, attention_mask=mask, use_cache=False)
 
         torch.testing.assert_close(masked.logits, unmasked.logits)
-        torch.testing.assert_close(masked.load_balance_loss, unmasked.load_balance_loss)
-        torch.testing.assert_close(masked.max_vio, unmasked.max_vio)
+        torch.testing.assert_close(masked.regret_loss, unmasked.regret_loss)
 
     def test_ragged_batched_generate_works_with_attention_mask(
         self,

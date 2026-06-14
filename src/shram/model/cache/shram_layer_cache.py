@@ -23,19 +23,21 @@ from transformers.cache_utils import CacheLayerMixin
 
 from ..configuration import ShramConfig
 from .mosrah_cache import MoSRAHCache
+from .router_cache import RouterCache
 from .sliding_window_cache import LocalSlidingWindowLayerCache
 
 
 class ShramLayerCache(CacheLayerMixin):
     """Cache subsystem for one SHRAM decoder layer.
 
-    Owns and coordinates two sub-caches:
+    Owns and coordinates three sub-caches:
       - sliding_window_cache: LocalSlidingWindowLayerCache for the local sliding-window path.
       - mosrah_cache: MoSRAHCache for the MoSRAH sparse attention path.
+      - router_cache: RouterCache for the block-balanced router's block state.
 
-    Satisfies the HuggingFace per-layer cache role (CacheLayerMixin). The two sub-caches are
-    exposed directly for their downstream attention paths — no composite update() interface is
-    provided, because the two paths have materially different update semantics.
+    Satisfies the HuggingFace per-layer cache role (CacheLayerMixin). The sub-caches are
+    exposed directly for their downstream consumers — no composite update() interface is
+    provided, because the paths have materially different update semantics.
 
     Sequence length is reported by delegating to the local sliding-window sub-cache, which
     tracks the cumulative count of token positions processed across all update() calls.
@@ -72,6 +74,12 @@ class ShramLayerCache(CacheLayerMixin):
             device=device,
             mosrah_cache_length=config.mosrah_cache_length,
         )
+        self.router_cache = RouterCache(
+            block_length=config.block_length,
+            num_mosrah_heads=config.num_mosrah_heads,
+            batch_size=batch_size,
+            device=device,
+        )
 
     # ---------------------------------------------------------------------------
     # Properties
@@ -84,7 +92,11 @@ class ShramLayerCache(CacheLayerMixin):
         Both LocalSlidingWindowLayerCache and MoSRAHCache pre-allocate at construction,
         so this is True immediately after ShramLayerCache.__init__ returns.
         """
-        return self.sliding_window_cache.is_initialized and self.mosrah_cache.is_initialized
+        return (
+            self.sliding_window_cache.is_initialized
+            and self.mosrah_cache.is_initialized
+            and self.router_cache.is_initialized
+        )
 
     @is_initialized.setter
     def is_initialized(self, value: bool) -> None:
@@ -115,6 +127,7 @@ class ShramLayerCache(CacheLayerMixin):
         """
         self.sliding_window_cache.reset()
         self.mosrah_cache.reset()
+        self.router_cache.reset()
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
         """Reorder the batch dimension of both sub-caches for beam search.
@@ -127,6 +140,7 @@ class ShramLayerCache(CacheLayerMixin):
         """
         self.sliding_window_cache.reorder_cache(beam_idx)
         self.mosrah_cache.reorder_cache(beam_idx)
+        self.router_cache.reorder_cache(beam_idx)
 
     def batch_repeat_interleave(self, repeats: int) -> None:
         """Expand the batch dimension of both sub-caches for beam search initialisation.
@@ -139,6 +153,7 @@ class ShramLayerCache(CacheLayerMixin):
         """
         self.sliding_window_cache.batch_repeat_interleave(repeats)
         self.mosrah_cache.batch_repeat_interleave(repeats)
+        self.router_cache.batch_repeat_interleave(repeats)
 
     def batch_select_indices(self, indices: torch.Tensor) -> None:
         """Select a subset of batch entries in both sub-caches for contrastive search.
@@ -151,6 +166,7 @@ class ShramLayerCache(CacheLayerMixin):
         """
         self.sliding_window_cache.batch_select_indices(indices)
         self.mosrah_cache.batch_select_indices(indices)
+        self.router_cache.batch_select_indices(indices)
 
     def offload(self) -> None:
         """Offload both sub-caches to CPU.
@@ -160,6 +176,7 @@ class ShramLayerCache(CacheLayerMixin):
         """
         self.sliding_window_cache.offload()
         self.mosrah_cache.offload()
+        self.router_cache.offload()
 
     def prefetch(self) -> None:
         """Move both sub-caches back to their model device ahead of time.
@@ -169,6 +186,7 @@ class ShramLayerCache(CacheLayerMixin):
         """
         self.sliding_window_cache.prefetch()
         self.mosrah_cache.prefetch()
+        self.router_cache.prefetch()
 
     def lazy_initialization(  # type: ignore[override]
         self, key_states: torch.Tensor, value_states: torch.Tensor

@@ -26,7 +26,7 @@ def small_config(**overrides) -> ShramConfig:
         mlp_width=16,
         num_decoder_layers=3,
         num_sliding_window_heads=2,
-        num_mosrah_heads=5,
+        num_mosrah_heads=4,
         num_selected_heads=2,
         head_dim=4,
         window_size=4,
@@ -120,8 +120,8 @@ class TestOutputContract:
             "last_hidden_state",
             "past_key_values",
             "hidden_states",
-            "load_balance_loss",
-            "max_vio",
+            "regret_loss",
+            "logit_regret",
             "logit_std",
         }
 
@@ -134,12 +134,12 @@ class TestOutputContract:
         out = model(inputs_embeds, position_ids(2, 5, device), torch.ones(2, 5, dtype=torch.bool, device=device))
 
         assert out["last_hidden_state"].shape == (2, 5, config.embedding_width)
-        assert out["load_balance_loss"].ndim == 0
-        assert out["max_vio"].ndim == 0
+        assert out["regret_loss"].ndim == 0
+        assert out["logit_regret"].ndim == 0
         assert torch.isfinite(out["last_hidden_state"]).all()
-        assert torch.isfinite(out["load_balance_loss"])
-        assert torch.isfinite(out["max_vio"])
-        assert not out["max_vio"].requires_grad
+        assert torch.isfinite(out["regret_loss"])
+        assert torch.isfinite(out["logit_regret"])
+        assert not out["logit_regret"].requires_grad
 
 
 # ---------------------------------------------------------------------------
