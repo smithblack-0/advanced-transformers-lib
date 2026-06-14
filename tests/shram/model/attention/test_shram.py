@@ -27,7 +27,7 @@ def make_config(**overrides) -> ShramConfig:
         mlp_width=16,
         num_decoder_layers=1,
         num_sliding_window_heads=2,
-        num_mosrah_heads=5,
+        num_mosrah_heads=4,
         num_selected_heads=2,
         head_dim=4,
         window_size=4,
@@ -160,7 +160,7 @@ class TestHybridComposition:
             active_mask=active_mask,
             cache=None,
         )
-        sparse_load_balance_loss = sparse_diagnostics["load_balance_loss"]
+        sparse_regret_loss = sparse_diagnostics["regret_loss"]
 
         hybrid_output, hybrid_diagnostics = layer(
             hidden_states=hidden_states,
@@ -168,7 +168,7 @@ class TestHybridComposition:
             active_mask=active_mask,
             cache=None,
         )
-        hybrid_load_balance_loss = hybrid_diagnostics["load_balance_loss"]
+        hybrid_regret_loss = hybrid_diagnostics["regret_loss"]
 
         torch.testing.assert_close(
             hybrid_output,
@@ -177,8 +177,8 @@ class TestHybridComposition:
             rtol=1e-5,
         )
         torch.testing.assert_close(
-            hybrid_load_balance_loss,
-            sparse_load_balance_loss,
+            hybrid_regret_loss,
+            sparse_regret_loss,
             atol=1e-6,
             rtol=1e-6,
         )
@@ -196,14 +196,14 @@ class TestHybridComposition:
             active_mask=active_mask,
             cache=None,
         )
-        sparse_load_balance_loss = sparse_diagnostics["load_balance_loss"]
+        sparse_regret_loss = sparse_diagnostics["regret_loss"]
         hybrid_output, hybrid_diagnostics = layer(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
-        hybrid_load_balance_loss = hybrid_diagnostics["load_balance_loss"]
+        hybrid_regret_loss = hybrid_diagnostics["regret_loss"]
 
         torch.testing.assert_close(
             hybrid_output,
@@ -212,8 +212,8 @@ class TestHybridComposition:
             rtol=1e-5,
         )
         torch.testing.assert_close(
-            hybrid_load_balance_loss,
-            sparse_load_balance_loss,
+            hybrid_regret_loss,
+            sparse_regret_loss,
             atol=1e-6,
             rtol=1e-6,
         )
@@ -237,14 +237,14 @@ class TestHybridComposition:
             active_mask=active_mask,
             cache=None,
         )
-        hybrid_load_balance_loss = hybrid_diagnostics["load_balance_loss"]
+        hybrid_regret_loss = hybrid_diagnostics["regret_loss"]
         sparse_output, sparse_diagnostics = layer.sparse_attention(
             hidden_states=hidden_states,
             position_ids=position_ids,
             active_mask=active_mask,
             cache=None,
         )
-        sparse_load_balance_loss = sparse_diagnostics["load_balance_loss"]
+        sparse_regret_loss = sparse_diagnostics["regret_loss"]
 
         torch.testing.assert_close(
             hybrid_output,
@@ -253,12 +253,12 @@ class TestHybridComposition:
             rtol=1e-5,
         )
         torch.testing.assert_close(
-            hybrid_load_balance_loss,
-            sparse_load_balance_loss,
+            hybrid_regret_loss,
+            sparse_regret_loss,
             atol=1e-6,
             rtol=1e-6,
         )
-        assert torch.isfinite(hybrid_load_balance_loss)
+        assert torch.isfinite(hybrid_regret_loss)
         torch.testing.assert_close(
             sparse_output,
             torch.zeros_like(sparse_output),
@@ -293,16 +293,12 @@ class TestRealExecution:
             active_mask=active_mask,
             cache=None,
         )
-        load_balance_loss = router_diagnostics["load_balance_loss"]
-        max_vio = router_diagnostics["max_vio"]
+        regret_loss = router_diagnostics["regret_loss"]
 
         assert hybrid_output.shape == hidden_states.shape
-        assert load_balance_loss.ndim == 0
-        assert max_vio.ndim == 0
+        assert regret_loss.ndim == 0
         assert torch.isfinite(hybrid_output).all()
-        assert torch.isfinite(load_balance_loss)
-        assert torch.isfinite(max_vio)
-        assert not max_vio.requires_grad
+        assert torch.isfinite(regret_loss)
 
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
     def test_cached_execution_runs_sanely_with_the_real_per_layer_cache(self, rope_mode, device):
@@ -329,19 +325,19 @@ class TestRealExecution:
             active_mask=prefix_active_mask,
             cache=layer_cache,
         )
-        prefix_load_balance_loss = prefix_diagnostics["load_balance_loss"]
+        prefix_regret_loss = prefix_diagnostics["regret_loss"]
         current_output, current_diagnostics = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             active_mask=current_active_mask,
             cache=layer_cache,
         )
-        current_load_balance_loss = current_diagnostics["load_balance_loss"]
+        current_regret_loss = current_diagnostics["regret_loss"]
 
         assert prefix_output.shape == prefix_hidden_states.shape
         assert current_output.shape == current_hidden_states.shape
-        assert prefix_load_balance_loss.ndim == 0
-        assert current_load_balance_loss.ndim == 0
+        assert prefix_regret_loss.ndim == 0
+        assert current_regret_loss.ndim == 0
         assert torch.isfinite(prefix_output).all()
         assert torch.isfinite(current_output).all()
 
@@ -393,7 +389,7 @@ class TestRealExecution:
             active_mask=current_active_mask,
             cache=layer_cache,
         )
-        current_cached_load_balance_loss = current_cached_diagnostics["load_balance_loss"]
+        current_cached_regret_loss = current_cached_diagnostics["regret_loss"]
 
         torch.testing.assert_close(
             current_cached_output,
@@ -403,8 +399,8 @@ class TestRealExecution:
         )
 
         assert current_cached_output.shape == current_hidden_states.shape
-        assert current_cached_load_balance_loss.ndim == 0
-        assert torch.isfinite(current_cached_load_balance_loss)
+        assert current_cached_regret_loss.ndim == 0
+        assert torch.isfinite(current_cached_regret_loss)
 
 # ---------------------------------------------------------------------------
 # Unit 11 sits at the top of the experimental feature stack, so it is also the
@@ -420,12 +416,12 @@ class TestConfigurationResponse:
         hidden_states, position_ids, active_mask = make_inputs(device, start_position=0)
 
         layer_a = make_layer(
-            make_config(num_mosrah_heads=3, num_selected_heads=2),
+            make_config(num_mosrah_heads=2, num_selected_heads=2),
             device,
             seed=0,
         )
         layer_b = make_layer(
-            make_config(num_mosrah_heads=5, num_selected_heads=2),
+            make_config(num_mosrah_heads=4, num_selected_heads=2),
             device,
             seed=0,
         )
@@ -578,7 +574,7 @@ class TestConfigurationResponse:
 # ---------------------------------------------------------------------------
 # The final responsibility preserved by the hybrid boundary is gradient
 # routing. Gradients from the summed hybrid output must reach both real
-# model-space paths. Gradients from load_balance_loss must not reach
+# model-space paths. Gradients from regret_loss must not reach
 # the local attention path.
 # ---------------------------------------------------------------------------
 
@@ -610,7 +606,7 @@ class TestGradientBehavior:
         assert sparse_output_param.grad is not None
         assert torch.isfinite(sparse_output_param.grad).all()
 
-    def test_load_balance_loss_backward_reaches_the_sparse_balancing_path_and_causes_movement(self, device):
+    def test_regret_loss_backward_reaches_the_sparse_balancing_path_and_causes_movement(self, device):
         """The returned load-balance loss should survive the hybrid layer and update router parameters."""
         hidden_states, position_ids, active_mask = make_inputs(device, requires_grad=True, start_position=0)
         layer = make_layer(make_config(), device, seed=0)
@@ -623,11 +619,11 @@ class TestGradientBehavior:
             active_mask=active_mask,
             cache=None,
         )
-        load_balance_loss = router_diagnostics["load_balance_loss"]
+        regret_loss = router_diagnostics["regret_loss"]
         del hybrid_output
 
         optimizer.zero_grad()
-        load_balance_loss.backward()
+        regret_loss.backward()
         optimizer.step()
 
         assert any(p.grad is not None for p in layer.sparse_attention.router.parameters())

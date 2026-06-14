@@ -141,45 +141,6 @@ class TestIntegrationTrainable:
 
 
 
-# ---------------------------------------------------------------------------
-# Integration — Capacity enforcement
-# ---------------------------------------------------------------------------
-
-class TestIntegrationCapacityEnforcement:
-    """Verify balance_capacity prevents overflow under tight capacity budgets.
-
-    Both tests use mosrah_overallocation_factor=1.001 (effectively no headroom)
-    and feed a full training_sequence_length sequence so N > mosrah_packed_length
-    and balance_capacity must do real work to keep routing within budget.
-    """
-
-    def test_dense_routing_stays_within_capacity(self, device):
-        """Dense routing (K/L=0.75) with tight capacity completes without overflow."""
-        config = small_config(
-            num_selected_heads=3,
-            num_mosrah_heads=4,
-            mosrah_overallocation_factor=1.2  ,
-            training_sequence_length=32,
-            max_bid_rounds = 20,
-        )
-        m = ShramForCausalLM(config).train().to(device)
-        ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
-        out = m(ids, labels=ids, use_cache=False)
-        assert out.loss is not None and torch.isfinite(out.loss)
-
-    def test_sparse_routing_stays_within_capacity(self, device):
-        """Sparse routing (K/L=0.25) with tight capacity completes without overflow."""
-        config = small_config(
-            num_selected_heads=1,
-            num_mosrah_heads=4,
-            mosrah_overallocation_factor=1.2,
-            training_sequence_length=32,
-            max_bid_rounds = 20,
-        )
-        m = ShramForCausalLM(config).train().to(device)
-        ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
-        out = m(ids, labels=ids, use_cache=False)
-        assert out.loss is not None and torch.isfinite(out.loss)
 
 # ---------------------------------------------------------------------------
 # Integration — Extended inference (YaRN rescaling)
@@ -202,7 +163,6 @@ class TestIntegrationExtendedInference:
         """Save a model trained at training_sequence_length=16 with no YaRN override."""
         config = small_config(
             training_sequence_length=16,
-            mosrah_overallocation_factor=2.0,
         )
         ShramForCausalLM(config).save_pretrained(tmp_path)
 
@@ -510,7 +470,7 @@ class TestIntegrationRouterDiagnostics:
         with torch.no_grad():
             out = m(ids, use_cache=False)
 
-        for field in ("logit_std", "max_vio", "load_balance_loss"):
+        for field in ("logit_std", "regret_loss", "logit_regret"):
             val = getattr(out, field)
             assert val is not None, f"{field} is None"
             assert val.ndim == 0, f"{field} is not a scalar (shape={val.shape})"
@@ -530,7 +490,7 @@ class TestIntegrationRouterDiagnostics:
         m = ShramForCausalLM(config).train().to(device)
         ids = torch.randint(0, 256, (2, 16), device=device)
 
-        fields = ("logit_std", "max_vio", "load_balance_loss")
+        fields = ("logit_std", "regret_loss", "logit_regret")
 
         with torch.no_grad():
             before = {f: getattr(m(ids, use_cache=False), f).item() for f in fields}

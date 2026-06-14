@@ -106,8 +106,9 @@ is being achieved, one verified unit at a time.
 - [X] Unit 26.A — Restore Coupled Routing
 - [X] Unit 26.B — Temporal Overcapacity Loss
 - [X] Unit 26.C — Temporal Overcapacity Integration
-- [ ] Unit 27 — Causal Overcapacity Loss
-- [ ] Unit 28 — Final Audit
+- [X] Unit 27 — Causal Overcapacity Loss
+- [X] Unit 28 — Mechanical Load Balancing
+- [ ] Unit 29 — Final Audit
 
 ---
 
@@ -3593,7 +3594,315 @@ Make sure to consult the imbalance overcapacity loss to see how to do this corre
 
 ---
 
-## Unit 28 — Final Audit
+## Unit 28 — Mechanical Load Balancing
+
+**Responsibility**
+
+Insert mechanical load balancing into the routing unit along with associated machinery
+
+**Context of Correctness**
+
+It has become clear no loss-based solution can load balance this router.
+
+Any such solution appears to have extremely negative consequences on the ability of the model to train when the loss is turned up high enough to hold back degeneracy. An alternative was needed. 
+
+A significant amount of expert was spend looking into alternative solutions to mechnanically load balance the router without ever using an auxiliary loss. After significant effort, one has been found which is guaranteed to effectively, rapidly, and precisely load balance the router under any situation. Specifically, when certain constraints are put on the values of the number of experts and the number of experts chosen it is possible to divide a sequence of tokens up into 'blocks' which have a guarantee that each expert fires within the block at most once. Using this guarentee, it is then possible to solve for a solution within a finite number of rounds of known length.
+
+**Mathematics**
+*Block Mathematics*
+
+Mechanical load balancing is built around a simple exact-cover contract: each local block is shaped so that perfect load balance is equivalent to using every expert exactly once. This turns load balancing from a global correction problem into a local construction problem. The cost is a compatibility restriction between the number of experts and the number of experts selected per token.
+
+Let $z$ be the routing logits, let $E$ be the number of experts, let $K$ be the number of experts selected per token, and let $W$ be the number of tokens in a mechanical routing block. Let $M = f(z)$ be the on/off expert-selection mask produced by some block solver $f$, where $M_{n,e}=1$ means token $n$ selected expert $e$.
+
+This unit accepts the compatibility constraints
+
+```text
+E % K = 0
+W = E / K
+```
+
+so each block contains exactly
+
+```text
+W K = E
+```
+
+expert-selection slots. Since there are also $E$ experts, the block is perfectly load balanced exactly when each expert appears once in the block. This immediately implies if $f$ constructs $M$ to select each expert only once, it also will be perfectly balanced. 
+
+*Causal Construction*
+
+In order for this to be usable with a decoder model, a causal method of construction is needed for inference compatibility. This can be achieved remarkably easy. 
+
+1) Start from a set of token logits
+2) Pad to block length
+3) Reshape into blocks of length W
+4) Create a boolean mask filled with false
+5) For length of W across each collection of logits in the block, causaly
+   6) Mask out the experts already chosen by setting their logits to -inf
+   7) Choose the topk scores and indexes
+   8) Set those indexes to now be used
+9) Reshape back to standard form
+10) Discard any padding
+11) Return routing scores, and routing indices.
+
+Note that this will require the introduction of a routing cache to keep track of the hidden state
+for inference mode. Nonetheless, this is entirely achievable. We also note that while it was experimented. This does not guarentee global optimality, and instead takes the best action at each causal step.
+
+
+### 28.A -- Training Mode 
+
+**Responsibility**
+
+Install the mechanical load balancing itself within the router
+
+**Context of Correctness**
+
+It is possible to produce ideal load balancing in training mode by enforcing a one-usage-per-block rule with additional installed constraints
+
+**Invariants**
+
+- Config is modified to assert that (E % K = 0) and explain clearly that if not true it needs to be true to achieve load balancing.
+- The algorithm is implemented inside the router and operational in a training mode. 
+- The algorithm is implemented in a block parallel, efficiently compilable manner.
+
+**Tests**
+
+- Training mode tests pass
+- Inference tests may still be broken, as caches have not yet been modified to accommodate this paradigm
+- Training tests should verify, by tracking max vio, that exact load balancing is occurring. 
+
+**Preliminary Implementation Notes**
+
+- It was found that the serial variant was the fastest variant available, and still very fast, under 1 ms.
+- W, the block length, can be computed as E/K with the assertion in place.
+
+### 28.B -- Regret Loss
+
+**Responsibility**
+
+Provide the model with the ability to refine the moments it chooses experts
+by means of providing it with a 'regret' loss that can let it know when 
+it wanted an expert later it used prematurely
+
+**Context of Correctness**
+
+In theory, if the model could perfectly balance it's usage of tokens, we might expect that for an ideal balancing situation the model would always allocate the most probability to the cases where it uses it's experts. Failing to do so means 
+
+**Invariants**
+
+- The regret loss is the only type of loss available
+- The regret within a block, at a particular expert configuration, is defined as max(p_maximum - p_chosen, 0), including only tokens which are unmasked. 
+- The regret loss is the mean of this, adjusted appropriately to ignore masked tokens. 
+- The regret loss computation is installed as a static method in the router class
+- The regret is returned by the router, and reduced by mean.
+
+**Tests**
+
+- Verify regret computation is correct by comparing statically computed values to actual returns
+- Verify regret correctly ignores masked tokens.
+- Verify router now returns a regret loss.
+
+**Preliminary Implementation Notes**
+
+Working tensor is `(B, num_blocks, L)` — one regret scalar per batch item, block, and expert.
+
+Sources: `routing_scores` (raw softmax over all L, not renormalized routing_probs) and
+`selected_heads_blocked` (already available from the block solver for-loop — no recomputation).
+Both are padded and reshaped into block form to match the solver's layout.
+
+Gating is at block level: a block is live iff it has at least one active token. All L experts
+in a live block count toward the mean. Within a live block, the active mask gates both the
+p_maximum search (only active tokens are candidates) and the p_chosen lookup (an expert
+assigned to a dead token is treated as having p_chosen = 0).
+
+The static method receives routing_scores, selected_heads_blocked, active_mask, and the block
+geometry (num_blocks, W, L) — all available at the call site in forward().
+
+### 28.C -- Inference and Caching
+
+**Responsibility**
+
+Install inference support and necessary caching
+
+**Context of Correctness**
+
+The algorithm used for load balancing is stateful, and thus requires caching. Specifially, within a block state is needed to know, for the next iteration, how many experts have already been exhausted within the block. 
+
+**Invariants**
+
+- A new cache has been placed in the cache folder called router_cache.py
+- The cache is now installed in shram_layer_cache as an additional term.
+- The cache is static, compilable, and preallocates memory for all possible terms then fills them 
+  in statically as inference runs. 
+- The cache is passed in as an instance in routing.
+- Routing accepts a None argument to distinguish training, like all other caching subsystems. 
+- The cache can be used to get the necessary information to continue generation or do a new prefill session
+
+**Tests**
+
+- All original tests should now pass.
+- When inspected, max vio should be perfectly balanced
+
+**Preliminary implementation strategy**
+
+- The cache should likely be made as a bool array of inference_sequence_length or the appropriate term on the config
+- It is likely easiest to just record the entire chain of states up to the current point. 
+- The cache should use a tensor int to track how many tokens deep the cache has already traveled, to know where to insert new tokens
+- Caches of this nature MUST me updated in-place, including counters and such, using tensors, to meet all compile requirements. 
+- It might be useful to consult the other caches for motivation and to know the requirements and available patterns
+
+
+### 28.D -- Cleanup Identification
+
+**Responsibility**
+
+Get ready to Clean out old loss systems and tests, and install additional telemetry in their place
+
+** Context of Correctness **
+
+Many groups of tests and router functionality concern loss, telementry, and tests that are no longer applicable now load balancing is exact. This should be identified and removed.
+
+Because it is such a foundational part of the assumptions up to now, the issues may be significant and found all over the repo. A dedicated step to gather places that depend on that assumption is needed.
+
+**Invariants**
+
+- Explore steps were taken to identify the locations depending on this assumption deserving of adjustment
+- The entire load balancing loss unit has been examined and is planned for removal
+- The relevant telemetry has been planned for removal, as has any config entries and reduction technology that will no longer be needed. 
+- Documentation, docstrings, and such have been examined for revision
+- Tests that are no longer needed have been planned for removal
+- The whole "overallocation" system and it's tests can now be removed and replaced with the exact balance + W. 
+- The revision has been inserted concretely into 28.D -- Cleanup Execution.
+**Tests**
+
+None
+
+**Preliminary strategy**
+
+- Use explore agents. Attack the problem from multiple angles
+- It is likely useful to read the entirety of plan.md, and to have explore agents do so too.
+- Don't expect one iteration of corrections to restore a sane repo state
+
+### 28.E -- Cleanup Execution + Telemetry
+
+**NOTE: This plan entry is a generated artifact produced by 28.D (Cleanup Identification).
+It is not held to normal plan-entry standards. Its authority comes from the 28.D research
+session, not from independent reasoning. The checklist below was generated by aggressive
+Haiku agents — it guarantees that the listed issues EXIST in each file, but the exact
+nature of each fix requires reading the file first.**
+
+**Folds in 28.F (Revised Telemetry) — logit_regret surfaced in ShramCausalLMOutput.**
+
+---
+
+**Source file changes (COMPLETE):**
+
+`src/shram/model/attention/load_balance_loss.py`
+- Delete entire file (no imports, no callers anywhere in src/)
+
+`src/shram/model/model.py`
+- Rename `total_load_balance_loss` accumulator → `total_regret_loss`
+- Rename `layer_diagnostics["load_balance_loss"]` → `layer_diagnostics["regret_loss"]`
+- Add `total_logit_regret` accumulator; aggregate `layer_diagnostics["logit_regret"]` (mean across layers, like logit_std)
+- Remove `max_vio` accumulator and aggregation entirely
+- Update output dict: `"load_balance_loss"` → `"regret_loss"`, add `"logit_regret"`, remove `"max_vio"`
+- Update module docstring and forward() docstring
+
+`src/shram/model/huggingface.py`
+- ShramCausalLMOutput: rename field `load_balance_loss` → `regret_loss`; add field `logit_regret`; remove field `max_vio`; update comment
+- forward(): rename `backbone_outputs["load_balance_loss"]` → `backbone_outputs["regret_loss"]`; populate `logit_regret=backbone_outputs["logit_regret"]`; remove `max_vio=` population
+- Update forward() docstring
+
+`src/shram/model/attention/mosrah.py`
+- Docstring only: update stale diagnostic key list to reflect {regret_loss, logit_regret, logit_std}
+
+`src/shram/model/configuration.py`
+- Remove `mosrah_overallocation_factor` param, validation block, and docstring entry
+- Remove `max_bid_rounds` param, validation block, and docstring entry
+- Update `mosrah_packed_length` formula: remove `* self.mosrah_overallocation_factor` (exact balance → training_sequence_length * num_selected_heads // num_mosrah_heads)
+- Update `mosrah_cache_length` formula: same removal
+
+`src/shram/documentation.md`
+- Line 214: update "load-balance loss" → "regret loss", remove "MaxVio"
+
+---
+
+**Test file changes (REMAINING):**
+
+**Known post-28.E issue (user-flagged):** Removal of `mosrah_overallocation_factor` required
+adding explicit block-length padding room to the packed length. User added this after src
+files were completed. May break some tests — if tests fail on packed-length assertions,
+this is the likely cause. Investigate before assuming the rename work broke anything.
+
+**Protocol for each file:** Read the file first. Scan for ALL occurrences of removed
+symbols: `load_balance_loss`, `max_vio`, `mosrah_overallocation_factor`, `max_bid_rounds`,
+`balance_capacity`. Fix each appropriately — rename, remove kwarg, or delete surrounding
+class if the concept it tests no longer exists. Do not assume the agent checklist captures
+every occurrence or correctly identifies the fix.
+
+`tests/shram/test_end_to_end.py`
+- Known issues: `load_balance_loss`/`max_vio` in TestIntegrationRouterDiagnostics;
+  `mosrah_overallocation_factor`/`max_bid_rounds` in TestIntegrationCapacityEnforcement
+  and _save_base_model; exact fixes determined on read.
+
+`tests/shram/model/attention/test_shram.py`
+- Known issues: `load_balance_loss`/`max_vio` references; scan for removed params too.
+
+`tests/shram/model/test_model.py`
+- Known issues: `load_balance_loss`/`max_vio`; add `logit_regret` assertions; scan for removed params.
+
+`tests/shram/model/test_decoder_layer.py`
+- Known issues: `load_balance_loss`/`max_vio`; scan for removed params.
+
+`tests/shram/model/attention/test_mosrah.py`
+- Known issues: `load_balance_loss`/`max_vio`; update docstring; scan for removed params.
+
+`tests/shram/model/test_huggingface.py`
+- Known issues: `load_balance_loss`/`max_vio`; add `logit_regret` field check; scan for removed params.
+
+`tests/shram/model/test_configuration.py`
+- Known issues: delete TestMosrahPackedLength class (7 tests); delete TestMaxBidRounds class
+  (5 tests); trim test_roundtrip_preserves_all_fields (remove mosrah_overallocation_factor=1.3
+  kwarg + 2 assertions). Scan for additional removed-param usage.
+
+`tests/shram/model/attention/test_expert_packing.py`
+- Known issues: overflow error message match strings reference removed param name; scan
+  for additional removed-param usage.
+
+### 28.F -- Revised Telemetry
+
+**Responsibility**
+
+Provide some additional telementry on regret
+
+**CoC**
+
+When an expert is utilized, it means that expert can no longer be used later. In a block, an 'ideal' solution uses the expert where it is wanted the most. Thus, it is possible to measure the "regret" a model feels in terms of how strongly it preferred an expert when chosen vs how strongly it would have preferred the expert at the location of maximum preference.
+
+**Invariants**
+
+- `logit_regret` and `prob_regret` are present in `ShramCausalLMOutput` as finite detached scalars.
+- `max_vio` is removed from `ShramCausalLMOutput` — exact load balancing makes it permanently zero and therefore misleading. Removal is executed in 28.D.
+- Documentation is updated to describe both metrics and their interpretation.
+
+**Tests**
+
+- Verify `logit_regret` and `prob_regret` are present in `ShramCausalLMOutput` and are finite detached scalars.
+- Hand-calculated case where every expert is assigned at its ideal position: verify both metrics match analytically derived expected values.
+- Hand-calculated case where assignment is forced away from ideal: verify both metrics match analytically derived expected values.
+
+**Preliminary Implementation Strategy**
+
+- Compute both metrics inside the router after block assignment is resolved, reusing the logit tensor and assignment indices already available there.
+- For `logit_regret`: normalize per-expert logit at the assigned position by the within-block mean and std for that expert (z-score style); mean over experts, blocks, and batch. It might be as simple as the highest logit score compared to the chosen one. 
+- For `prob_regret`: apply softmax over the logit tensor; subtract assigned-position probability from ideal-position probability; mean over experts, blocks, and batch. Again, highest to chosen.
+- Surface both through the same diagnostic return path as other router scalars, aggregate across layers in `ShramModel`, expose in `ShramCausalLMOutput`.
+- `logit_regret` is expected to be in [0, inf].
+- `prob_regret` is expected in [0, 1].
+
+
+## Unit 29 — Final Audit
 
 This unit can only be completed once the paper is done and results are back. It involves resolving the paper to the codebase. 
 

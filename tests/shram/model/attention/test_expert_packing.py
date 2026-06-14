@@ -757,7 +757,7 @@ class TestOverflowDetection:
             "position_ids": (position_ids, 0),
             "active_mask": (outer_active_mask, False),
         }
-        with pytest.raises(RuntimeError, match="mosrah_overallocation_factor"):
+        with pytest.raises(RuntimeError, match="mosrah_packed_length"):
             pack_experts(entries, setup, selected_heads, num_experts, packed_length=2)
 
     def test_overflow_raises_in_compiled_mode(self):
@@ -878,7 +878,7 @@ class TestOverflowDetection:
             "active_mask": (outer_active_mask, False),
         }
 
-        with pytest.raises(RuntimeError, match="mosrah_overallocation_factor"):
+        with pytest.raises(RuntimeError, match="mosrah_packed_length"):
             pack_experts(
                 entries,
                 setup,

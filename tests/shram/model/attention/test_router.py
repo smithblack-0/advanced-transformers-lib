@@ -2,31 +2,29 @@
 
 Invariants verified:
 - routing_weight is the only routing projection; balance_weight does not exist
-- load-balance gradients reach routing_weight; task loss gradients also reach routing_weight
-- load-balance gradients reach the router input x
-- router_diagnostics exposes exactly {load_balance_loss, max_vio, logit_std}
-- load_balance_loss has gradient; max_vio and logit_std are detached
+- regret_loss gradient reaches routing_weight; task loss gradient also reaches routing_weight
+- regret_loss gradient reaches the router input x
+- router_diagnostics exposes exactly {regret_loss, logit_regret, logit_std}
+- regret_loss has gradient; logit_regret and logit_std are detached
 - compiled and eager router diagnostics are numerically identical
-- Output shapes: selected_heads (B, N, K), routing_probs (B, N, K), loss scalar, max_vio scalar
+- Output shapes: selected_heads (B, N, K), routing_probs (B, N, K), regret_loss scalar, logit_regret scalar
 - routing_probs sum to 1 per token and are non-negative
 - selected_heads are valid indices in [0, L-1] and are distinct per token
-- max_vio is exactly 0 for perfectly uniform routing frequencies
-- max_vio is exactly 1 when the most overloaded head receives double its fair share
-- max_vio produces the correct value for a known intermediate routing imbalance
-- max_vio is detached from the autograd graph
-- dead outer tokens do not affect load_balance_loss
-- dead outer tokens do not affect max_vio
-- router forward max_vio matches _compute_max_vio called directly on all-live inputs
-- each loss mode (gshard, ce, bce, temporal_overcapacity, causal_overcapacity) reduces routing concentration over training
+- regret_loss is zero when every expert is assigned at its peak-preference token within the block
+- regret_loss matches hand-calculated values for known routing configurations
+- dead tokens do not affect regret_loss
+- every expert appears exactly once per routing block in selected_heads
+- cached decode (router_cache not None, N=1) produces valid (B, 1, K) selections
+- W consecutive decode steps cover all L experts exactly once per block
+- decode routing respects the used_in_block mask from cache (no expert reuse within block)
 """
-
-import math
 
 import pytest
 import torch
 
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.attention.router import MoSRAHRouter
+from src.shram.model.cache.router_cache import RouterCache
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +33,7 @@ from src.shram.model.attention.router import MoSRAHRouter
 
 def small_config(**kwargs) -> ShramConfig:
     """Small config valid for router tests. num_selected_heads < num_mosrah_heads
-    so TopK is genuinely sparse. maximum_expert_overclaim=0 ensures the temporal
-    overcapacity loss fires on any imbalance, keeping gradient tests meaningful."""
+    so TopK is genuinely sparse."""
     defaults = dict(
         embedding_width=64,
         num_mosrah_heads=8,
@@ -46,7 +43,6 @@ def small_config(**kwargs) -> ShramConfig:
         window_size=16,
         mlp_width=128,
         num_decoder_layers=2,
-        maximum_expert_overclaim=0,
     )
     defaults.update(kwargs)
     return ShramConfig(**defaults)
@@ -63,7 +59,7 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        selected_heads, _, _ = router(x, active_mask, None)
+        selected_heads, _, _ = router(x, active_mask)
         assert selected_heads.shape == (2, 8, config.num_selected_heads)
 
     def test_routing_probs_shape(self):
@@ -72,28 +68,26 @@ class TestOutputShapes:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, routing_probs, _ = router(x, active_mask, None)
+        _, routing_probs, _ = router(x, active_mask)
         assert routing_probs.shape == (2, 8, config.num_selected_heads)
 
-    def test_load_balance_loss_is_scalar(self):
-        """load_balance_loss must be a zero-dimensional tensor."""
+    def test_regret_loss_is_scalar(self):
+        """regret_loss must be a zero-dimensional tensor."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, diagnostics = router(x, active_mask, None)
-        load_balance_loss = diagnostics["load_balance_loss"]
-        assert load_balance_loss.shape == ()
+        _, _, diagnostics = router(x, active_mask)
+        assert diagnostics["regret_loss"].shape == ()
 
-    def test_max_vio_is_scalar(self):
-        """max_vio must be a zero-dimensional tensor."""
+    def test_logit_regret_is_scalar(self):
+        """logit_regret must be a zero-dimensional tensor."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, diagnostics = router(x, active_mask, None)
-        max_vio = diagnostics["max_vio"]
-        assert max_vio.shape == ()
+        _, _, diagnostics = router(x, active_mask)
+        assert diagnostics["logit_regret"].shape == ()
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +102,7 @@ class TestRoutingProbabilities:
         router = MoSRAHRouter(config)
         x = torch.randn(3, 10, 64)
         active_mask = torch.ones(3, 10, dtype=torch.bool)
-        _, routing_probs, _ = router(x, active_mask, None)
+        _, routing_probs, _ = router(x, active_mask)
         token_sums = routing_probs.sum(dim=-1)
         assert torch.allclose(token_sums, torch.ones_like(token_sums), atol=1e-5)
 
@@ -118,9 +112,8 @@ class TestRoutingProbabilities:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, routing_probs, _ = router(x, active_mask, None)
+        _, routing_probs, _ = router(x, active_mask)
         assert (routing_probs >= 0).all()
-
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +127,7 @@ class TestSelectedHeads:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        selected_heads, _, _ = router(x, active_mask, None)
+        selected_heads, _, _ = router(x, active_mask)
         assert (selected_heads >= 0).all()
         assert (selected_heads < config.num_mosrah_heads).all()
 
@@ -148,7 +141,7 @@ class TestSelectedHeads:
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        selected_heads, _, _ = router(x, active_mask, None)
+        selected_heads, _, _ = router(x, active_mask)
         B, N, K = selected_heads.shape
         for b in range(B):
             for n in range(N):
@@ -162,12 +155,12 @@ class TestSelectedHeads:
 class TestGradients:
     """Tests certifying gradient flow in the coupled single-projection architecture.
 
-    routing_weight is the only routing parameter. Both task loss and load_balance_loss
+    routing_weight is the only routing parameter. Both task loss and regret_loss
     must train it directly — there is no gradient isolation between the two signals.
     """
 
-    def test_load_balance_loss_reaches_routing_weight(self):
-        """Backward on load_balance_loss must populate routing_weight.grad with a
+    def test_regret_loss_reaches_routing_weight(self):
+        """Backward on regret_loss must populate routing_weight.grad with a
         non-zero, finite gradient — confirming the loss trains the routing projection."""
         torch.manual_seed(0)
         config = small_config()
@@ -175,8 +168,8 @@ class TestGradients:
         x = torch.randn(2, 8, config.embedding_width)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
 
-        _, _, diagnostics = router(x, active_mask, None)
-        diagnostics["load_balance_loss"].backward()
+        _, _, diagnostics = router(x, active_mask)
+        diagnostics["regret_loss"].backward()
 
         assert router.routing_weight.grad is not None
         assert router.routing_weight.grad.abs().sum().item() > 0.0
@@ -190,14 +183,14 @@ class TestGradients:
         x = torch.randn(2, 8, config.embedding_width)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
 
-        _, routing_probs, _ = router(x, active_mask, None)
+        _, routing_probs, _ = router(x, active_mask)
         routing_probs.sum().backward()
 
         assert router.routing_weight.grad is not None
         assert router.routing_weight.grad.abs().sum().item() > 0.0
 
-    def test_load_balance_loss_reaches_input(self):
-        """Backward on load_balance_loss must populate x.grad — confirming gradient
+    def test_regret_loss_reaches_input(self):
+        """Backward on regret_loss must populate x.grad — confirming gradient
         flows through the router input, not just to routing_weight."""
         torch.manual_seed(0)
         config = small_config()
@@ -205,8 +198,8 @@ class TestGradients:
         x = torch.randn(2, 8, config.embedding_width, requires_grad=True)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
 
-        _, _, diagnostics = router(x, active_mask, None)
-        diagnostics["load_balance_loss"].backward()
+        _, _, diagnostics = router(x, active_mask)
+        diagnostics["regret_loss"].backward()
 
         assert x.grad is not None
         assert x.grad.abs().sum().item() > 0.0
@@ -219,40 +212,39 @@ class TestGradients:
 class TestRouterDiagnostics:
     """Tests for the router_diagnostics dict returned from MoSRAHRouter.forward.
 
-    Verifies the exact three-key contract {load_balance_loss, max_vio, logit_std},
-    that load_balance_loss retains gradient, and that monitoring scalars are detached.
+    Verifies the exact three-key contract {regret_loss, logit_regret, logit_std},
+    that regret_loss retains gradient, and that monitoring scalars are detached.
     """
 
     def test_diagnostics_has_exactly_three_keys(self):
-        """router_diagnostics must expose exactly {load_balance_loss, max_vio, logit_std}."""
+        """router_diagnostics must expose exactly {regret_loss, logit_regret, logit_std}."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, diagnostics = router(x, active_mask, None)
-        assert set(diagnostics.keys()) == {"load_balance_loss", "max_vio", "logit_std"}
+        _, _, diagnostics = router(x, active_mask)
+        assert set(diagnostics.keys()) == {"regret_loss", "logit_regret", "logit_std"}
 
-    def test_load_balance_loss_has_gradient(self):
-        """load_balance_loss must retain its gradient; it is the training signal."""
+    def test_regret_loss_has_gradient(self):
+        """regret_loss must retain its gradient; it is the training signal."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, diagnostics = router(x, active_mask, None)
-        assert diagnostics["load_balance_loss"].requires_grad
+        _, _, diagnostics = router(x, active_mask)
+        assert diagnostics["regret_loss"].requires_grad
 
-    def test_diagnostic_scalars_are_detached(self):
-        """max_vio and logit_std must be detached — they are monitoring metrics."""
+    def test_monitoring_scalars_are_detached(self):
+        """logit_regret and logit_std must be detached — they are monitoring metrics only."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
         active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, diagnostics = router(x, active_mask, None)
-        for key in ("max_vio", "logit_std"):
+        _, _, diagnostics = router(x, active_mask)
+        for key in ("logit_regret", "logit_std"):
             assert not diagnostics[key].requires_grad, (
                 f"diagnostic scalar '{key}' must be detached but requires_grad is True"
             )
-
 
 
 # ---------------------------------------------------------------------------
@@ -286,75 +278,116 @@ class TestArchitectureInvariants:
 
 
 # ---------------------------------------------------------------------------
-# MaxVio
+# Regret loss
 # ---------------------------------------------------------------------------
 
-class TestMaxVio:
-    """Tests for the _compute_max_vio helper and the max_vio forward output.
+class TestRegretLoss:
+    """Hand-calculated verification of _compute_regret.
 
-    The helper is tested directly with synthetic assignment_mask tensors, bypassing
-    TopK entirely. This avoids the tie-breaking ambiguity that arises when all
-    routing scores are equal and makes the expected values exact and analytical.
-
-    All three numerical tests use B=1, L=4, K=1 and analytically derived expected
-    values. assignment_mask is constructed via scatter from known head selections so
-    that reduce_frequency_tokens produces known f_bl values.
+    All cases use B=1, L=2, K=1, N=2 (num_blocks=1, W=2). The static method
+    is called directly with synthetic tensors, bypassing the block solver entirely.
+    This makes expected values exact and analytical.
     """
 
-    def test_max_vio_zero_for_uniform_frequencies(self):
-        """MaxVio must be exactly 0 when all heads receive equal routing frequency.
+    @staticmethod
+    def _make_inputs(
+        routing_scores: list,
+        selected: list,
+        active: list,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build tensors for _compute_regret from plain Python lists.
 
-        With L=4 and one token per head (N=4, K=1), each head gets f=0.25.
-        Every term (f_l - 1/L) is zero, so L * max(f_l - 1/L) = 0.
+        Args:
+            routing_scores: Shape (N, L) list-of-lists, softmax probabilities.
+            selected: Shape (N,) list of expert indices (K=1 per token).
+            active: Shape (N,) list of bools.
+
+        Returns:
+            Tuple of (routing_scores_t, routing_logits_t, selected_heads_blocked, active_mask_t)
+            with B=1, num_blocks=1, W=N, K=1.
         """
-        L = 4
-        # Token i selects head i: f_bl = [0.25, 0.25, 0.25, 0.25]
-        assignment_mask = torch.eye(L).unsqueeze(0)        # (1, 4, 4)
-        active_mask = torch.ones(1, L, dtype=torch.bool)
-        max_vio = MoSRAHRouter._compute_max_vio(assignment_mask, active_mask, L)
-        assert torch.isclose(max_vio, torch.tensor(0.0), atol=1e-6)
+        # B=1; N and L inferred from routing_scores.
+        scores_t  = torch.tensor([routing_scores], dtype=torch.float32)       # (1, N, L)
+        # Log of scores as stand-in logits — only relative ordering matters for
+        # logit_regret, which is a detached monitoring scalar in these tests.
+        logits_t  = torch.log(scores_t.clamp(min=1e-9))                       # (1, N, L)
+        N = len(selected)
+        # selected_heads_blocked: (B=1, nb=1, W=N, K=1)
+        sel_t = torch.tensor([[[[s] for s in selected]]], dtype=torch.long)
+        act_t = torch.tensor([active], dtype=torch.bool)                       # (1, N)
+        return scores_t, logits_t, sel_t, act_t
 
-    def test_max_vio_one_for_double_fair_share(self):
-        """MaxVio must be exactly 1 when one head receives double its fair share.
+    def test_nonzero_regret(self):
+        """regret_loss must equal 0.2 when both experts are assigned sub-optimally.
 
-        With L=4, N=6, K=1: 3 tokens to head 0, 1 each to heads 1-3.
-        f_bl = [3/6, 1/6, 1/6, 1/6] = [0.5, 1/6, 1/6, 1/6].
-        MaxVio = 4 * (0.5 - 0.25) = 1.0.
+        Setup: B=1, L=2, K=1, N=2 (one block of W=2).
+        Token 0 → expert 0, token 1 → expert 1.
+        Expert 0: p_chosen=0.6, p_max=max(0.6, 0.8)=0.8 → regret=0.2
+        Expert 1: p_chosen=0.2, p_max=max(0.4, 0.2)=0.4 → regret=0.2
+        regret_loss = (0.2 + 0.2) / (1 block × 2 experts) = 0.2
         """
-        L, N = 4, 6
-        heads_selected = torch.tensor([[0, 0, 0, 1, 2, 3]]).unsqueeze(-1)  # (1, 6, 1)
-        assignment_mask = torch.zeros(1, N, L).scatter_(-1, heads_selected, 1.0)
-        active_mask = torch.ones(1, N, dtype=torch.bool)
-        max_vio = MoSRAHRouter._compute_max_vio(assignment_mask, active_mask, L)
-        assert torch.isclose(max_vio, torch.tensor(1.0), atol=1e-6)
+        scores, logits, selected, active = self._make_inputs(
+            routing_scores=[[0.6, 0.4], [0.8, 0.2]],
+            selected=[0, 1],
+            active=[True, True],
+        )
 
-    def test_max_vio_intermediate_value(self):
-        """MaxVio must equal 0.5 when one head receives 1.5× its fair share.
+        regret_loss, _ = MoSRAHRouter._compute_regret(scores, logits, selected, active)
 
-        With L=4, N=8, K=1: 3 tokens to head 0, then 2/2/1 to heads 1/2/3.
-        f_bl = [3/8, 2/8, 2/8, 1/8] = [0.375, 0.25, 0.25, 0.125].
-        MaxVio = 4 * (0.375 - 0.25) = 0.5.
+        assert regret_loss.item() == pytest.approx(0.2, abs=1e-6)
+
+    def test_zero_regret(self):
+        """regret_loss must be exactly 0 when every expert is assigned at its
+        peak-preference token within the block.
+
+        Setup: B=1, L=2, K=1, N=2 (one block of W=2).
+        Token 0 → expert 0, token 1 → expert 1.
+        Expert 0: p_chosen=0.6, p_max=max(0.6, 0.3)=0.6 → regret=0
+        Expert 1: p_chosen=0.7, p_max=max(0.4, 0.7)=0.7 → regret=0
+        regret_loss = 0.0
         """
-        L, N = 4, 8
-        heads_selected = torch.tensor([[0, 0, 0, 1, 2, 3, 1, 2]]).unsqueeze(-1)  # (1, 8, 1)
-        assignment_mask = torch.zeros(1, N, L).scatter_(-1, heads_selected, 1.0)
-        active_mask = torch.ones(1, N, dtype=torch.bool)
-        max_vio = MoSRAHRouter._compute_max_vio(assignment_mask, active_mask, L)
-        assert torch.isclose(max_vio, torch.tensor(0.5), atol=1e-6)
+        scores, logits, selected, active = self._make_inputs(
+            routing_scores=[[0.6, 0.4], [0.3, 0.7]],
+            selected=[0, 1],
+            active=[True, True],
+        )
 
-    def test_max_vio_is_detached(self):
-        """max_vio must not be part of the autograd graph.
+        regret_loss, _ = MoSRAHRouter._compute_regret(scores, logits, selected, active)
 
-        MaxVio is a monitoring scalar. It must never contribute gradients to any
-        parameter regardless of how the caller uses it.
+        assert regret_loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_dead_token_excluded_from_max(self):
+        """regret_loss must be 0.2 when a dead token is assigned and excluded from p_max.
+
+        Setup: B=1, L=2, K=1, N=2 (one block of W=2).
+        Token 0 alive → expert 0, token 1 dead → expert 1.
+        Expert 0: p_chosen=0.6 (alive), p_max=max(1.0×0.6, 0.0×0.8)=0.6 → regret=0
+        Expert 1: p_chosen=0 (dead, gated), p_max=max(1.0×0.4, 0.0×0.2)=0.4 → regret=0.4
+        regret_loss = (0 + 0.4) / (1 block × 2 experts) = 0.2
         """
-        config = small_config()
-        router = MoSRAHRouter(config)
-        x = torch.randn(2, 8, 64)
-        active_mask = torch.ones(2, 8, dtype=torch.bool)
-        _, _, diagnostics = router(x, active_mask, None)
-        max_vio = diagnostics["max_vio"]
-        assert not max_vio.requires_grad
+        scores, logits, selected, active = self._make_inputs(
+            routing_scores=[[0.6, 0.4], [0.8, 0.2]],
+            selected=[0, 1],
+            active=[True, False],
+        )
+
+        regret_loss, _ = MoSRAHRouter._compute_regret(scores, logits, selected, active)
+
+        assert regret_loss.item() == pytest.approx(0.2, abs=1e-6)
+
+    def test_regret_loss_has_gradient_logit_regret_detached(self):
+        """regret_loss must have requires_grad=True; logit_regret must be detached."""
+        scores, logits, selected, active = self._make_inputs(
+            routing_scores=[[0.6, 0.4], [0.8, 0.2]],
+            selected=[0, 1],
+            active=[True, True],
+        )
+        scores = scores.requires_grad_(True)
+
+        regret_loss, logit_regret = MoSRAHRouter._compute_regret(scores, logits, selected, active)
+
+        assert regret_loss.requires_grad
+        assert not logit_regret.requires_grad
 
 
 # ---------------------------------------------------------------------------
@@ -362,10 +395,10 @@ class TestMaxVio:
 # ---------------------------------------------------------------------------
 
 class TestMaskedContinuationBehavior:
-    def test_dead_tokens_do_not_affect_load_balance_loss(self):
-        """Changing a dead token's hidden state must not affect load_balance_loss.
+    def test_dead_tokens_do_not_affect_regret_loss(self):
+        """Changing a dead token's hidden state must not affect regret_loss.
 
-        Verified by marking a token dead, computing load_balance_loss, then replacing
+        Verified by marking a token dead, computing regret_loss, then replacing
         that token's hidden state with a drastically different value and confirming
         the loss is unchanged. The large multiplier ensures the dead token's routing
         selection almost certainly changes, so any leak would be detected.
@@ -378,405 +411,76 @@ class TestMaskedContinuationBehavior:
 
         torch.manual_seed(11)
         x = torch.randn(B, N, config.embedding_width)
-        _, _, diag_a = router(x, active_mask, None)
-        loss_a = diag_a["load_balance_loss"]
+        _, _, diag_a = router(x, active_mask)
+        loss_a = diag_a["regret_loss"]
 
         x_modified = x.clone()
         x_modified[0, 3] = torch.randn(config.embedding_width) * 100.0
-        _, _, diag_b = router(x_modified, active_mask, None)
-        loss_b = diag_b["load_balance_loss"]
+        _, _, diag_b = router(x_modified, active_mask)
+        loss_b = diag_b["regret_loss"]
 
         torch.testing.assert_close(loss_a, loss_b)
 
-    def test_dead_tokens_do_not_affect_max_vio(self):
-        """Changing a dead token's hidden state must not affect max_vio."""
-        config = small_config()
-        router = MoSRAHRouter(config)
-        B, N = 2, 8
-        active_mask = torch.ones(B, N, dtype=torch.bool)
-        active_mask[1, 5] = False
 
-        torch.manual_seed(17)
-        x = torch.randn(B, N, config.embedding_width)
-        _, _, diag_a = router(x, active_mask, None)
-        vio_a = diag_a["max_vio"]
+# ---------------------------------------------------------------------------
+# Block balance
+# ---------------------------------------------------------------------------
 
-        x_modified = x.clone()
-        x_modified[1, 5] = torch.randn(config.embedding_width) * 100.0
-        _, _, diag_b = router(x_modified, active_mask, None)
-        vio_b = diag_b["max_vio"]
+class TestBlockBalance:
+    """Tests for block-balanced exact load balance.
 
-        torch.testing.assert_close(vio_a, vio_b)
+    With W = L/K, every expert must appear exactly once per block of W tokens.
+    """
 
-    def test_all_live_mask_gives_max_vio_matching_direct_static_call(self):
-        """With all tokens live, router forward max_vio must match _compute_max_vio called directly.
+    def test_each_expert_used_exactly_once_per_block(self):
+        """Every expert must appear exactly once per routing block in selected_heads.
 
-        Builds assignment_mask from selected_heads via scatter and calls the static method
-        independently, confirming the router forward correctly wires to _compute_max_vio.
+        With L=8, K=4, W=2: each 2-token block covers all 8 experts exactly once.
         """
-        config = small_config()
+        torch.manual_seed(0)
+        config = small_config(num_mosrah_heads=8, num_selected_heads=4)
         router = MoSRAHRouter(config)
-        B, N = 2, 8
-        L = config.num_mosrah_heads
-        active_mask = torch.ones(B, N, dtype=torch.bool)
-
-        torch.manual_seed(13)
+        B, N = 2, 12  # 6 complete blocks of W=2
         x = torch.randn(B, N, config.embedding_width)
+        active_mask = torch.ones(B, N, dtype=torch.bool)
 
         with torch.no_grad():
-            selected_heads, _, diagnostics = router(x, active_mask, None)
-            max_vio = diagnostics["max_vio"]
+            selected_heads, _, _ = router(x, active_mask)
 
-            # Build assignment_mask from selected_heads via scatter and call directly.
-            assignment_mask = torch.zeros(B, N, L)
-            assignment_mask.scatter_(-1, selected_heads, 1.0)
-            expected_max_vio = MoSRAHRouter._compute_max_vio(assignment_mask, active_mask, L)
+        L, W = config.num_mosrah_heads, router.block_length
+        num_blocks = N // W
+        assignment = torch.zeros(B, N, L, dtype=torch.long)
+        assignment.scatter_(-1, selected_heads, 1)
+        expert_counts = assignment.view(B, num_blocks, W, L).sum(dim=2)  # (B, blocks, L)
+        expected = torch.ones(B, num_blocks, L, dtype=torch.long)
+        assert torch.equal(expert_counts, expected), (
+            f"Expert counts per block not exactly 1. "
+            f"Max: {expert_counts.max().item()}, Min: {expert_counts.min().item()}"
+        )
 
-        torch.testing.assert_close(max_vio, expected_max_vio)
-
-
-# ---------------------------------------------------------------------------
-# balance_capacity
-# ---------------------------------------------------------------------------
-
-class TestBalanceCapacity:
-    """Tests for MoSRAHRouter.balance_capacity.
-
-    Called directly as a static method with synthetic logits to verify
-    each path independently of the full router forward pass.
-    """
-
-    def test_training_passthrough_when_n_below_capacity(self):
-        """When N < capacity in training mode, logits are returned unchanged."""
-        logits = torch.randn(2, 3, 4)
-        result = MoSRAHRouter.balance_capacity(logits, None, capacity=8, min_choices=1, max_rounds=10)
-        assert torch.equal(result, logits)
-
-    def test_training_correct_tokens_masked(self):
-        """Both capacity constraints hold when N > capacity.
-
-        N=5, L=2, capacity=3: total capacity (6) exceeds N*min_choices (5), so
-        a valid assignment exists. Verifies column and row bounds both hold.
-        """
-        logits = torch.tensor([[[5.0, 0.4], [3.0, 0.3], [1.0, 0.2], [4.0, 0.1], [2.0, 0.0]]])  # (1, 5, 2)
-        result = MoSRAHRouter.balance_capacity(logits, None, capacity=3, min_choices=1, max_rounds=10)
-        unmasked = result > -1e7
-        assert (unmasked.sum(dim=-2) <= 3).all()   # column bound: at most 3 tokens per expert
-        assert (unmasked.sum(dim=-1) >= 1).all()   # row bound: every token has at least 1 expert
-
-    def test_training_surviving_count_equals_capacity(self):
-        """With N > capacity, at most capacity logits per (batch, head) are unmasked,
-        and every token retains at least min_choices experts."""
-        B, N, L, capacity, min_choices = 2, 10, 4, 3, 1
-        torch.manual_seed(0)
-        logits = torch.randn(B, N, L)
-        result = MoSRAHRouter.balance_capacity(logits, None, capacity=capacity, min_choices=min_choices, max_rounds=10)
-        unmasked = result > -1e7
-        assert (unmasked.sum(dim=-2) <= capacity).all()   # column bound
-        assert (unmasked.sum(dim=-1) >= min_choices).all()  # row bound
-
-    def test_training_no_masking_when_n_equals_capacity(self):
-        """When N == capacity every token is within the limit — nothing is masked."""
-        torch.manual_seed(2)
-        logits = torch.randn(2, 4, 3)
-        result = MoSRAHRouter.balance_capacity(logits, None, capacity=4, min_choices=1, max_rounds=10)
-        assert torch.equal(result, logits)
-
-    def test_inference_full_head_blocks_all_tokens(self):
-        """When used_capacity equals capacity, all tokens for that head are masked.
-
-        With L=2 and min_choices=1, the token still has the other head available,
-        so the row bound is satisfied while the full head is correctly blocked.
-        """
-        B, N, L, capacity = 1, 4, 2, 4
+    def test_block_balance_holds_for_non_multiple_sequence_length(self):
+        """Block balance must hold for complete blocks when N is not a multiple of W."""
         torch.manual_seed(3)
-        logits = torch.randn(B, N, L)
-        # head 0 fully used, head 1 empty
-        used_capacity = torch.tensor([[capacity, 0]])
-        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity, min_choices=1, max_rounds=10)
-        assert (result[0, :, 0] <= -1e7).all()
+        config = small_config(num_mosrah_heads=8, num_selected_heads=4)
+        router = MoSRAHRouter(config)
+        B, N, W = 1, 13, router.block_length  # W=2, 6 complete blocks + 1 partial
 
-    def test_inference_correct_tokens_survive_per_head(self):
-        """Both constraints hold for known logits with per-head used_capacity.
+        x = torch.randn(B, N, config.embedding_width)
+        active_mask = torch.ones(B, N, dtype=torch.bool)
 
-        Uses a (1, 3, 2) case: head 0 has remaining=2, head 1 has remaining=1.
-        Total remaining (3) equals N*min_choices (3) — feasible but tight.
-        """
-        # B=1, N=3, L=2, capacity=4
-        # head 0: used=2 → remaining=2; head 1: used=3 → remaining=1
-        logits = torch.tensor([[[10.0, 9.0], [7.0, 6.0], [4.0, 3.0]]])
-        used_capacity = torch.tensor([[2, 3]])
-        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=4, min_choices=1, max_rounds=10)
-        unmasked = result > -1e7
-        remaining = (torch.tensor([[4, 4]]) - used_capacity).clamp(min=0)  # [[2, 1]]
-        assert (unmasked.sum(dim=-2) <= remaining).all()   # column bound
-        assert (unmasked.sum(dim=-1) >= 1).all()           # row bound
+        with torch.no_grad():
+            selected_heads, _, _ = router(x, active_mask)
 
-    def test_inference_n_less_than_capacity_empty_head_passes(self):
-        """With N < capacity and an empty head, the single token must not be masked.
-
-        This is the standard decode-step case: one new token, head has room.
-        """
-        B, N, L, capacity = 1, 1, 2, 8
-        torch.manual_seed(4)
-        logits = torch.randn(B, N, L)
-        used_capacity = torch.zeros(B, L, dtype=torch.long)
-        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity, min_choices=1, max_rounds=10)
-        assert (result > -1e7).all()
-
-    def test_inference_n_less_than_capacity_full_head_blocks(self):
-        """With N < capacity and a full head, that head's token must be masked.
-
-        N=1, L=2, min_choices=1: head 0 is full so its token is masked, but
-        head 1 is empty so the token still has one valid choice — row bound met.
-        """
-        B, N, L, capacity = 1, 1, 2, 8
-        torch.manual_seed(5)
-        logits = torch.randn(B, N, L)
-        # head 0 full, head 1 empty
-        used_capacity = torch.tensor([[capacity, 0]])
-        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity, min_choices=1, max_rounds=10)
-        assert (result[0, :, 0] <= -1e7).all()
-        assert (result[0, :, 1] > -1e7).all()
-
-    def test_both_constraints_satisfied_training(self):
-        """Both column and row bounds hold simultaneously under a tight capacity budget.
-
-        N=32, L=4, capacity=25, min_choices=3. Total capacity (100) > N*K (96),
-        so a valid assignment exists, but the budget is tight enough to require
-        real enforcement.
-        """
-        B, N, L, capacity, min_choices = 1, 32, 4, 25, 3
-        torch.manual_seed(7)
-        logits = torch.randn(B, N, L)
-        result = MoSRAHRouter.balance_capacity(logits, None, capacity=capacity, min_choices=min_choices, max_rounds=10)
-        unmasked = result > -1e7
-        assert (unmasked.sum(dim=-2) <= capacity).all(), "column bound violated"
-        assert (unmasked.sum(dim=-1) >= min_choices).all(), "row bound violated"
-
-    def test_both_constraints_satisfied_inference(self):
-        """Both bounds hold simultaneously with mixed per-head remaining capacities."""
-        B, N, L, capacity, min_choices = 1, 16, 4, 20, 2
-        torch.manual_seed(8)
-        logits = torch.randn(B, N, L)
-        # Give each head a different used value; remaining = [18, 15, 12, 9]
-        used_capacity = torch.tensor([[2, 5, 8, 11]])
-        remaining = (capacity - used_capacity).clamp(min=0)  # (1, 4)
-        result = MoSRAHRouter.balance_capacity(logits, used_capacity, capacity=capacity, min_choices=min_choices, max_rounds=10)
-        unmasked = result > -1e7
-        assert (unmasked.sum(dim=-2) <= remaining).all(), "column bound violated"
-        assert (unmasked.sum(dim=-1) >= min_choices).all(), "row bound violated"
-
-    def test_non_convergence_raises(self):
-        """Infeasible config (total capacity < N * K) must raise RuntimeError in eager."""
-        # L=4, capacity=2 → total=8; N=8, min_choices=3 → demand=24. Infeasible.
-        B, N, L, capacity, min_choices = 1, 8, 4, 2, 3
-        logits = torch.randn(B, N, L)
-        with pytest.raises((RuntimeError, AssertionError)):
-            MoSRAHRouter.balance_capacity(logits, None, capacity=capacity, min_choices=min_choices, max_rounds=10)
-
-
-class TestRouterRealizedCapacityFuzz:
-    """Fuzz tests for the router's realized selected-head capacity contract.
-
-    Packing consumes the final `selected_heads` index tensor, not the router's
-    internal capacity mask. The contract tested here is therefore only the
-    downstream-relevant one: after routing, no active `(batch, expert)` bucket
-    may contain more routed token copies than `config.mosrah_packed_length`.
-
-    This suite fixes the architecture/config, reads the actual packed capacity
-    from config, varies runtime sequence length to hit a target capacity-use
-    ratio, and counts the realized selected-head indices.
-    """
-
-    NUM_TRIALS = 100
-    BATCH_SIZE = 4
-    TRAINING_SEQUENCE_LENGTH = 256
-    MAX_BID_ROUNDS = 64
-
-    SPARSITY_PROFILES = (
-        (16, 16),
-        (32, 16),
-        (64, 16),
-    )
-
-    @staticmethod
-    def _make_config(num_mosrah_heads: int, num_selected_heads: int) -> ShramConfig:
-        """Build the router config for one sparsity profile.
-
-        The production path obtains packed capacity from
-        `config.mosrah_packed_length`. The test does the same so it certifies
-        the same capacity boundary consumed later by expert packing.
-        """
-
-        return small_config(
-            embedding_width=64,
-            num_mosrah_heads=num_mosrah_heads,
-            num_selected_heads=num_selected_heads,
-            num_sliding_window_heads=4,
-            head_dim=16,
-            training_sequence_length=(
-                TestRouterRealizedCapacityFuzz.TRAINING_SEQUENCE_LENGTH
-            ),
-            inference_sequence_length=(
-                TestRouterRealizedCapacityFuzz.TRAINING_SEQUENCE_LENGTH
-            ),
-            mosrah_overallocation_factor=1.25,
-            max_bid_rounds=TestRouterRealizedCapacityFuzz.MAX_BID_ROUNDS,
-            use_cache=False,
+        L = config.num_mosrah_heads
+        complete_blocks = N // W
+        assignment = torch.zeros(B, N, L, dtype=torch.long)
+        assignment.scatter_(-1, selected_heads, 1)
+        expert_counts = assignment[:, :complete_blocks * W, :].view(B, complete_blocks, W, L).sum(dim=2)
+        expected = torch.ones(B, complete_blocks, L, dtype=torch.long)
+        assert torch.equal(expert_counts, expected), (
+            f"Expert counts in complete blocks not exactly 1. "
+            f"Max: {expert_counts.max().item()}, Min: {expert_counts.min().item()}"
         )
-
-    @staticmethod
-    def _runtime_length_for_capacity_use(
-        capacity_use: float,
-        capacity: int,
-        num_mosrah_heads: int,
-        num_selected_heads: int,
-    ) -> int:
-        """Return runtime token count for the requested capacity-use ratio.
-
-        Capacity use is `N * K / (C * L)`, where `N` is runtime token count,
-        `K` is selected heads per token, `C` is per-expert packed capacity, and
-        `L` is total MoSRAH heads. In practice `L`, `K`, and `C` are fixed by
-        architecture/config; `N` is the runtime load knob.
-        """
-
-        return int(
-            capacity_use
-            * capacity
-            * num_mosrah_heads
-            / num_selected_heads
-        )
-
-    @staticmethod
-    def _count_selected_heads(
-        selected_heads: torch.Tensor,
-        active_mask: torch.Tensor,
-        num_mosrah_heads: int,
-    ) -> torch.Tensor:
-        """Count active routed token copies per `(batch, expert)` bucket."""
-
-        batch_size = selected_heads.shape[0]
-
-        counts = torch.zeros(
-            batch_size,
-            num_mosrah_heads,
-            dtype=torch.long,
-            device=selected_heads.device,
-        )
-
-        active_selected_heads = selected_heads.masked_fill(
-            ~active_mask.unsqueeze(-1),
-            0,
-        )
-
-        active_copies = active_mask.unsqueeze(-1).expand_as(selected_heads)
-        src = active_copies.to(dtype=torch.long)
-
-        counts.scatter_add_(
-            dim=-1,
-            index=active_selected_heads.reshape(batch_size, -1),
-            src=src.reshape(batch_size, -1),
-        )
-
-        return counts
-
-    def _run_realized_capacity_fuzz(
-        self,
-        device: torch.device,
-        capacity_use: float,
-    ) -> None:
-        """Run randomized realized-capacity trials for one capacity-use ratio."""
-
-        generator = torch.Generator(device=device)
-        generator.manual_seed(19317)
-
-        for num_mosrah_heads, num_selected_heads in self.SPARSITY_PROFILES:
-            try:
-                config = self._make_config(num_mosrah_heads, num_selected_heads)
-                router = MoSRAHRouter(config).to(device)
-
-                capacity = config.mosrah_packed_length
-                runtime_length = self._runtime_length_for_capacity_use(
-                    capacity_use,
-                    capacity,
-                    num_mosrah_heads,
-                    num_selected_heads,
-                )
-
-                assert runtime_length > 0
-
-                actual_capacity_use = (
-                    runtime_length
-                    * num_selected_heads
-                    / (capacity * num_mosrah_heads)
-                )
-
-                for trial in range(self.NUM_TRIALS):
-                    x = torch.randn(
-                        self.BATCH_SIZE,
-                        runtime_length,
-                        config.embedding_width,
-                        generator=generator,
-                        device=device,
-                    )
-                    active_mask = torch.ones(
-                        self.BATCH_SIZE,
-                        runtime_length,
-                        dtype=torch.bool,
-                        device=device,
-                    )
-
-                    selected_heads, _, _ = router(
-                        x,
-                        active_mask,
-                        used_capacity=None,
-                    )
-
-                    assert selected_heads.shape == (
-                        self.BATCH_SIZE,
-                        runtime_length,
-                        num_selected_heads,
-                    )
-
-                    counts = self._count_selected_heads(
-                        selected_heads,
-                        active_mask,
-                        num_mosrah_heads,
-                    )
-
-                    max_count = counts.max().item()
-
-                    assert max_count <= capacity, (
-                        "router exceeded realized packed capacity: "
-                        f"requested_capacity_use={capacity_use}, "
-                        f"actual_capacity_use={actual_capacity_use}, "
-                        f"trial={trial}, "
-                        f"B={self.BATCH_SIZE}, "
-                        f"N={runtime_length}, "
-                        f"L={num_mosrah_heads}, "
-                        f"K={num_selected_heads}, "
-                        f"C={capacity}, "
-                        f"max_count={max_count}, "
-                        f"counts={counts}"
-                    )
-            except Exception as err:
-                raise err # Debugging aid.
-
-    def test_realized_capacity_fuzz_50_percent(self, device):
-        """Final selected_heads must obey capacity at 50% packed-capacity use."""
-
-        self._run_realized_capacity_fuzz(device, capacity_use=0.50)
-
-    def test_realized_capacity_fuzz_80_percent(self, device):
-        """Final selected_heads must obey capacity at 80% packed-capacity use."""
-
-        self._run_realized_capacity_fuzz(device, capacity_use=0.80)
-
-    def test_realized_capacity_fuzz_90_percent(self, device):
-        """Final selected_heads must obey capacity at 90% packed-capacity use."""
-
-        self._run_realized_capacity_fuzz(device, capacity_use=0.90)
 
 
 class TestRouterCompileEquivalenceFuzz:
@@ -785,7 +489,7 @@ class TestRouterCompileEquivalenceFuzz:
     This suite certifies that compiling the router does not change its forward
     contract. It intentionally compares the full router outputs, not just the
     realized capacity counts, because the compile boundary should preserve
-    selection, probabilities, load-balance loss, and monitoring output for the
+    selection, probabilities, regret_loss, and monitoring output for the
     same module state and input tensors.
 
     The tests are CUDA-only because this project already treats uncached
@@ -795,7 +499,6 @@ class TestRouterCompileEquivalenceFuzz:
     NUM_TRIALS = 25
     BATCH_SIZE = 4
     TRAINING_SEQUENCE_LENGTH = 256
-    MAX_BID_ROUNDS = 64
 
     SPARSITY_PROFILES = (
         (16, 16),
@@ -823,7 +526,6 @@ class TestRouterCompileEquivalenceFuzz:
                 TestRouterCompileEquivalenceFuzz.TRAINING_SEQUENCE_LENGTH
             ),
             mosrah_overallocation_factor=1.25,
-            max_bid_rounds=TestRouterCompileEquivalenceFuzz.MAX_BID_ROUNDS,
             use_cache=False,
         )
 
@@ -906,14 +608,12 @@ class TestRouterCompileEquivalenceFuzz:
                     eager_selected, eager_probs, eager_diag = router(
                         x,
                         active_mask,
-                        used_capacity=None,
                     )
 
                     compiled_selected, compiled_probs, compiled_diag = (
                         compiled_router(
                             x,
                             active_mask,
-                            None,
                         )
                     )
                 assert eager_selected.dtype == compiled_selected.dtype
@@ -980,300 +680,6 @@ class TestRouterCompileEquivalenceFuzz:
 
         self._run_compile_equivalence_fuzz(device, capacity_use=0.90)
 
-# ---------------------------------------------------------------------------
-# get_mask
-# ---------------------------------------------------------------------------
-
-# Alias the static method so tests call the production code directly without
-# being coupled to the class name in every assertion.
-get_mask = MoSRAHRouter.get_best_proposals
-
-
-def make_tensor(*shape):
-    """Deterministic tensor for reproducible tests."""
-    return torch.arange(math.prod(shape), dtype=torch.float).reshape(shape)
-
-
-class TestGetMaskContract:
-    """
-    Tests verify the contract: mask has exactly min(n_per_slice, dim_length)
-    True entries per slice along dim, at the highest-valued positions.
-    """
-
-    def test_int_n_selects_top_n_dim_last(self):
-        """Exactly n True entries per row along the last dimension."""
-        t = torch.randn(3, 8)
-        for n in range(1, 8):
-            mask = get_mask(t, dim=-1, n=n, capacity_scalar=8)
-            count = mask.sum(dim=-1)
-            assert (count == n).all(), \
-                f"n={n}: expected {n} True per row, got {count}"
-
-    def test_int_n_selects_top_n_dim_second_last(self):
-        """Exactly n True entries per column along the second-to-last dimension."""
-        t = torch.randn(2, 8, 4)
-        for n in range(1, 8):
-            mask = get_mask(t, dim=-2, n=n, capacity_scalar=8)
-            count = mask.sum(dim=-2)
-            assert (count == n).all(), \
-                f"n={n}: expected {n} True per column"
-
-    def test_tensor_n_selects_top_n_per_row(self):
-        """Each row gets exactly n[row] True entries."""
-        t = torch.randn(4, 8)
-        n = torch.randint(1, 8, (4,))
-        mask = get_mask(t, dim=-1, n=n, capacity_scalar=8)
-        for i in range(t.shape[0]):
-            count = mask[i].sum()
-            assert count.item() == n[i].item(), \
-                f"row {i}: expected {n[i]} True, got {count}"
-
-    def test_tensor_n_column_dim(self):
-        """Tensor-n contract holds for the second-to-last dimension."""
-        t = torch.randn(2, 8, 4)
-        n = torch.randint(1, 8, (2, 4))
-        mask = get_mask(t, dim=-2, n=n, capacity_scalar=8)
-        for b in range(2):
-            for j in range(4):
-                count = mask[b, :, j].sum()
-                assert count.item() == n[b, j].item()
-
-    def test_selected_entries_are_highest_valued(self):
-        """True entries must be the n highest-valued positions per row."""
-        t = torch.randn(3, 8)
-        n = 3
-        mask = get_mask(t, dim=-1, n=n, capacity_scalar=8)
-        for i in range(t.shape[0]):
-            selected_min = t[i][mask[i]].min()
-            unselected_max = t[i][~mask[i]].max()
-            assert selected_min >= unselected_max, \
-                f"row {i}: selected values are not the top {n}"
-
-
-class TestGetMaskBoundaries:
-
-    def test_int_n_zero_returns_all_false(self):
-        """n=0 must return all-False — nothing qualifies."""
-        t = torch.randn(4, 8)
-        mask = get_mask(t, dim=-1, n=0, capacity_scalar=8)
-        assert not mask.any()
-
-    def test_int_n_overflow_returns_all_true(self):
-        """n >= dim_length must return all-True — every entry qualifies."""
-        t = torch.randn(4, 8)
-        mask = get_mask(t, dim=-1, n=9, capacity_scalar=9)   # dim_length == 8
-        assert mask.all()
-
-    def test_tensor_n_zero_positions_return_all_false(self):
-        """Tensor n=0 per row must produce all-False rows."""
-        t = torch.randn(4, 8)
-        n = torch.zeros(4, dtype=torch.long)
-        mask = get_mask(t, dim=-1, n=n, capacity_scalar=8)
-        assert not mask.any()
-
-    def test_tensor_n_overflow_positions_return_all_true(self):
-        """Tensor n >= dim_length per row must produce all-True rows."""
-        t = torch.randn(4, 8)
-        n = torch.full((4,), 9, dtype=torch.long)
-        mask = get_mask(t, dim=-1, n=n, capacity_scalar=9)   # dim_length == 8
-        assert mask.all()
-
-    def test_tensor_n_mixed_boundaries_and_valid(self):
-        """n=0 rows all-False, valid n rows correct count, overflow rows all-True."""
-        t = torch.randn(3, 8)
-        # row 0: n=0 (all False), row 1: n=4 (4 True), row 2: n=9 (all True)
-        n = torch.tensor([0, 4, 9])
-        mask = get_mask(t, dim=-1, n=n, capacity_scalar=9)
-        assert not mask[0].any()
-        assert mask[1].sum().item() == 4
-        assert mask[2].all()
-
-
-class TestGetMaskShape:
-
-    def test_output_shape_matches_input_dim_last(self):
-        """Output shape must equal input shape."""
-        t = torch.randn(2, 5, 8)
-        mask = get_mask(t, dim=-1, n=3, capacity_scalar=8)
-        assert tuple(mask.shape) == (2, 5, 8)
-
-    def test_output_shape_matches_input_dim_second_last(self):
-        """Output shape must equal input shape for dim=-2."""
-        t = torch.randn(2, 8, 4)
-        mask = get_mask(t, dim=-2, n=3, capacity_scalar=8)
-        assert tuple(mask.shape) == (2, 8, 4)
-
-    def test_output_is_bool(self):
-        """Output dtype must be bool."""
-        t = torch.randn(4, 8)
-        mask = get_mask(t, dim=-1, n=3, capacity_scalar=8)
-        assert mask.dtype == torch.bool
-
-    def test_device_preserved(self):
-        """Output must be on the same device as the input."""
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        t = torch.randn(4, 8, device=device)
-        mask = get_mask(t, dim=-1, n=3, capacity_scalar=8)
-        assert mask.device.type == device
-
-
-class TestGetMaskIntTensorAgreement:
-    """Int and tensor paths must produce identical masks for the same n values."""
-
-    def test_paths_agree_dim_last(self):
-        t = torch.randn(3, 8)
-        for n_val in range(1, 9):
-            int_mask    = get_mask(t, dim=-1, n=n_val, capacity_scalar=8)
-            tensor_mask = get_mask(t, dim=-1, n=torch.full((3,), n_val), capacity_scalar=8)
-            assert (int_mask == tensor_mask).all(), \
-                f"paths disagree at n={n_val}"
-
-    def test_paths_agree_dim_second_last(self):
-        t = torch.randn(2, 8, 4)
-        for n_val in range(1, 9):
-            int_mask    = get_mask(t, dim=-2, n=n_val, capacity_scalar=8)
-            tensor_mask = get_mask(t, dim=-2, n=torch.full((2, 4), n_val), capacity_scalar=8)
-            assert (int_mask == tensor_mask).all(), \
-                f"paths disagree at n={n_val}"
-
-
-# ---------------------------------------------------------------------------
-# Load balance convergence
-# ---------------------------------------------------------------------------
-
-class TestLoadBalanceConvergence:
-    """Tests that each loss mode reduces routing concentration when used as the sole
-    training signal.
-
-    Each test trains a router from a fixed random initialization using only
-    load_balance_loss, then verifies that max_vio on the training input is lower
-    after training than before. Evaluating on the same input used for training is
-    the correct design: the claim is that the loss reduces concentration on inputs
-    it has seen, not that it generalises to arbitrary unseen inputs.
-
-    A generous overallocation_factor ensures balance_capacity never intervenes,
-    leaving routing fully determined by the learned routing_weight. Adam is used
-    in place of SGD because the training landscape is non-convex and Adam's
-    adaptive step sizes handle the per-parameter curvature differences better.
-
-    CPU-compatible: no CUDA required.
-    """
-
-    B = 2
-    N = 16
-    NUM_STEPS = 500
-    LR = 0.001
-
-    @staticmethod
-    def _measure_max_vio(
-        router: MoSRAHRouter,
-        x: torch.Tensor,
-        active_mask: torch.Tensor,
-    ) -> float:
-        """Return max_vio for a router on a fixed input without modifying router state."""
-        with torch.no_grad():
-            _, _, diag = router(x, active_mask, None)
-        return diag["max_vio"].item()
-
-    @staticmethod
-    def _train_router(
-        router: MoSRAHRouter,
-        x: torch.Tensor,
-        active_mask: torch.Tensor,
-        num_steps: int,
-        lr: float,
-    ) -> None:
-        """Train a router in-place using load_balance_loss as the sole gradient signal."""
-        opt = torch.optim.Adam(router.parameters(), lr=lr)
-        for _ in range(num_steps):
-            opt.zero_grad()
-            _, _, diag = router(x, active_mask, None)
-            diag["load_balance_loss"].backward()
-            opt.step()
-
-    def _run_convergence(self, loss_type: str) -> None:
-        """Train a router with the given loss type and assert max_vio decreases.
-
-        Uses the same fixed x for both the before measurement and the after
-        measurement. All three loss-type variants share the same seed so their
-        starting conditions are identical and results are directly comparable.
-        """
-        torch.manual_seed(42)
-        config = small_config(
-            load_balance_loss_type=loss_type,
-            mosrah_overallocation_factor=2.0,
-        )
-        router = MoSRAHRouter(config)
-        x = torch.randn(self.B, self.N, config.embedding_width)
-        active_mask = torch.ones(self.B, self.N, dtype=torch.bool)
-
-        max_vio_before = self._measure_max_vio(router, x, active_mask)
-        self._train_router(router, x, active_mask, self.NUM_STEPS, self.LR)
-        max_vio_after = self._measure_max_vio(router, x, active_mask)
-
-        assert max_vio_after < max_vio_before, (
-            f"load_balance_loss ({loss_type!r}) must reduce concentration: "
-            f"max_vio before={max_vio_before:.4f}, after={max_vio_after:.4f}"
-        )
-
-    def test_gshard_reduces_concentration(self):
-        """Router trained with gshard loss must reach lower max_vio than at initialization."""
-        self._run_convergence("gshard")
-
-    def test_ce_reduces_concentration(self):
-        """Router trained with ce loss must reach lower max_vio than at initialization."""
-        self._run_convergence("ce")
-
-    def test_bce_reduces_concentration(self):
-        """Router trained with bce loss must reach lower max_vio than at initialization."""
-        self._run_convergence("bce")
-
-    def test_temporal_overcapacity_reduces_concentration(self):
-        """Router trained with temporal_overcapacity loss must reach lower max_vio than at
-        initialization. maximum_expert_overclaim=0 ensures violations fire immediately so
-        the loss is active from the first imbalanced position."""
-        torch.manual_seed(42)
-        config = small_config(
-            load_balance_loss_type="temporal_overcapacity",
-            maximum_expert_overclaim=0,
-            mosrah_overallocation_factor=2.0,
-        )
-        router = MoSRAHRouter(config)
-        x = torch.randn(self.B, self.N, config.embedding_width)
-        active_mask = torch.ones(self.B, self.N, dtype=torch.bool)
-
-        max_vio_before = self._measure_max_vio(router, x, active_mask)
-        self._train_router(router, x, active_mask, self.NUM_STEPS, self.LR)
-        max_vio_after = self._measure_max_vio(router, x, active_mask)
-
-        assert max_vio_after < max_vio_before, (
-            f"load_balance_loss ('temporal_overcapacity') must reduce concentration: "
-            f"max_vio before={max_vio_before:.4f}, after={max_vio_after:.4f}"
-        )
-
-    def test_causal_overcapacity_reduces_concentration(self):
-        """Router trained with causal_overcapacity loss must reach lower max_vio than at
-        initialization. maximum_expert_overclaim=0 ensures violations fire immediately so
-        the loss is active from the first imbalanced position."""
-        torch.manual_seed(42)
-        config = small_config(
-            load_balance_loss_type="causal_overcapacity",
-            maximum_expert_overclaim=0,
-            mosrah_overallocation_factor=2.0,
-        )
-        router = MoSRAHRouter(config)
-        x = torch.randn(self.B, self.N, config.embedding_width)
-        active_mask = torch.ones(self.B, self.N, dtype=torch.bool)
-
-        max_vio_before = self._measure_max_vio(router, x, active_mask)
-        self._train_router(router, x, active_mask, self.NUM_STEPS, self.LR)
-        max_vio_after = self._measure_max_vio(router, x, active_mask)
-
-        assert max_vio_after < max_vio_before, (
-            f"load_balance_loss ('causal_overcapacity') must reduce concentration: "
-            f"max_vio before={max_vio_before:.4f}, after={max_vio_after:.4f}"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Compiled backward
@@ -1301,10 +707,144 @@ class TestCompiledBackward:
         active_mask = torch.ones(2, 16, dtype=torch.bool, device=device)
 
         opt.zero_grad()
-        _, routing_probs, diagnostics = compiled_router(x, active_mask, None)
-        loss = routing_probs.sum() + diagnostics["load_balance_loss"]
+        _, routing_probs, diagnostics = compiled_router(x, active_mask)
+        loss = routing_probs.sum() + diagnostics["regret_loss"]
         loss.backward()
 
         assert router.routing_weight.grad is not None, (
             "routing_weight.grad must be populated after compiled backward"
         )
+
+
+# ---------------------------------------------------------------------------
+# Cached decode inference
+# ---------------------------------------------------------------------------
+
+class TestCachedDecodeInference:
+    """Verify the router's decode mode (N=1 with RouterCache).
+
+    These tests exercise the three-mode router forward: training (cache=None),
+    prefill (N>1 with cache), and decode (N=1 with cache).
+    """
+
+    def _make_router_and_cache(self, **config_kwargs):
+        """Helper: construct a router and a matching RouterCache."""
+        config = small_config(**config_kwargs)
+        torch.manual_seed(42)
+        router = MoSRAHRouter(config)
+        cache = RouterCache(
+            block_length=config.block_length,
+            num_mosrah_heads=config.num_mosrah_heads,
+            batch_size=2,
+            device=torch.device("cpu"),
+        )
+        return router, cache, config
+
+    def test_decode_output_shapes(self):
+        """Decode mode must return (B, 1, K) selected_heads and (B, 1, K) routing_probs."""
+        router, cache, config = self._make_router_and_cache()
+        B, K = 2, config.num_selected_heads
+
+        x = torch.randn(B, 1, config.embedding_width)
+        active_mask = torch.ones(B, 1, dtype=torch.bool)
+
+        selected_heads, routing_probs, diagnostics = router(x, active_mask, cache)
+
+        assert selected_heads.shape == (B, 1, K)
+        assert routing_probs.shape == (B, 1, K)
+
+    def test_decode_selected_heads_valid_range(self):
+        """Decode mode selected_heads must be in [0, L-1]."""
+        router, cache, config = self._make_router_and_cache()
+        L = config.num_mosrah_heads
+
+        x = torch.randn(2, 1, config.embedding_width)
+        active_mask = torch.ones(2, 1, dtype=torch.bool)
+        selected_heads, _, _ = router(x, active_mask, cache)
+
+        assert (selected_heads >= 0).all()
+        assert (selected_heads < L).all()
+
+    def test_decode_routing_probs_sum_to_one(self):
+        """Decode mode routing_probs must sum to 1 per token."""
+        router, cache, config = self._make_router_and_cache()
+
+        x = torch.randn(2, 1, config.embedding_width)
+        active_mask = torch.ones(2, 1, dtype=torch.bool)
+        _, routing_probs, _ = router(x, active_mask, cache)
+
+        sums = routing_probs.sum(dim=-1)  # (B, 1)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+    def test_w_decode_steps_cover_all_experts(self):
+        """W consecutive decode steps must collectively assign every expert exactly once."""
+        # W=2, K=2, L=4 — simplest nontrivial block
+        router, cache, config = self._make_router_and_cache(
+            num_mosrah_heads=4, num_selected_heads=2
+        )
+        W = config.block_length  # = 4 // 2 = 2
+        L = config.num_mosrah_heads
+        B = 2
+
+        all_selected = []
+        for _ in range(W):
+            x = torch.randn(B, 1, config.embedding_width)
+            active_mask = torch.ones(B, 1, dtype=torch.bool)
+            selected_heads, _, _ = router(x, active_mask, cache)
+            all_selected.append(selected_heads[:, 0, :])  # (B, K)
+
+        # Union of selections across W steps: each expert must appear exactly once
+        combined = torch.cat(all_selected, dim=-1)  # (B, W*K = L)
+        for b in range(B):
+            experts_used = combined[b].tolist()
+            assert sorted(experts_used) == list(range(L)), (
+                f"Batch item {b}: expected all {L} experts, got {sorted(experts_used)}"
+            )
+
+    def test_decode_respects_cached_used_in_block(self):
+        """Decode must not select experts already marked as used in the cache."""
+        # Manually pre-fill cache with experts 0..K-1 marked used
+        router, cache, config = self._make_router_and_cache()
+        K = config.num_selected_heads
+        L = config.num_mosrah_heads
+        B = 2
+
+        # Mark experts 0..K-1 as already used in the current block
+        cache._used_in_block[:, :K] = True
+        cache._step_in_block[:] = K
+
+        x = torch.randn(B, 1, config.embedding_width)
+        active_mask = torch.ones(B, 1, dtype=torch.bool)
+        selected_heads, _, _ = router(x, active_mask, cache)
+
+        # Must not select any expert in [0, K-1]
+        for b in range(B):
+            for e in selected_heads[b, 0].tolist():
+                assert e >= K, (
+                    f"Batch {b}: selected expert {e} which was already used in block"
+                )
+
+    def test_decode_diagnostics_are_scalars(self):
+        """Decode mode must return the standard scalar diagnostics dict."""
+        router, cache, config = self._make_router_and_cache()
+
+        x = torch.randn(2, 1, config.embedding_width)
+        active_mask = torch.ones(2, 1, dtype=torch.bool)
+        _, _, diagnostics = router(x, active_mask, cache)
+
+        assert set(diagnostics.keys()) == {"regret_loss", "logit_regret", "logit_std"}
+        for key, val in diagnostics.items():
+            assert val.shape == (), f"{key} must be a scalar"
+
+    def test_decode_regret_loss_is_zero(self):
+        """Decode mode regret_loss must be exactly 0.0 — regret is undefined over a
+        single decode step (not a complete W-token block); returning zero is the
+        correct no-op since backward is never called during inference."""
+        router, cache, config = self._make_router_and_cache()
+
+        x = torch.randn(2, 1, config.embedding_width)
+        active_mask = torch.ones(2, 1, dtype=torch.bool)
+        _, _, diagnostics = router(x, active_mask, cache)
+
+        assert diagnostics["regret_loss"].item() == pytest.approx(0.0, abs=1e-6)
+        assert diagnostics["logit_regret"].item() == pytest.approx(0.0, abs=1e-6)

@@ -17,6 +17,7 @@ import torch
 from torch import nn
 
 from ..cache.mosrah_cache import MoSRAHCache
+from ..cache.router_cache import RouterCache
 from ..configuration import ShramConfig
 from .bottlenecked_ensemble_attention import BottleneckedEnsembleAttention
 from .expert_packing import (
@@ -60,6 +61,7 @@ class MoSRAHLayer(nn.Module):
         position_ids: torch.Tensor,
         active_mask: torch.Tensor,
         cache: MoSRAHCache | None,
+        router_cache: RouterCache | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Run the full MoSRAH sparse path.
 
@@ -77,9 +79,8 @@ class MoSRAHLayer(nn.Module):
         Returns:
             sparse_output: Model-space sparse-path output of shape (B, N, d).
             router_diagnostics: Dict of router feedback scalars. Keys:
-                ``load_balance_loss`` (has grad), ``max_vio``, ``bias_std``,
-                ``raw_logit_std``, ``logit_std``, ``bias_alignment`` (all
-                detached). See MoSRAHRouter for semantics.
+                ``regret_loss`` (has grad), ``logit_regret`` (detached),
+                ``logit_std`` (detached). See MoSRAHRouter for semantics.
         """
 
         # -------------------------------------------------------------------
@@ -93,9 +94,8 @@ class MoSRAHLayer(nn.Module):
         # B*N*K True entries) and the packed active mask (live slots only);
         # active_mask is rebound to the packed form after this point.
         # -------------------------------------------------------------------
-        used_capacity = cache.get_heads_lengths() if cache is not None else None
         selected_heads, routing_probs, router_diagnostics = self.router(
-            hidden_states, active_mask, used_capacity
+            hidden_states, active_mask, router_cache
         )
 
         setup = setup_packing(selected_heads)

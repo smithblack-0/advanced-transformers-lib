@@ -19,6 +19,7 @@ def small_config(**kwargs) -> ShramConfig:
         embedding_width=64,
         mlp_width=128,
         num_mosrah_heads=4,
+        num_selected_heads=1,
         num_decoder_layers=2,
     )
     defaults.update(kwargs)

@@ -81,7 +81,6 @@ A few SHRAM settings are easier to understand in terms of their relationships wi
 - RoPE has two modes of operation. In `"main_sequence"` mode it uses original token positions after packing. In `"semantic_sequence"` mode, MoSRAH instead uses local positions inside each expert bucket.
 - The default configuration has `num_selected_heads == num_mosrah_heads`, meaning every token selects all available expert heads — this is dense routing, not sparse. To engage the sparse regime described in the paper, set `num_selected_heads < num_mosrah_heads`.
 
-`mosrah_overallocation_factor` and `max_bid_rounds` interact and must be tuned together. `mosrah_overallocation_factor` controls how much capacity slack exists above the expected per-head token count under balanced routing — tighter margins mean less room for the capacity-enforcement algorithm to find valid assignments. `max_bid_rounds` is the iteration ceiling for that algorithm. When overallocation margins are tight, more rounds are needed to reach a stable assignment. If `max_bid_rounds` is too small for the capacity tightness, bidding fails to converge and the model raises an assertion. The default values are chosen to work together; if you reduce `mosrah_overallocation_factor` significantly, ensure `max_bid_rounds` is still sufficient.
 
 Ordinary generation modes are intended to work almost completely flawlessly. Greedy, beam, and contrastive paths are explicitly tested. The main caveat worth documenting at the user level is that speculative rollback through `crop()` is not supported due to the use of a sliding-window cache structure.
 
@@ -211,12 +210,11 @@ Relative imports in all Python files are rewritten to match using libcst. The st
 - `model/decoder_layer.py` Owns one transformer block. This is where SHRAM attention and the MLP are threaded together inside a pre-norm residual block.
 - `model/attention/shram.py` Owns the SHRAM hybrid relation `H(x) = h_l(x) + h_s(x)`.
 - `model/attention/mosrah.py` Owns the MoSRAH sparse routed path orchestration.
-- `model/attention/router.py` Owns token-choice routing, routing probabilities, load-balance loss, and MaxVio.
+- `model/attention/router.py` Owns token-choice routing, routing probabilities, and regret loss.
 - `model/attention/expert_packing.py` Owns the token-choice ↔ expert-choice conversion boundary.
 - `model/attention/positions_converter.py` Owns packed position construction for the sparse routed path.
 - `model/attention/sliding_window_attention.py` Owns the local sliding-window attention path.
 - `model/attention/bottlenecked_ensemble_attention.py` Owns BEA itself.
-- `model/attention/load_balance_loss.py` Owns the custom autograd load-balance operator.
 - `model/cache/shram_cache.py` Owns the top-level cache boundary used by the wrapper and HuggingFace.
 - `model/cache/shram_layer_cache.py` Owns the per-layer cache composition: local cache plus sparse cache.
 - `model/cache/sliding_window_cache.py` Owns the local sliding-window cache behavior.

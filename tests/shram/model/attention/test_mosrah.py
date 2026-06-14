@@ -1,11 +1,10 @@
 """Tests for the full MoSRAH sparse path.
 
-Invariants verified: model-space output shape, propagation of load_balance_loss,
-propagation of max_vio as a detached scalar, weighted reduction semantics, support
-for both RoPE position modes, uncached execution, cached execution with the real
-layer-local cache, cached/uncached external-contract equivalence on the sparse
-output, and preservation of the two distinct gradient paths exposed by the
-assembled layer.
+Invariants verified: model-space output shape, propagation of regret_loss,
+weighted reduction semantics, support for both RoPE position modes, uncached
+execution, cached execution with the real layer-local cache, cached/uncached
+external-contract equivalence on the sparse output, and preservation of the two
+distinct gradient paths exposed by the assembled layer.
 """
 
 import pytest
@@ -27,7 +26,7 @@ def make_config(rope_mode: str = "main_sequence") -> ShramConfig:
         mlp_width=16,
         num_decoder_layers=1,
         num_sliding_window_heads=2,
-        num_mosrah_heads=3,
+        num_mosrah_heads=4,
         num_selected_heads=2,
         head_dim=4,
         window_size=4,
@@ -93,16 +92,12 @@ class TestRealExecution:
             active_mask=active_mask,
             cache=None,
         )
-        load_balance_loss = router_diagnostics["load_balance_loss"]
-        max_vio = router_diagnostics["max_vio"]
+        regret_loss = router_diagnostics["regret_loss"]
 
         assert sparse_output.shape == hidden_states.shape
-        assert load_balance_loss.ndim == 0
-        assert max_vio.ndim == 0
+        assert regret_loss.ndim == 0
         assert torch.isfinite(sparse_output).all()
-        assert torch.isfinite(load_balance_loss)
-        assert torch.isfinite(max_vio)
-        assert not max_vio.requires_grad
+        assert torch.isfinite(regret_loss)
 
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
     def test_cached_execution_accumulates_in_the_real_layer_local_cache(self, rope_mode, device):
@@ -127,7 +122,7 @@ class TestRealExecution:
             active_mask=prefix_active_mask,
             cache=cache,
         )
-        prefix_load_balance_loss = prefix_diagnostics["load_balance_loss"]
+        prefix_regret_loss = prefix_diagnostics["regret_loss"]
         lengths_after_prefix = cache.get_heads_lengths().clone()
 
         current_output, current_diagnostics = layer(
@@ -136,7 +131,7 @@ class TestRealExecution:
             active_mask=current_active_mask,
             cache=cache,
         )
-        current_load_balance_loss = current_diagnostics["load_balance_loss"]
+        current_regret_loss = current_diagnostics["regret_loss"]
         lengths_after_current = cache.get_heads_lengths().clone()
 
         uncached_current_output, uncached_current_diagnostics = layer(
@@ -145,12 +140,12 @@ class TestRealExecution:
             active_mask=current_active_mask,
             cache=None,
         )
-        uncached_current_load_balance_loss = uncached_current_diagnostics["load_balance_loss"]
+        uncached_current_regret_loss = uncached_current_diagnostics["regret_loss"]
 
         assert prefix_output.shape == prefix_hidden_states.shape
         assert current_output.shape == current_hidden_states.shape
-        assert prefix_load_balance_loss.ndim == 0
-        assert current_load_balance_loss.ndim == 0
+        assert prefix_regret_loss.ndim == 0
+        assert current_regret_loss.ndim == 0
         assert torch.all(lengths_after_prefix >= 0)
         assert torch.any(lengths_after_prefix > 0)
         assert torch.all(lengths_after_current >= lengths_after_prefix)
@@ -160,8 +155,8 @@ class TestRealExecution:
         # not depend on cache, so the load-balance loss should remain identical.
         assert not torch.allclose(current_output, uncached_current_output)
         torch.testing.assert_close(
-            current_load_balance_loss,
-            uncached_current_load_balance_loss,
+            current_regret_loss,
+            uncached_current_regret_loss,
         )
 
     @pytest.mark.parametrize("rope_mode", ["main_sequence", "semantic_sequence"])
@@ -189,7 +184,7 @@ class TestRealExecution:
             active_mask=active_mask,
             cache=None,
         )
-        full_load_balance_loss = full_diagnostics["load_balance_loss"]
+        full_regret_loss = full_diagnostics["regret_loss"]
 
         cache = make_cache(config, batch_size=hidden_states.shape[0], device=device)
 
@@ -199,14 +194,14 @@ class TestRealExecution:
             active_mask=prefix_active_mask,
             cache=cache,
         )
-        prefix_load_balance_loss = prefix_diagnostics["load_balance_loss"]
+        prefix_regret_loss = prefix_diagnostics["regret_loss"]
         current_output, current_diagnostics = layer(
             hidden_states=current_hidden_states,
             position_ids=current_position_ids,
             active_mask=current_active_mask,
             cache=cache,
         )
-        current_load_balance_loss = current_diagnostics["load_balance_loss"]
+        current_regret_loss = current_diagnostics["regret_loss"]
 
         torch.testing.assert_close(
             current_output,
@@ -219,16 +214,16 @@ class TestRealExecution:
         # uncached run, while the current-chunk load-balance loss remains a
         # well-formed scalar produced by the current routing step.
         assert current_output.shape == current_hidden_states.shape
-        assert prefix_load_balance_loss.ndim == 0
-        assert current_load_balance_loss.ndim == 0
-        assert full_load_balance_loss.ndim == 0
+        assert prefix_regret_loss.ndim == 0
+        assert current_regret_loss.ndim == 0
+        assert full_regret_loss.ndim == 0
 
 
 # ---------------------------------------------------------------------------
 # The final section certifies the two gradient responsibilities preserved by
 # assembly. The sparse output must still backpropagate through the real output
 # path, including the router projection path carried by unbiased routing_probs.
-# Separately, the returned load_balance_loss must still expose the router's
+# Separately, the returned regret_loss must still expose the router's
 # balancing signal through the assembled layer.
 # ---------------------------------------------------------------------------
 
@@ -246,8 +241,8 @@ class TestGradientFlow:
             active_mask=active_mask,
             cache=None,
         )
-        load_balance_loss = router_diagnostics["load_balance_loss"]
-        del load_balance_loss
+        regret_loss = router_diagnostics["regret_loss"]
+        del regret_loss
 
         sparse_output.sum().backward()
 
@@ -262,8 +257,8 @@ class TestGradientFlow:
         assert bea_q_grad is not None
         assert torch.isfinite(bea_q_grad).all()
 
-    def test_load_balance_loss_backward_reaches_router_parameters_not_bea(self, device):
-        """load_balance_loss must reach router parameters but must not reach BEA parameters."""
+    def test_regret_loss_backward_reaches_router_parameters_not_bea(self, device):
+        """regret_loss must reach router parameters but must not reach BEA parameters."""
         torch.manual_seed(0)
         config = make_config("main_sequence")
         layer = MoSRAHLayer(config).to(device)
@@ -275,10 +270,10 @@ class TestGradientFlow:
             active_mask=active_mask,
             cache=None,
         )
-        load_balance_loss = router_diagnostics["load_balance_loss"]
+        regret_loss = router_diagnostics["regret_loss"]
         del sparse_output
 
-        load_balance_loss.backward()
+        regret_loss.backward()
 
         assert any(p.grad is not None for p in layer.router.parameters())
 

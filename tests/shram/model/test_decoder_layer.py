@@ -24,7 +24,7 @@ def small_config(**kwargs) -> ShramConfig:
         mlp_width=16,
         num_decoder_layers=2,
         num_sliding_window_heads=2,
-        num_mosrah_heads=5,
+        num_mosrah_heads=4,
         num_selected_heads=2,
         head_dim=4,
         window_size=4,
@@ -112,7 +112,7 @@ class TestInspectionGuards:
 # ---------------------------------------------------------------------------
 
 class TestRuntimeSmoke:
-    def test_real_forward_returns_valid_output_and_scalar_load_balance_loss(self, device):
+    def test_real_forward_returns_valid_output_and_scalar_regret_loss(self, device):
         """DecoderLayer should preserve (B, N, d) and return finite scalar loss."""
         config = small_config()
         layer = make_layer(config, device, seed=0)
@@ -124,16 +124,12 @@ class TestRuntimeSmoke:
             active_mask,
             cache=None,
         )
-        load_balance_loss = router_diagnostics["load_balance_loss"]
-        max_vio = router_diagnostics["max_vio"]
+        regret_loss = router_diagnostics["regret_loss"]
 
         assert output.shape == x.shape
-        assert load_balance_loss.ndim == 0
-        assert max_vio.ndim == 0
+        assert regret_loss.ndim == 0
         assert torch.isfinite(output).all()
-        assert torch.isfinite(load_balance_loss)
-        assert torch.isfinite(max_vio)
-        assert not max_vio.requires_grad
+        assert torch.isfinite(regret_loss)
 
     def test_output_responds_to_input_perturbation(self, device):
         """A real DecoderLayer should not be dead or bypassed with respect to x."""
@@ -147,7 +143,7 @@ class TestRuntimeSmoke:
             active_mask,
             cache=None,
         )
-        baseline_load_balance_loss = baseline_diagnostics["load_balance_loss"]
+        baseline_regret_loss = baseline_diagnostics["regret_loss"]
 
         perturbed_x = x.clone()
         perturbed_x[:, 2, :] += 0.5
@@ -158,7 +154,7 @@ class TestRuntimeSmoke:
             active_mask,
             cache=None,
         )
-        perturbed_load_balance_loss = perturbed_diagnostics["load_balance_loss"]
+        perturbed_regret_loss = perturbed_diagnostics["regret_loss"]
 
         assert not torch.allclose(
             baseline_output,
@@ -166,8 +162,8 @@ class TestRuntimeSmoke:
             atol=1e-5,
             rtol=1e-5,
         )
-        assert torch.isfinite(baseline_load_balance_loss)
-        assert torch.isfinite(perturbed_load_balance_loss)
+        assert torch.isfinite(baseline_regret_loss)
+        assert torch.isfinite(perturbed_regret_loss)
 
     def test_output_responds_to_position_change_on_at_least_one_deterministic_seed(self, device):
         """Changing positions should affect the real DecoderLayer on at least one fixed input seed."""
@@ -238,20 +234,20 @@ class TestRuntimeSmoke:
             prefix_active_mask,
             cache=layer_cache,
         )
-        prefix_load_balance_loss = prefix_diagnostics["load_balance_loss"]
+        prefix_regret_loss = prefix_diagnostics["regret_loss"]
         current_output, current_diagnostics = layer(
             current_x,
             current_position_ids,
             current_active_mask,
             cache=layer_cache,
         )
-        current_load_balance_loss = current_diagnostics["load_balance_loss"]
+        current_regret_loss = current_diagnostics["regret_loss"]
 
         assert prefix_output.shape == prefix_x.shape
         assert current_output.shape == current_x.shape
-        assert prefix_load_balance_loss.ndim == 0
-        assert current_load_balance_loss.ndim == 0
+        assert prefix_regret_loss.ndim == 0
+        assert current_regret_loss.ndim == 0
         assert torch.isfinite(prefix_output).all()
         assert torch.isfinite(current_output).all()
-        assert torch.isfinite(prefix_load_balance_loss)
-        assert torch.isfinite(current_load_balance_loss)
+        assert torch.isfinite(prefix_regret_loss)
+        assert torch.isfinite(current_regret_loss)

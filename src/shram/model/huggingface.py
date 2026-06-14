@@ -54,13 +54,13 @@ class ShramCausalLMOutput(CausalLMOutputWithPast):
     ## Python dataclass inheritance violation: CausalLMOutputWithPast defaults all
     ## fields to None, which forces every subclass field to also carry a default.
     ## The = None below is a language constraint, not a semantic statement. In
-    ## practice, load_balance_loss, max_vio, and logit_std are always populated
+    ## practice, regret_loss, logit_regret, and logit_std are always populated
     ## by ShramForCausalLM.forward(). ce_loss is genuinely optional — present
     ## only when labels are supplied.
 
     ce_loss: torch.FloatTensor | None = None
-    load_balance_loss: torch.FloatTensor | None = None
-    max_vio: torch.FloatTensor | None = None
+    regret_loss: torch.FloatTensor | None = None
+    logit_regret: torch.Tensor | None = None
     logit_std: torch.Tensor | None = None
 
 class ShramForCausalLM(PreTrainedModel, GenerationMixin):
@@ -495,21 +495,21 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
                 against ``labels[:, 1:]``. Do not pre-shift the caller side.
             return_dict: Must be ``True`` or ``None``.
             ce_weight: Weight applied to the cross-entropy loss when combining with
-                the load-balance loss. Default 1.0.
-            load_balance_weight: Weight applied to the load-balance auxiliary loss.
+                the regret loss. Default 1.0.
+            load_balance_weight: Weight applied to the regret loss.
                 Default 0.01, matching the paper's recommendation.
             **kwargs: Unsupported HuggingFace kwargs fail explicitly.
 
         Returns:
             ``ShramCausalLMOutput`` with:
             - ``logits`` of shape ``(batch, seq_len, vocab_size)``,
-            - ``loss`` = ``ce_weight * ce_loss + load_balance_weight * load_balance_loss``
+            - ``loss`` = ``ce_weight * ce_loss + load_balance_weight * regret_loss``
               when labels are provided (``None`` otherwise),
             - ``ce_loss`` — raw unweighted cross-entropy loss for logging,
             - ``past_key_values`` as the active ``ShramCache`` or ``None``,
             - ``hidden_states`` when requested,
-            - ``load_balance_loss`` — raw unweighted load-balance loss from the backbone,
-            - ``max_vio`` — detached worst-case routing imbalance across layers,
+            - ``regret_loss`` — raw unweighted regret loss from the backbone,
+            - ``logit_regret`` — detached mean logit-space regret across layers,
             - ``logit_std`` — detached mean per-token routing logit spread across layers.
         """
         use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -607,7 +607,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
                 shift_logits.view(-1, self.config.vocab_size),
                 shift_labels.view(-1),
             )
-            loss = ce_weight * ce_loss + load_balance_weight * backbone_outputs["load_balance_loss"]
+            loss = ce_weight * ce_loss + load_balance_weight * backbone_outputs["regret_loss"]
 
         return ShramCausalLMOutput(
             loss=loss,
@@ -615,7 +615,7 @@ class ShramForCausalLM(PreTrainedModel, GenerationMixin):
             logits=logits,
             past_key_values=backbone_outputs["past_key_values"],
             hidden_states=backbone_outputs["hidden_states"],
-            load_balance_loss=backbone_outputs["load_balance_loss"],
-            max_vio=backbone_outputs["max_vio"],
+            regret_loss=backbone_outputs["regret_loss"],
+            logit_regret=backbone_outputs["logit_regret"],
             logit_std=backbone_outputs["logit_std"],
         )
