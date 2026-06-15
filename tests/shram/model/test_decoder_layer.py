@@ -172,8 +172,8 @@ class TestRuntimeSmoke:
         # Open the residual gate so sublayer outputs are visible; the zero-init
         # default would make every output identical regardless of position.
         with torch.no_grad():
-            layer.attn_residual_gate.fill_(1.0)
-            layer.mlp_residual_gate.fill_(1.0)
+            layer.attn_residual_scale.fill_(1.0)
+            layer.mlp_residual_scale.fill_(1.0)
 
         position_ids_a = torch.tensor([[0, 1, 2, 3]], dtype=torch.long, device=device)
         position_ids_b = torch.tensor([[0, 3, 6, 9]], dtype=torch.long, device=device)
@@ -252,3 +252,15 @@ class TestRuntimeSmoke:
         assert torch.isfinite(current_output).all()
         assert torch.isfinite(prefix_regret_loss)
         assert torch.isfinite(current_regret_loss)
+
+    def test_fixed_scale_mode_produces_valid_output(self, device):
+        """use_residual_gate=False must produce finite output with the fixed 1/√L scale."""
+        config = small_config(use_residual_gate=False)
+        layer = make_layer(config, device, seed=0)
+
+        x, position_ids, active_mask = make_input(config, device, batch=2, seq=4, seed=0)
+        output, diagnostics = layer(x, position_ids, active_mask, cache=None)
+
+        assert output.shape == x.shape
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(diagnostics["regret_loss"])

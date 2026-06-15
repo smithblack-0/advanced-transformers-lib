@@ -5,18 +5,19 @@ gated residual connections around both sublayers:
 
     normed_attn = RMSNorm(x)
     attn_out, router_diagnostics = SHRAMHybridLayer(normed_attn, ...)
-    h = x + attn_residual_gate * attn_out
+    h = x + attn_residual_scale * attn_out
 
     normed_mlp = RMSNorm(h)
     mlp_out = SwiGLUMLP(normed_mlp)
-    out = h + mlp_residual_gate * mlp_out
+    out = h + mlp_residual_scale * mlp_out
 
-Two independent scalar residual gates (shape: [1], init: zero) gate the attention and
-MLP sublayer contributions separately. At initialisation the layer is a pure identity.
-Scalar gates produce a single gradient signal per sublayer ("how much should this sublayer
-contribute") rather than a per-dimension signal, preventing the large noisy gradient norms
-that arise when 512 independent gate elements each receive gradients proportional to the
-sublayer output magnitude.
+``attn_residual_scale`` and ``mlp_residual_scale`` are always present. Their nature
+depends on ``config.use_residual_gate``:
+
+- ``True`` (default): learnable scalar ``nn.Parameter`` initialised to zero. The layer
+  is a pure identity at initialisation and the scales open during training.
+- ``False``: fixed buffer ``1/√num_decoder_layers``. No learnable parameter; residual
+  variance sums to O(1) across depth by construction.
 
 Pre-norm keeps the residual stream unnormalised. Gradients flow more cleanly
 through unnormalised residuals at depth, and each sublayer receives a stable,
@@ -29,6 +30,8 @@ dynamic ranges. Sharing them would be wrong.
 torch.nn.RMSNorm is used directly (available from PyTorch 2.4+). It omits mean
 subtraction, is faster than LayerNorm, and proved more stable at scale.
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -57,8 +60,13 @@ class DecoderLayer(nn.Module):
         self.mlp_norm = nn.RMSNorm(config.embedding_width, eps=config.rms_norm_eps)
         self.attention = SHRAMHybridLayer(config)
         self.mlp = SwiGLUMLP(config)
-        self.attn_residual_gate = nn.Parameter(torch.zeros(1))
-        self.mlp_residual_gate = nn.Parameter(torch.zeros(1))
+        scale = 1.0 / math.sqrt(config.num_decoder_layers)
+        if config.use_residual_gate:
+            self.attn_residual_scale = nn.Parameter(torch.zeros(1))
+            self.mlp_residual_scale = nn.Parameter(torch.zeros(1))
+        else:
+            self.register_buffer("attn_residual_scale", torch.full((1,), scale))
+            self.register_buffer("mlp_residual_scale", torch.full((1,), scale))
     def num_mosrah_parameters(self) -> int:
         """Return the total number of trainable MoSRAH parameters in this decoder layer."""
         return self.attention.num_mosrah_parameters()
@@ -92,6 +100,6 @@ class DecoderLayer(nn.Module):
             active_mask=active_mask,
             cache=cache,
         )
-        hidden_states = x + self.attn_residual_gate*attn_out
-        output = hidden_states + self.mlp_residual_gate*self.mlp(self.mlp_norm(hidden_states))
+        hidden_states = x + self.attn_residual_scale * attn_out
+        output = hidden_states + self.mlp_residual_scale * self.mlp(self.mlp_norm(hidden_states))
         return output, router_diagnostics

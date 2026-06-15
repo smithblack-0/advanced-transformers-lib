@@ -110,6 +110,7 @@ is being achieved, one verified unit at a time.
 - [X] Unit 28 — Mechanical Load Balancing
 - [X] Unit 29.A — Split residual gates in DecoderLayer (vector)
 - [ ] Unit 29.B — Scalar residual gates
+- [ ] Unit 29.C — Config-selectable residual gate vs fixed scale
 - [ ] Unit 30 — Final Audit
 
 ---
@@ -3934,6 +3935,20 @@ learns only "how much should this sublayer contribute," a single clean gradient 
 **Invariants:**
 - `attn_residual_gate` and `mlp_residual_gate` are scalar parameters (shape `[1]`, init: zero).
 - Gradient into each gate is a single scalar — no per-dimension gradient splitting.
+
+## Unit 29.C — Config-selectable residual gate vs fixed scale
+
+**Note:** Even with scalar gates (29.B), gradient norms on `mlp_residual_gate` remained
+large. The gate itself may not be needed now that mechanical load balancing removes the
+router instability that motivated skip-init. Added `use_residual_gate: bool = True` to
+`ShramConfig`. When `False`, each DecoderLayer uses a fixed `1/√num_decoder_layers` scale
+on both residual branches — no learnable parameter, O(1) variance at depth by construction.
+Default `True` preserves existing behavior.
+
+**Invariants:**
+- `ShramConfig.use_residual_gate` is a boolean param, default `True`, survives roundtrip.
+- `DecoderLayer` with `use_residual_gate=True` owns `attn_residual_gate` and `mlp_residual_gate` scalar params.
+- `DecoderLayer` with `use_residual_gate=False` owns no gate params; applies fixed `1/√L` scale.
 
 ---
 
