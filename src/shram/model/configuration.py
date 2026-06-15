@@ -79,6 +79,10 @@ class ShramConfig(PretrainedConfig):
         use_cache: Whether to return past_key_values for KV caching.
         output_hidden_states: Whether to return hidden states after each layer.
         tie_word_embeddings: Whether input embedding and LM head share weights.
+        use_residual_gate: When True, each DecoderLayer gates its residual contributions
+            with a learnable scalar parameter (init: zero). When False, uses a fixed
+            ``1/√num_decoder_layers`` scale instead, which preserves O(1) residual
+            variance at depth with no learnable gate. Default True.
     """
 
     model_type = "shram"
@@ -111,6 +115,7 @@ class ShramConfig(PretrainedConfig):
         use_cache: bool = True,
         output_hidden_states: bool = False,
         tie_word_embeddings: bool = False,
+        use_residual_gate: bool = True,
         **kwargs
     ):
         if head_dim % 2 != 0:
@@ -167,6 +172,7 @@ class ShramConfig(PretrainedConfig):
         self.beta = beta
         self.attention_dropout = attention_dropout
         self.use_cache = use_cache
+        self.use_residual_gate = use_residual_gate
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
