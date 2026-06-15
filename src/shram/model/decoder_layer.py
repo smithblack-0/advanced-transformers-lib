@@ -5,16 +5,17 @@ gated residual connections around both sublayers:
 
     normed_attn = RMSNorm(x)
     attn_out, router_diagnostics = SHRAMHybridLayer(normed_attn, ...)
-    h = x + residual_gate * attn_out
+    h = x + attn_residual_gate * attn_out
 
     normed_mlp = RMSNorm(h)
     mlp_out = SwiGLUMLP(normed_mlp)
-    out = h + residual_gate * mlp_out
+    out = h + mlp_residual_gate * mlp_out
 
-A single shared residual_gate vector (shape: embedding_width, init: zeros) gates
-both sublayer contributions. At initialisation the layer is a pure identity, which
-prevents variance explosion through depth regardless of how HuggingFace initialises
-the projection weights. The gate is a trainable parameter and opens during training.
+Two independent residual gate vectors (shape: embedding_width, init: near-zero) gate
+the attention and MLP sublayer contributions separately. At initialisation the layer is
+a pure identity. The gates are independent trainable parameters so gradients from the
+two sublayers never accumulate into a shared parameter, preventing norm explosion at
+depth.
 
 Pre-norm keeps the residual stream unnormalised. Gradients flow more cleanly
 through unnormalised residuals at depth, and each sublayer receives a stable,
@@ -55,7 +56,8 @@ class DecoderLayer(nn.Module):
         self.mlp_norm = nn.RMSNorm(config.embedding_width, eps=config.rms_norm_eps)
         self.attention = SHRAMHybridLayer(config)
         self.mlp = SwiGLUMLP(config)
-        self.residual_gate = nn.Parameter(1e-6*torch.randn([config.embedding_width]))
+        self.attn_residual_gate = nn.Parameter(1e-6*torch.randn([config.embedding_width]))
+        self.mlp_residual_gate = nn.Parameter(1e-6*torch.randn([config.embedding_width]))
     def num_mosrah_parameters(self) -> int:
         """Return the total number of trainable MoSRAH parameters in this decoder layer."""
         return self.attention.num_mosrah_parameters()
@@ -89,6 +91,6 @@ class DecoderLayer(nn.Module):
             active_mask=active_mask,
             cache=cache,
         )
-        hidden_states = x + self.residual_gate*attn_out
-        output = hidden_states + self.residual_gate*self.mlp(self.mlp_norm(hidden_states))
+        hidden_states = x + self.attn_residual_gate*attn_out
+        output = hidden_states + self.mlp_residual_gate*self.mlp(self.mlp_norm(hidden_states))
         return output, router_diagnostics
