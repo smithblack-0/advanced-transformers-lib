@@ -172,7 +172,8 @@ class TestRuntimeSmoke:
         # Open the residual gate so sublayer outputs are visible; the zero-init
         # default would make every output identical regardless of position.
         with torch.no_grad():
-            layer.residual_gate.fill_(1.0)
+            layer.attn_residual_gate.fill_(1.0)
+            layer.mlp_residual_gate.fill_(1.0)
 
         position_ids_a = torch.tensor([[0, 1, 2, 3]], dtype=torch.long, device=device)
         position_ids_b = torch.tensor([[0, 3, 6, 9]], dtype=torch.long, device=device)

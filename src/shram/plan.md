@@ -108,7 +108,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 26.C — Temporal Overcapacity Integration
 - [X] Unit 27 — Causal Overcapacity Loss
 - [X] Unit 28 — Mechanical Load Balancing
-- [ ] Unit 29 — Final Audit
+- [ ] Unit 29 — Split residual gates in DecoderLayer
+- [ ] Unit 30 — Final Audit
 
 ---
 
@@ -3902,7 +3903,24 @@ When an expert is utilized, it means that expert can no longer be used later. In
 - `prob_regret` is expected in [0, 1].
 
 
-## Unit 29 — Final Audit
+## Unit 29 — Split residual gates in DecoderLayer
+
+**Note:** Gradient norm explosion discovered in training. Root cause: a single `residual_gate`
+parameter was shared between the attention and MLP residual connections in `DecoderLayer`.
+Gradients from both sublayers accumulated into the same parameter simultaneously, producing
+compounding norm growth at depth.
+
+**Fix:** Split into `attn_residual_gate` and `mlp_residual_gate` — two independent parameters
+with the same near-zero initialisation. Gradients from attention and MLP residuals are now
+isolated. `test_decoder_layer.py` updated at the one test site that opened the gate directly.
+
+**Invariants:**
+- `DecoderLayer` owns two independent gate parameters: `attn_residual_gate` and `mlp_residual_gate`.
+- No shared gradient path exists between the two sublayer residual connections.
+
+---
+
+## Unit 30 — Final Audit
 
 This unit can only be completed once the paper is done and results are back. It involves resolving the paper to the codebase. 
 
