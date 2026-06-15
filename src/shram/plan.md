@@ -108,7 +108,8 @@ is being achieved, one verified unit at a time.
 - [X] Unit 26.C — Temporal Overcapacity Integration
 - [X] Unit 27 — Causal Overcapacity Loss
 - [X] Unit 28 — Mechanical Load Balancing
-- [ ] Unit 29 — Split residual gates in DecoderLayer
+- [X] Unit 29.A — Split residual gates in DecoderLayer (vector)
+- [ ] Unit 29.B — Scalar residual gates
 - [ ] Unit 30 — Final Audit
 
 ---
@@ -3903,7 +3904,7 @@ When an expert is utilized, it means that expert can no longer be used later. In
 - `prob_regret` is expected in [0, 1].
 
 
-## Unit 29 — Split residual gates in DecoderLayer
+## Unit 29.A — Split residual gates in DecoderLayer (vector)
 
 **Note:** Gradient norm explosion discovered in training. Root cause: a single `residual_gate`
 parameter was shared between the attention and MLP residual connections in `DecoderLayer`.
@@ -3917,6 +3918,22 @@ isolated. `test_decoder_layer.py` updated at the one test site that opened the g
 **Invariants:**
 - `DecoderLayer` owns two independent gate parameters: `attn_residual_gate` and `mlp_residual_gate`.
 - No shared gradient path exists between the two sublayer residual connections.
+
+## Unit 29.B — Scalar residual gates
+
+**Note:** Vector gates (512 params each) produced large, noisy gradient norms dominated by
+`mlp_residual_gate` across all layers. Root cause: each of the 512 gate elements receives a
+gradient equal to the MLP output at that embedding dimension, summed over batch and sequence.
+MLP outputs (SwiGLU) have larger magnitude than attention outputs, amplifying the effect.
+A vector gate tries to learn per-dimension scaling on top of what the MLP projection already
+controls — the directional question is already answered by the MLP weights. A scalar gate
+learns only "how much should this sublayer contribute," a single clean gradient signal.
+
+**Fix:** Both gates changed from `[embedding_width]` to scalar (shape `[1]`, init: zero).
+
+**Invariants:**
+- `attn_residual_gate` and `mlp_residual_gate` are scalar parameters (shape `[1]`, init: zero).
+- Gradient into each gate is a single scalar — no per-dimension gradient splitting.
 
 ---
 
