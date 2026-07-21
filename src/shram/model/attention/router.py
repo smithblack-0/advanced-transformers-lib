@@ -6,7 +6,7 @@ input hidden state x, the router produces two outputs used downstream:
   - selected_heads (I): which K of the L available expert heads each token
     routes to, determined by a block-balanced causal solver.
   - routing_probs (P): the weights used for the weighted output reduction,
-    gathered from the softmax routing scores at the selected indices and
+    gathered from the Entmax routing distribution at the selected indices and
     renormalized to sum to 1 per token.
 
 Routing uses a single learnable projection:
@@ -31,9 +31,15 @@ Paper ref: Appendix A.Routing.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from entmax import entmax_bisect
 
 from ..cache.router_cache import RouterCache
 from ..configuration import ShramConfig
+from ..initialization import initialize_projection_parameter
+
+
+ENTMAX_ALPHA = 1.2
+ROUTING_GATE_EPS = 1e-9
 
 
 class MoSRAHRouter(nn.Module):
@@ -44,8 +50,8 @@ class MoSRAHRouter(nn.Module):
     consecutive tokens every expert is used exactly once, giving perfect load
     balance by construction.
 
-    routing_weight is nn.Parameter rather than nn.Linear so that HuggingFace
-    _init_weights does not override its kaiming initialization at construction.
+    routing_weight is an ``nn.Parameter`` rather than ``nn.Linear`` because the
+    router owns a custom raw projection boundary and its initialization.
 
     Attributes:
         routing_weight: Shape (L, embedding_width). Maps input hidden states to
@@ -61,16 +67,17 @@ class MoSRAHRouter(nn.Module):
 
     def __init__(self, config: ShramConfig) -> None:
         super().__init__()
-        self.num_mosrah_heads   = config.num_mosrah_heads
+        self.num_mosrah_heads = config.num_mosrah_heads
         self.num_selected_heads = config.num_selected_heads
-        self.block_length       = config.block_length
+        self.block_length = config.block_length
+        self.entmax_alpha = ENTMAX_ALPHA
+        self.gate_eps = ROUTING_GATE_EPS
 
         # Routing projection: maps input (B, N, d) to per-head routing scores (B, N, L).
-        # nn.Parameter ensures HuggingFace _init_weights does not override kaiming init.
         self.routing_weight = nn.Parameter(
             torch.empty(config.num_mosrah_heads, config.embedding_width)
         )
-        nn.init.kaiming_normal_(self.routing_weight)
+        initialize_projection_parameter(self.routing_weight)
 
     def forward(
         self,
@@ -90,15 +97,15 @@ class MoSRAHRouter(nn.Module):
             selected_heads: Head indices I of shape (batch, seq_len, num_selected_heads).
                 Each token's K selected head indices from the block-balanced solver.
             routing_probs: Routing probabilities P of shape (batch, seq_len,
-                num_selected_heads). Gathered from the pre-balance softmax at
-                selected_heads and renormalized to sum to 1 per token.
+                num_selected_heads). Gathered from the pre-balance Entmax
+                distribution and renormalized to sum to 1 per token.
             router_diagnostics: Dict of routing scalars:
                 - ``regret_loss``: gradient-carrying mean regret, mean of
                   max(p_max_active − p_chosen, 0) over live (B, num_blocks, L)
                   entries. In [0, 1]. Zero when every expert is assigned at its
                   peak-preference token within the block.
                 - ``logit_regret``: detached logit-space regret; same formula
-                  applied to routing logits rather than softmax probabilities.
+                  applied to routing logits rather than Entmax probabilities.
                   In [0, ∞). Monitoring only.
                 - ``logit_std``: detached mean per-token std of routing logits.
         """
@@ -128,13 +135,19 @@ class MoSRAHRouter(nn.Module):
 
         # ── Phase: pre-balance scoring ─────────────────────────────────────────
         #
-        # Establishes the clean routing distribution before any -inf masking.
-        # logit_std is captured here because the block solver's masking would
-        # corrupt the standard deviation. routing_scores is used both for
-        # regret_loss and for the final routing_probs.
+        # Establish the clean routing distribution before any -inf masking.
+        # Entmax is computed in fp32 by numeric policy. Executable route values
+        # are then cast back to the router-logit dtype, matching the model path.
+        # The regret objective retains the fp32 distribution.
         routing_logits = self._compute_routing_logits(x)                       # (B, N, L)
-        logit_std      = routing_logits.std(dim=-1).mean().detach()
-        routing_scores = F.softmax(routing_logits, dim=-1)                     # (B, N, L)
+        routing_logits_fp32 = routing_logits.float()
+        logit_std = routing_logits_fp32.std(dim=-1).mean().detach()
+        routing_scores_fp32 = entmax_bisect(
+            routing_logits_fp32,
+            alpha=self.entmax_alpha,
+            dim=-1,
+        )                                                                       # (B, N, L), fp32
+        routing_scores = routing_scores_fp32.to(dtype=routing_logits.dtype)     # (B, N, L)
 
         # ── Phase: block-balanced causal selection ─────────────────────────────
         #
@@ -163,9 +176,9 @@ class MoSRAHRouter(nn.Module):
             # token per "block" there is no alternative assignment with higher
             # preference.
             used_in_block = router_cache.get_used_in_block()                   # (B, L)
-            step_logits   = routing_logits[:, 0, :]                            # (B, L)
-            available     = step_logits.masked_fill(used_in_block, float('-inf'))
-            step_heads    = available.topk(K, dim=-1).indices                  # (B, K)
+            step_logits = routing_logits[:, 0, :]                               # (B, L)
+            available = step_logits.masked_fill(used_in_block, float("-inf"))
+            step_heads = available.topk(K, dim=-1).indices                      # (B, K)
 
             router_cache.update_decode(step_heads)
 
@@ -179,8 +192,8 @@ class MoSRAHRouter(nn.Module):
             # preceding them have already had their pick each step. The pad is
             # discarded after the solver.
             num_blocks = (N + W - 1) // W
-            N_pad      = num_blocks * W
-            pad_len    = N_pad - N
+            N_pad = num_blocks * W
+            pad_len = N_pad - N
 
             if pad_len > 0:
                 padded_logits = torch.cat(
@@ -194,14 +207,20 @@ class MoSRAHRouter(nn.Module):
             # used_in_block tracks which experts have been claimed within each block.
             # No gradient here — expert availability is a hard structural constraint,
             # not a differentiable quantity. Gradient flows through routing_probs.
-            used_in_block   = torch.zeros(B, num_blocks, L, dtype=torch.bool, device=x.device)
+            used_in_block = torch.zeros(
+                B,
+                num_blocks,
+                L,
+                dtype=torch.bool,
+                device=x.device,
+            )
             step_heads_list = []
 
             for step in range(W):
                 step_logits = blocked_logits[:, :, step, :]                    # (B, blk, L)
 
                 # Claimed experts receive -inf so top-K never selects them.
-                available  = step_logits.masked_fill(used_in_block, float('-inf'))
+                available = step_logits.masked_fill(used_in_block, float("-inf"))
                 step_heads = available.topk(K, dim=-1).indices                 # (B, blk, K)
                 step_heads_list.append(step_heads)
 
@@ -210,7 +229,7 @@ class MoSRAHRouter(nn.Module):
 
             # Stack W steps and reshape to (B, N_pad, K), then unpad.
             selected_heads_blocked = torch.stack(step_heads_list, dim=2)       # (B, blk, W, K)
-            selected_heads         = selected_heads_blocked.view(B, N_pad, K)[:, :N, :]  # (B, N, K)
+            selected_heads = selected_heads_blocked.view(B, N_pad, K)[:, :N, :]  # (B, N, K)
 
             if router_cache is not None:
                 # Prefill: persist the partial last-block state so decode steps
@@ -230,27 +249,28 @@ class MoSRAHRouter(nn.Module):
         # blocks, and a single decode step is not a complete block. Backward is
         # never called during inference so the zero is a correct no-op.
         if router_cache is not None and N == 1:
-            regret_loss  = routing_logits.new_zeros(())
-            logit_regret = routing_logits.new_zeros(()).detach()
+            regret_loss = routing_logits_fp32.new_zeros(())
+            logit_regret = routing_logits_fp32.new_zeros(()).detach()
         else:
             regret_loss, logit_regret = self._compute_regret(
-                routing_scores,
-                routing_logits,
+                routing_scores_fp32,
+                routing_logits_fp32,
                 selected_heads_blocked,
                 active_mask,
             )
 
         # ── Phase: routing probabilities ────────────────────────────────────────
         #
-        # Gathered from the pre-balance routing_scores to reflect genuine routing
-        # preference; renormalized so they sum to 1 per token.
-        gathered      = routing_scores.gather(dim=-1, index=selected_heads)    # (B, N, K)
-        routing_probs = gathered / gathered.sum(dim=-1, keepdim=True)          # (B, N, K)
+        # Gather from the pre-balance Entmax values and renormalize over the
+        # mechanically selected experts. This is the executable model-dtype path.
+        gathered = routing_scores.gather(dim=-1, index=selected_heads)          # (B, N, K)
+        gathered_sum = gathered.sum(dim=-1, keepdim=True)
+        routing_probs = gathered / gathered_sum.clamp_min(self.gate_eps)        # (B, N, K)
 
         router_diagnostics = {
-            "regret_loss":  regret_loss,
+            "regret_loss": regret_loss,
             "logit_regret": logit_regret,
-            "logit_std":    logit_std,
+            "logit_std": logit_std,
         }
         return selected_heads, routing_probs, router_diagnostics
 
@@ -287,9 +307,9 @@ class MoSRAHRouter(nn.Module):
         detached — it is a monitoring scalar only, in [0, ∞).
 
         Args:
-            routing_scores:         Softmax routing probabilities, shape (B, N, L).
+            routing_scores:         Entmax routing probabilities, shape (B, N, L).
                                     Gradient flows through this tensor into regret_loss.
-            routing_logits:         Pre-softmax routing logits, shape (B, N, L).
+            routing_logits:         Router logits in fp32, shape (B, N, L).
                                     Used only for the detached logit_regret.
             selected_heads_blocked: Expert assignments from the block solver,
                                     shape (B, num_blocks, W, K). Block geometry
@@ -301,8 +321,8 @@ class MoSRAHRouter(nn.Module):
             logit_regret:  Detached scalar in [0, ∞).
         """
         B, num_blocks, W, _K = selected_heads_blocked.shape
-        L   = routing_scores.shape[-1]
-        N   = routing_scores.shape[1]
+        L = routing_scores.shape[-1]
+        N = routing_scores.shape[1]
         N_pad = num_blocks * W
 
         # ── Reshape into block form ─────────────────────────────────────────
@@ -338,23 +358,25 @@ class MoSRAHRouter(nn.Module):
         assignment_mask.scatter_(dim=-1, index=selected_heads_blocked, value=1.0)
                                                                                # (B, nb, W, L)
 
-        # ── Prob regret (gradient flows through routing_scores) ─────────────
+        # ── Probability regret (gradient flows through routing_scores) ───────
         #
         # p_chosen: routing score at the assigned token, gated by active_float
         # so dead assignments contribute 0 — the expert accrues full regret
         # against the active maximum rather than no penalty.
         # p_max: peak routing score over active tokens; dead tokens zeroed before
-        # max (safe because softmax outputs are non-negative).
-        p_chosen = (assignment_mask * active_float.unsqueeze(-1) * scores_blocked).sum(dim=2)
-                                                                               # (B, nb, L)
-        p_max    = (active_float.unsqueeze(-1) * scores_blocked).max(dim=2).values
-                                                                               # (B, nb, L)
+        # max (safe because Entmax outputs are non-negative).
+        p_chosen = (
+            assignment_mask * active_float.unsqueeze(-1) * scores_blocked
+        ).sum(dim=2)                                                           # (B, nb, L)
+        p_max = (
+            active_float.unsqueeze(-1) * scores_blocked
+        ).max(dim=2).values                                                     # (B, nb, L)
 
-        regret = (p_max - p_chosen).clamp(min=0.0)                            # (B, nb, L)
+        regret = (p_max - p_chosen).clamp(min=0.0)                             # (B, nb, L)
 
         # Mean over live (B, num_blocks, L) entries. Clamped to 1 for the
         # all-dead edge case where the numerator is already 0.
-        num_live    = block_active.float().sum()                               # scalar
+        num_live = block_active.float().sum()                                  # scalar
         regret_loss = (
             block_active.float().unsqueeze(-1) * regret
         ).sum() / num_live.mul(L).clamp(min=1.0)
@@ -370,12 +392,13 @@ class MoSRAHRouter(nn.Module):
         ).sum(dim=2)                                                           # (B, nb, L)
 
         logit_max = logits_blocked.masked_fill(
-            ~active_blocked.unsqueeze(-1), float('-inf')
-        ).max(dim=2).values                                                    # (B, nb, L)
+            ~active_blocked.unsqueeze(-1), float("-inf")
+        ).max(dim=2).values                                                     # (B, nb, L)
         logit_max = logit_max.masked_fill(~block_active.unsqueeze(-1), 0.0)
 
         logit_regret = (
-            block_active.float().unsqueeze(-1) * (logit_max - logit_chosen).clamp(min=0.0)
+            block_active.float().unsqueeze(-1)
+            * (logit_max - logit_chosen).clamp(min=0.0)
         ).sum() / num_live.mul(L).clamp(min=1.0)
         logit_regret = logit_regret.detach()
 
