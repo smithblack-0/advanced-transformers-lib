@@ -1,5 +1,7 @@
 """Trainability contracts for SHRAM initialization and router numerics."""
 
+import math
+
 import pytest
 import torch
 
@@ -13,7 +15,7 @@ from src.shram.model.cache.shram_layer_cache import ShramLayerCache
 from src.shram.model.cache.slow_mosrah_cache import SlowMoSRAHCache
 from src.shram.model.cache.sliding_window_cache import LocalSlidingWindowLayerCache
 from src.shram.model.configuration import ShramConfig
-from src.shram.model.initialization import PROJECTION_INIT_STD
+from src.shram.model.initialization import ROUTER_INIT_STD
 
 
 def small_config(**overrides) -> ShramConfig:
@@ -35,28 +37,35 @@ def small_config(**overrides) -> ShramConfig:
     return ShramConfig(**values)
 
 
-def assert_projection_scale(parameter: torch.Tensor, *, relative_tolerance: float) -> None:
-    observed = parameter.detach().float().std().item()
-    assert observed == pytest.approx(
-        PROJECTION_INIT_STD,
-        rel=relative_tolerance,
-    )
+def assert_expert_bank_uses_per_matrix_xavier(bank: torch.Tensor) -> None:
+    """Verify every stored expert matrix follows its own fan geometry."""
+    for matrix in bank.detach().float().unbind(dim=0):
+        fan_in, fan_out = nn_fans(matrix)
+        expected_std = math.sqrt(2.0 / (fan_in + fan_out))
+        assert matrix.std().item() == pytest.approx(expected_std, rel=0.12)
 
 
-def test_bea_projection_banks_use_rank_independent_scale() -> None:
+def nn_fans(matrix: torch.Tensor) -> tuple[int, int]:
+    """Return fan-in/fan-out for one two-dimensional linear matrix."""
+    assert matrix.ndim == 2
+    return matrix.shape[0], matrix.shape[1]
+
+
+def test_bea_projection_banks_use_each_experts_fan_geometry() -> None:
     torch.manual_seed(0)
     layer = BottleneckedEnsembleAttention(small_config())
 
-    assert_projection_scale(layer.q_proj, relative_tolerance=0.08)
-    assert_projection_scale(layer.k_proj, relative_tolerance=0.08)
-    assert_projection_scale(layer.v_proj, relative_tolerance=0.08)
-    assert_projection_scale(layer.o_proj, relative_tolerance=0.08)
+    assert_expert_bank_uses_per_matrix_xavier(layer.q_proj)
+    assert_expert_bank_uses_per_matrix_xavier(layer.k_proj)
+    assert_expert_bank_uses_per_matrix_xavier(layer.v_proj)
+    assert_expert_bank_uses_per_matrix_xavier(layer.o_proj)
 
 
-def test_router_projection_uses_model_projection_scale() -> None:
+def test_router_projection_uses_balance_initialization_scale() -> None:
     torch.manual_seed(0)
     router = MoSRAHRouter(small_config())
-    assert_projection_scale(router.routing_weight, relative_tolerance=0.20)
+    observed = router.routing_weight.detach().float().std().item()
+    assert observed == pytest.approx(ROUTER_INIT_STD, rel=0.20)
 
 
 def test_router_entmax_outputs_are_normalized_and_finite() -> None:
