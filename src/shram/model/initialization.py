@@ -8,7 +8,9 @@ SHRAM also stores two custom raw-parameter forms that Hugging Face cannot infer:
 
 The expert-bank leading dimension is ownership/storage, not fan geometry. Each
 expert matrix must therefore receive Xavier initialization independently. The
-router follows the proven BALANCE initialization scale instead.
+router follows the proven BALANCE initialization scale instead. Tensor rank is
+used here as the explicit representation contract for these two owners, not as
+a general initialization heuristic.
 """
 
 import torch
