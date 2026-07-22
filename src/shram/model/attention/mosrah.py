@@ -7,10 +7,11 @@ corrupting their bridge contracts.
 
 In particular, this path must preserve three architectural distinctions:
 
-- selected head indices are not routing probabilities
+- selected head indices are not routing weights
 - packed position semantics are chosen before BEA, not inside it
-- weighted reduction must consume the router's unbiased renormalized
-  probabilities after token-choice order has been restored
+- weighted reduction must consume the router's selected Entmax weights after
+  token-choice order has been restored; an all-zero weight vector means that
+  token contributes nothing through the sparse path
 """
 
 import torch
@@ -34,9 +35,8 @@ class MoSRAHLayer(nn.Module):
 
     The MoSRAH path consumes model-space hidden states together with
     authoritative per-token positions and returns the model-space sparse-path
-    contribution and a diagnostics dict from the router containing
-    load-balance loss, routing-imbalance scalar, and load-balance health
-    scalars.
+    contribution and a diagnostics dict from the router containing regret and
+    routing-health scalars.
     """
 
     def __init__(self, config: ShramConfig) -> None:
@@ -78,6 +78,8 @@ class MoSRAHLayer(nn.Module):
 
         Returns:
             sparse_output: Model-space sparse-path output of shape (B, N, d).
+                A token whose selected Entmax support has zero total mass receives
+                an exactly zero sparse-path contribution.
             router_diagnostics: Dict of router feedback scalars. Keys:
                 ``regret_loss`` (has grad), ``logit_regret`` (detached),
                 ``logit_std`` (detached). See MoSRAHRouter for semantics.
@@ -86,7 +88,7 @@ class MoSRAHLayer(nn.Module):
         # -------------------------------------------------------------------
         # The first transition moves from model-space token-choice input into
         # the packed expert-choice sparse-attention state. Routing decides both
-        # which experts each token uses and which unbiased probabilities must be
+        # which experts each token uses and which selected Entmax weights must be
         # reserved for the final reduction. The active mask is forwarded to the
         # router so dead tokens are excluded from routing statistics, and to
         # pack_experts so outer liveness is faithfully carried into the packed
@@ -104,7 +106,13 @@ class MoSRAHLayer(nn.Module):
             "position_ids": (position_ids, 0),
             "active_mask": (active_mask, False),
         }
-        packed, unpacking_map = pack_experts(entries, setup, selected_heads, self.num_experts, self.packed_length)
+        packed, unpacking_map = pack_experts(
+            entries,
+            setup,
+            selected_heads,
+            self.num_experts,
+            self.packed_length,
+        )
         packed_hidden_states = packed["hidden_states"]
         packed_positions = packed["position_ids"]
         active_mask = packed["active_mask"]
@@ -133,9 +141,9 @@ class MoSRAHLayer(nn.Module):
         # The final transition restores token-choice meaning and only then
         # collapses the K routed copies back into model space. This ordering is
         # required because routing_probs live in token-choice space, whereas BEA
-        # returns expert-choice packed outputs. The reduction must therefore
-        # happen after unpacking, and it must use the router's unbiased
-        # renormalized probabilities rather than any biased selection scores.
+        # returns expert-choice packed outputs. Positive selected Entmax mass is
+        # normalized by the router; an all-zero vector intentionally suppresses
+        # the sparse contribution for that token.
         # -------------------------------------------------------------------
         token_choice_outputs = unpack_experts(
             expert_outputs=packed_outputs,
