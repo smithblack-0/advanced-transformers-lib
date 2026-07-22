@@ -93,6 +93,42 @@ def test_router_entmax_outputs_are_normalized_and_finite() -> None:
     assert torch.isfinite(diagnostics["logit_std"])
 
 
+def test_forced_zero_support_assignments_still_normalize(monkeypatch) -> None:
+    """Mechanical balance must not produce an all-zero selected mixture."""
+    config = small_config()
+    router = MoSRAHRouter(config)
+    hidden = torch.zeros(1, config.block_length, config.embedding_width)
+    active = torch.ones(1, config.block_length, dtype=torch.bool)
+
+    # Both tokens strongly prefer experts 0..3. The first token claims them,
+    # forcing the second token onto experts 4..7, which lie outside its sparse
+    # Entmax support before selected-weight smoothing.
+    forced_logits = torch.tensor(
+        [[
+            [100.0, 99.0, 98.0, 97.0, -100.0, -101.0, -102.0, -103.0],
+            [100.0, 99.0, 98.0, 97.0, -100.0, -101.0, -102.0, -103.0],
+        ]],
+        dtype=hidden.dtype,
+    )
+    monkeypatch.setattr(router, "_compute_routing_logits", lambda _x: forced_logits)
+
+    selected, probabilities, _ = router(hidden, active)
+
+    assert torch.equal(selected[0, 1].sort().values, torch.tensor([4, 5, 6, 7]))
+    torch.testing.assert_close(
+        probabilities[0, 1],
+        torch.full((config.num_selected_heads,), 1.0 / config.num_selected_heads),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        probabilities.sum(dim=-1),
+        torch.ones_like(probabilities[..., 0]),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 def test_router_entmax_task_gradient_reaches_projection_and_input() -> None:
     torch.manual_seed(0)
     config = small_config()
