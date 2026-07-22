@@ -10,7 +10,8 @@ The expert-bank leading dimension is ownership/storage, not fan geometry. Each
 expert matrix must therefore receive Xavier initialization independently. The
 router follows the proven BALANCE initialization scale instead. Tensor rank is
 used here as the explicit representation contract for these two owners, not as
-a general initialization heuristic.
+a general initialization heuristic. Adding another raw projection shape must
+therefore extend this contract deliberately rather than inheriting a fallback.
 """
 
 import torch
