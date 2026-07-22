@@ -162,19 +162,17 @@ class BottleneckedEnsembleAttention(nn.Module):
              value_states,
              block_mask=block_mask,
              scale=attention_scaling / math.sqrt(self.head_dim),
-         )
+        )
 
         # Project back to model width:
         # (B, L, T, u) x (L, u, d) -> (B, L, T, d)
         return torch.einsum("bltu,lud->bltd", attended_states, self.o_proj)
 
     def _reset_parameters(self) -> None:
-        """Initialize projection banks with the model-wide projection policy.
+        """Initialize projection banks independently of storage rank.
 
         These tensors store independent per-head linear maps. Their leading
-        head dimension is storage organization rather than fan geometry, so a
-        rank-sensitive Xavier call would initialize them as if they were one
-        higher-dimensional operator.
+        head dimension is storage organization rather than fan geometry.
         """
         for weight in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
             initialize_projection_parameter(weight)

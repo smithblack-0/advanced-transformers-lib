@@ -267,11 +267,13 @@ class SlowMoSRAHCache(CacheLayerMixin):
             "Use get_heads_lengths() for per-head occupancy."
         )
 
+    def get_max_length(self) -> int:
+        """Return the fixed reference-buffer capacity."""
+        return self.mosrah_cache_length
+
     def get_max_cache_shape(self) -> int:  # type: ignore[override]
-        """Not supported — SlowMoSRAHCache is dynamic and unbounded."""
-        raise NotImplementedError(
-            "SlowMoSRAHCache is unbounded; get_max_cache_shape() is not supported."
-        )
+        """Compatibility alias for the deprecated cache-shape interface."""
+        return self.get_max_length()
 
     def get_mask_sizes(  # type: ignore[override]
         self,

@@ -87,7 +87,11 @@ class ShramLayerCache(CacheLayerMixin):
 
     @property
     def is_initialized(self) -> bool:
-        """True iff all owned sub-caches have allocated their storage."""
+        """True iff both sub-caches have allocated their storage.
+
+        Both LocalSlidingWindowLayerCache and MoSRAHCache pre-allocate at construction,
+        so this is True immediately after ShramLayerCache.__init__ returns.
+        """
         return (
             self.sliding_window_cache.is_initialized
             and self.mosrah_cache.is_initialized
@@ -97,7 +101,9 @@ class ShramLayerCache(CacheLayerMixin):
     @is_initialized.setter
     def is_initialized(self, value: bool) -> None:
         # CacheLayerMixin.__init__ assigns self.is_initialized = False as an instance
-        # attribute. State is derived from the owned sub-caches, not stored here.
+        # attribute. Since property is a data descriptor it takes precedence, but Python
+        # still routes the assignment through __set__. Absorb it silently — state is
+        # derived from sub-caches, not stored here.
         pass
 
     # ---------------------------------------------------------------------------
@@ -105,49 +111,79 @@ class ShramLayerCache(CacheLayerMixin):
     # ---------------------------------------------------------------------------
 
     def get_seq_length(self) -> int:  # type: ignore[override]
-        """Return cumulative sequence progress from the local cache owner."""
+        """Return the cumulative sequence length from the local sliding-window path.
+
+        The local path is authoritative for sequence progress: it sees every token
+        presented to this layer and accumulates a truthful total. Delegates to
+        sliding_window_cache.get_seq_length().
+        """
         return self.sliding_window_cache.get_seq_length()
 
-    def get_max_length(self) -> int:
-        """Return the configured maximum inference sequence length."""
-        return self._inference_sequence_length
-
-    def get_max_cache_shape(self) -> int:  # type: ignore[override]
-        """Compatibility alias for the deprecated cache-shape interface."""
-        return self.get_max_length()
-
     def reset(self) -> None:
-        """Clear all owned sub-caches atomically."""
+        """Clear both sub-caches.
+
+        Delegates reset to each sub-cache. Both are cleared atomically so the sliding-window
+        state and MoSRAH sparse state remain consistent.
+        """
         self.sliding_window_cache.reset()
         self.mosrah_cache.reset()
         self.router_cache.reset()
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
-        """Reorder the batch dimension of all sub-caches for beam search."""
+        """Reorder the batch dimension of both sub-caches for beam search.
+
+        Delegates to each sub-cache. Both are reordered atomically so the sliding-window
+        and MoSRAH state correspond to the same beam hypotheses after reordering.
+
+        Args:
+            beam_idx: Permutation indices of shape (batch,) produced by beam search.
+        """
         self.sliding_window_cache.reorder_cache(beam_idx)
         self.mosrah_cache.reorder_cache(beam_idx)
         self.router_cache.reorder_cache(beam_idx)
 
     def batch_repeat_interleave(self, repeats: int) -> None:
-        """Expand the batch dimension of all sub-caches together."""
+        """Expand the batch dimension of both sub-caches for beam search initialisation.
+
+        Delegates atomically to each sub-cache. Both must be expanded together so the
+        sliding-window and MoSRAH state correspond to the same beam candidates.
+
+        Args:
+            repeats: Number of times to repeat each batch entry.
+        """
         self.sliding_window_cache.batch_repeat_interleave(repeats)
         self.mosrah_cache.batch_repeat_interleave(repeats)
         self.router_cache.batch_repeat_interleave(repeats)
 
     def batch_select_indices(self, indices: torch.Tensor) -> None:
-        """Select matching batch entries in every owned sub-cache."""
+        """Select a subset of batch entries in both sub-caches for contrastive search.
+
+        Delegates atomically to each sub-cache. Both must be trimmed together so the
+        sliding-window and MoSRAH state remain consistent.
+
+        Args:
+            indices: 1-D integer tensor of batch indices to retain.
+        """
         self.sliding_window_cache.batch_select_indices(indices)
         self.mosrah_cache.batch_select_indices(indices)
         self.router_cache.batch_select_indices(indices)
 
     def offload(self) -> None:
-        """Offload all owned sub-caches to CPU."""
+        """Offload both sub-caches to CPU.
+
+        Delegates to each sub-cache's offload method. Does not call super() — ShramLayerCache
+        does not own self.keys/self.values directly; all cached data lives in the sub-caches.
+        """
         self.sliding_window_cache.offload()
         self.mosrah_cache.offload()
         self.router_cache.offload()
 
     def prefetch(self) -> None:
-        """Move all owned sub-caches back to their model device."""
+        """Move both sub-caches back to their model device ahead of time.
+
+        Delegates to each sub-cache's prefetch method. Does not call super() — ShramLayerCache
+        does not own self.keys/self.values directly; all cached data lives in the sub-caches.
+        """
         self.sliding_window_cache.prefetch()
         self.mosrah_cache.prefetch()
         self.router_cache.prefetch()
@@ -155,11 +191,11 @@ class ShramLayerCache(CacheLayerMixin):
     def lazy_initialization(  # type: ignore[override]
         self, key_states: torch.Tensor, value_states: torch.Tensor
     ) -> None:
-        """No-op — every sub-cache handles its own initialization."""
+        """No-op — both sub-caches handle their own initialization."""
         pass
 
     # ---------------------------------------------------------------------------
-    # CacheLayerMixin — unsupported composite methods
+    # CacheLayerMixin — unsupported abstract methods
     # ---------------------------------------------------------------------------
 
     def update(  # type: ignore[override]
@@ -168,15 +204,38 @@ class ShramLayerCache(CacheLayerMixin):
         value_states: torch.Tensor,
         cache_kwargs: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Not supported — ShramLayerCache has no composite update interface."""
+        """Not supported — ShramLayerCache has no composite update interface.
+
+        The two sub-caches have materially different update semantics: the sliding-window
+        side uses standard key/value concatenation while the MoSRAH side uses expert-choice
+        scatter with an active mask. Callers must update each sub-cache directly via
+        sliding_window_cache.update() or mosrah_cache.update().
+        """
         raise NotImplementedError(
             "ShramLayerCache has no composite update interface. "
             "Update sliding_window_cache or mosrah_cache directly."
         )
 
+    def get_max_length(self) -> int:
+        """Return the maximum sequence length this layer cache can serve.
+
+        The authoritative upper bound is ``config.inference_sequence_length``, which
+        governs the full accumulated token history the model is configured to handle.
+        """
+        return self._inference_sequence_length
+
+    def get_max_cache_shape(self) -> int:  # type: ignore[override]
+        """Compatibility alias for the deprecated cache-shape interface."""
+        return self.get_max_length()
+
     def get_mask_sizes(  # type: ignore[override]
         self,
-        query_length: int,
+        cache_position: torch.Tensor,
     ) -> tuple[int, int]:
-        """Return full static KV dimensions for Hugging Face mask construction."""
+        """Return the KV dimensions for HuggingFace causal mask construction.
+
+        Returns (inference_sequence_length, 0): the full static cache capacity as
+        kv_length and zero offset. HuggingFace reads these values to size the causal
+        attention mask when is_compileable is True.
+        """
         return self._inference_sequence_length, 0

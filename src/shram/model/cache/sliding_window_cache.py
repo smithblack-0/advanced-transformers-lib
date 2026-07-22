@@ -248,8 +248,13 @@ class LocalSlidingWindowLayerCache(CacheLayerMixin):
         """
         return int(self._total_processed)
 
-    def get_max_cache_shape(self) -> int:
+    def get_max_length(self) -> int:
+        """Return the retained local sliding-window capacity."""
         return self.sliding_window
+
+    def get_max_cache_shape(self) -> int:
+        """Compatibility alias for the deprecated cache-shape interface."""
+        return self.get_max_length()
 
     def get_mask_sizes(  # type: ignore[override]
         self,
