@@ -136,9 +136,9 @@ class MoSRAHRouter(nn.Module):
         # ── Phase: pre-balance scoring ─────────────────────────────────────────
         #
         # Establish the clean routing distribution before any -inf masking.
-        # Entmax is computed in fp32 by numeric policy. Executable route values
-        # are then cast back to the router-logit dtype, matching the model path.
-        # The regret objective retains the fp32 distribution.
+        # Entmax and selected-weight normalization are computed in fp32 by
+        # numeric policy. Only the final normalized route weights return to the
+        # model dtype. The regret objective also retains the fp32 distribution.
         routing_logits = self._compute_routing_logits(x)                       # (B, N, L)
         routing_logits_fp32 = routing_logits.float()
         logit_std = routing_logits_fp32.std(dim=-1).mean().detach()
@@ -147,7 +147,6 @@ class MoSRAHRouter(nn.Module):
             alpha=self.entmax_alpha,
             dim=-1,
         )                                                                       # (B, N, L), fp32
-        routing_scores = routing_scores_fp32.to(dtype=routing_logits.dtype)     # (B, N, L)
 
         # ── Phase: block-balanced causal selection ─────────────────────────────
         #
@@ -261,11 +260,17 @@ class MoSRAHRouter(nn.Module):
 
         # ── Phase: routing probabilities ────────────────────────────────────────
         #
-        # Gather from the pre-balance Entmax values and renormalize over the
-        # mechanically selected experts. This is the executable model-dtype path.
-        gathered = routing_scores.gather(dim=-1, index=selected_heads)          # (B, N, K)
-        gathered_sum = gathered.sum(dim=-1, keepdim=True)
-        routing_probs = gathered / gathered_sum.clamp_min(self.gate_eps)        # (B, N, K)
+        # Gather from the clean fp32 Entmax distribution. Mechanical balance can
+        # force every selected expert outside the sparse Entmax support, so epsilon
+        # smoothing is part of the normalization contract rather than a
+        # denominator-only clamp. Normalize in fp32, then return to model dtype.
+        gathered_fp32 = routing_scores_fp32.gather(                             # (B, N, K)
+            dim=-1,
+            index=selected_heads,
+        ).clamp_min(self.gate_eps)
+        routing_probs = (
+            gathered_fp32 / gathered_fp32.sum(dim=-1, keepdim=True)
+        ).to(dtype=routing_logits.dtype)                                        # (B, N, K)
 
         router_diagnostics = {
             "regret_loss": regret_loss,
