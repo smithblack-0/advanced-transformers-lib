@@ -7,6 +7,11 @@ from src.shram.model.attention.bottlenecked_ensemble_attention import (
     BottleneckedEnsembleAttention,
 )
 from src.shram.model.attention.router import MoSRAHRouter
+from src.shram.model.cache.mosrah_cache import MoSRAHCache
+from src.shram.model.cache.router_cache import RouterCache
+from src.shram.model.cache.shram_layer_cache import ShramLayerCache
+from src.shram.model.cache.slow_mosrah_cache import SlowMoSRAHCache
+from src.shram.model.cache.sliding_window_cache import LocalSlidingWindowLayerCache
 from src.shram.model.configuration import ShramConfig
 from src.shram.model.initialization import PROJECTION_INIT_STD
 
@@ -106,3 +111,53 @@ def test_router_entmax_task_gradient_reaches_projection_and_input() -> None:
     assert hidden.grad is not None
     assert torch.isfinite(hidden.grad).all()
     assert hidden.grad.abs().sum().item() > 0.0
+
+
+def test_cache_layers_implement_current_max_length_contract() -> None:
+    """Every SHRAM CacheLayerMixin owner must expose truthful maximum length."""
+    device = torch.device("cpu")
+    config = small_config(use_cache=True)
+
+    local_cache = LocalSlidingWindowLayerCache(
+        sliding_window=config.window_size,
+        num_heads=config.num_sliding_window_heads,
+        head_dim=config.head_dim,
+        batch_size=2,
+        device=device,
+    )
+    mosrah_cache = MoSRAHCache(
+        num_mosrah_heads=config.num_mosrah_heads,
+        head_dim=config.head_dim,
+        batch_size=2,
+        device=device,
+        mosrah_cache_length=config.mosrah_cache_length,
+    )
+    slow_mosrah_cache = SlowMoSRAHCache(
+        num_mosrah_heads=config.num_mosrah_heads,
+        head_dim=config.head_dim,
+        batch_size=2,
+        device=device,
+        mosrah_cache_length=config.mosrah_cache_length,
+    )
+    router_cache = RouterCache(
+        block_length=config.block_length,
+        num_mosrah_heads=config.num_mosrah_heads,
+        batch_size=2,
+        device=device,
+    )
+    layer_cache = ShramLayerCache(
+        config=config,
+        batch_size=2,
+        device=device,
+    )
+
+    expected_lengths = {
+        local_cache: config.window_size,
+        mosrah_cache: config.mosrah_cache_length,
+        slow_mosrah_cache: config.mosrah_cache_length,
+        router_cache: -1,
+        layer_cache: config.inference_sequence_length,
+    }
+    for cache, expected in expected_lengths.items():
+        assert cache.get_max_length() == expected
+        assert cache.get_max_cache_shape() == expected
