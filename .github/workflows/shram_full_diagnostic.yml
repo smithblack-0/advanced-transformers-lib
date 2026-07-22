@@ -1,3 +1,4 @@
+# Temporary PR-only diagnostic; remove before merge.
 name: SHRAM full diagnostic
 
 on:
