@@ -1,0 +1,87 @@
+name: Apply Entmax normalization correction
+
+on:
+  push:
+    branches:
+      - agent/shram-trainability-fixes
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/shram-trainability-fixes
+      - name: Normalize selected Entmax weights in fp32
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/shram/model/attention/router.py")
+          raw = path.read_bytes()
+          newline = "\r\n" if b"\r\n" in raw else "\n"
+          text = raw.decode("utf-8").replace("\r\n", "\n")
+
+          replacements = [
+              (
+                  '''        # Establish the clean routing distribution before any -inf masking.
+        # Entmax is computed in fp32 by numeric policy. Executable route values
+        # are then cast back to the router-logit dtype, matching the model path.
+        # The regret objective retains the fp32 distribution.
+''',
+                  '''        # Establish the clean routing distribution before any -inf masking.
+        # Entmax and selected-weight normalization are computed in fp32 by
+        # numeric policy. Only the final normalized route weights return to the
+        # model dtype. The regret objective also retains the fp32 distribution.
+''',
+              ),
+              (
+                  '''        routing_scores = routing_scores_fp32.to(dtype=routing_logits.dtype)     # (B, N, L)
+''',
+                  '''''',
+              ),
+              (
+                  '''        # Gather from the pre-balance Entmax values and renormalize over the
+        # mechanically selected experts. This is the executable model-dtype path.
+        gathered = routing_scores.gather(dim=-1, index=selected_heads)          # (B, N, K)
+        gathered_sum = gathered.sum(dim=-1, keepdim=True)
+        routing_probs = gathered / gathered_sum.clamp_min(self.gate_eps)        # (B, N, K)
+''',
+                  '''        # Gather from the clean fp32 Entmax distribution. Mechanical balance
+        # can force every selected expert outside the sparse Entmax support, so
+        # epsilon smoothing is part of the normalization contract rather than a
+        # denominator-only clamp. Normalize in fp32, then return to model dtype.
+        gathered_fp32 = routing_scores_fp32.gather(                             # (B, N, K)
+            dim=-1,
+            index=selected_heads,
+        ).clamp_min(self.gate_eps)
+        routing_probs = (
+            gathered_fp32 / gathered_fp32.sum(dim=-1, keepdim=True)
+        ).to(dtype=routing_logits.dtype)                                        # (B, N, K)
+''',
+              ),
+          ]
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(
+                      f"Expected exactly one router replacement target, found {count}: {old[:80]!r}"
+                  )
+              text = text.replace(old, new)
+
+          path.write_bytes(text.replace("\n", newline).encode("utf-8"))
+          Path(".github/workflows/agent_fix_entmax_normalization.yml").unlink()
+          PY
+      - name: Commit Entmax normalization correction
+        shell: bash
+        run: |
+          git config user.name "OpenAI Agent"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/shram/model/attention/router.py .github/workflows/agent_fix_entmax_normalization.yml
+          git commit -m "Normalize mechanically selected Entmax weights in fp32"
+          git push origin HEAD:agent/shram-trainability-fixes
