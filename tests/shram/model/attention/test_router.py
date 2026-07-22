@@ -8,7 +8,7 @@ Invariants verified:
 - regret_loss has gradient; logit_regret and logit_std are detached
 - compiled and eager router diagnostics are numerically identical
 - Output shapes: selected_heads (B, N, K), routing_probs (B, N, K), regret_loss scalar, logit_regret scalar
-- routing_probs sum to 1 per token and are non-negative
+- routing_probs are non-negative and have total mass 0 or 1 per token
 - selected_heads are valid indices in [0, L-1] and are distinct per token
 - regret_loss is zero when every expert is assigned at its peak-preference token within the block
 - regret_loss matches hand-calculated values for known routing configurations
@@ -95,19 +95,25 @@ class TestOutputShapes:
 # ---------------------------------------------------------------------------
 
 class TestRoutingProbabilities:
-    def test_routing_probs_sum_to_one(self):
-        """Each token's routing_probs must sum to 1 — they are a probability distribution
-        over the K selected heads."""
+    def test_routing_probs_have_zero_or_unit_total_mass(self):
+        """A token either has a normalized sparse mixture or no sparse contribution."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(3, 10, 64)
         active_mask = torch.ones(3, 10, dtype=torch.bool)
         _, routing_probs, _ = router(x, active_mask)
         token_sums = routing_probs.sum(dim=-1)
-        assert torch.allclose(token_sums, torch.ones_like(token_sums), atol=1e-5)
+        zero_mass = token_sums == 0
+        unit_mass = torch.isclose(
+            token_sums,
+            torch.ones_like(token_sums),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        assert torch.all(zero_mass | unit_mass)
 
     def test_routing_probs_are_nonnegative(self):
-        """Softmax outputs are non-negative; gathering and renormalizing preserves this."""
+        """Entmax outputs are non-negative; gathering and normalization preserve this."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
@@ -132,11 +138,7 @@ class TestSelectedHeads:
         assert (selected_heads < config.num_mosrah_heads).all()
 
     def test_selected_heads_are_distinct_per_token(self):
-        """TopK on distinct Softmax outputs must return K distinct head indices per token.
-
-        Softmax produces strictly positive values for all L heads; ties are impossible
-        in practice, so K selected indices must be distinct.
-        """
+        """The block solver's TopK result must contain K distinct head indices."""
         config = small_config()
         router = MoSRAHRouter(config)
         x = torch.randn(2, 8, 64)
@@ -175,8 +177,7 @@ class TestGradients:
         assert router.routing_weight.grad.abs().sum().item() > 0.0
 
     def test_task_loss_reaches_routing_weight(self):
-        """Backward on routing_probs.sum() must populate routing_weight.grad —
-        confirming task gradients reach the routing projection."""
+        """A nonconstant weighted reduction must train the routing projection."""
         torch.manual_seed(0)
         config = small_config()
         router = MoSRAHRouter(config)
@@ -184,7 +185,12 @@ class TestGradients:
         active_mask = torch.ones(2, 8, dtype=torch.bool)
 
         _, routing_probs, _ = router(x, active_mask)
-        routing_probs.sum().backward()
+        coefficients = torch.arange(
+            config.num_selected_heads,
+            dtype=routing_probs.dtype,
+            device=routing_probs.device,
+        )
+        (routing_probs * coefficients).sum().backward()
 
         assert router.routing_weight.grad is not None
         assert router.routing_weight.grad.abs().sum().item() > 0.0
@@ -298,7 +304,7 @@ class TestRegretLoss:
         """Build tensors for _compute_regret from plain Python lists.
 
         Args:
-            routing_scores: Shape (N, L) list-of-lists, softmax probabilities.
+            routing_scores: Shape (N, L) list-of-lists of routing probabilities.
             selected: Shape (N,) list of expert indices (K=1 per token).
             active: Shape (N,) list of bools.
 
