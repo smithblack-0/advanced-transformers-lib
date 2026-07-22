@@ -222,7 +222,7 @@ class RouterCache(CacheLayerMixin):
         self._step_in_block = self._step_in_block.to(self._device)
 
     # ---------------------------------------------------------------------------
-    # CacheLayerMixin — unsupported abstract methods
+    # CacheLayerMixin compatibility
     # ---------------------------------------------------------------------------
 
     def lazy_initialization(  # type: ignore[override]
@@ -247,13 +247,22 @@ class RouterCache(CacheLayerMixin):
         """Not supported — RouterCache tracks block position, not sequence length."""
         raise NotImplementedError("RouterCache does not track sequence length.")
 
+    def get_max_length(self) -> int:
+        """Return an undefined maximum because RouterCache stores no token sequence.
+
+        Hugging Face uses ``-1`` for cache layers with no meaningful maximum
+        sequence length. RouterCache retains only cyclic state for the current
+        W-token routing block, not a sequence-indexed K/V history.
+        """
+        return -1
+
     def get_max_cache_shape(self) -> int:
-        """Not supported — RouterCache does not hold KV pairs."""
-        raise NotImplementedError("RouterCache does not have a KV cache shape.")
+        """Compatibility alias for the deprecated cache-shape interface."""
+        return self.get_max_length()
 
     def get_mask_sizes(  # type: ignore[override]
         self,
-        cache_position: torch.Tensor,
+        query_length: int,
     ) -> tuple[int, int]:
         """Not supported — RouterCache does not participate in KV attention masking."""
         raise NotImplementedError("RouterCache does not participate in KV masking.")
