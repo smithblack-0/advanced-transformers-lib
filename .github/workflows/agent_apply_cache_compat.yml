@@ -1,0 +1,129 @@
+name: Apply cache compatibility patch
+
+on:
+  push:
+    branches:
+      - agent/shram-trainability-fixes
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/shram-trainability-fixes
+          fetch-depth: 0
+      - name: Rebuild affected files from master and apply exact substitutions
+        shell: bash
+        run: |
+          git fetch origin master
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          def base_text(path: str) -> tuple[str, str]:
+              data = subprocess.check_output(["git", "show", f"origin/master:{path}"])
+              newline = "\r\n" if b"\r\n" in data else "\n"
+              return data.decode("utf-8").replace("\r\n", "\n"), newline
+
+          def replace_once(text: str, old: str, new: str, path: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{path}: expected one replacement target, found {count}")
+              return text.replace(old, new)
+
+          def write_from_master(path: str, replacements: list[tuple[str, str]]) -> None:
+              text, newline = base_text(path)
+              for old, new in replacements:
+                  text = replace_once(text, old, new, path)
+              Path(path).write_bytes(text.replace("\n", newline).encode("utf-8"))
+
+          write_from_master(
+              "src/shram/model/attention/bottlenecked_ensemble_attention.py",
+              [
+                  (
+                      "from ..cache.mosrah_cache import MoSRAHCache\nfrom ..rope import RotaryEmbedding\n",
+                      "from ..cache.mosrah_cache import MoSRAHCache\nfrom ..initialization import initialize_projection_parameter\nfrom ..rope import RotaryEmbedding\n",
+                  ),
+                  (
+                      "    def _reset_parameters(self) -> None:\n        \"\"\"Initialize per-head projection weights.\"\"\"\n        for weight in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):\n            nn.init.xavier_uniform_(weight)\n",
+                      "    def _reset_parameters(self) -> None:\n        \"\"\"Initialize projection banks independently of storage rank.\n\n        These tensors store independent per-head linear maps. Their leading\n        head dimension is storage organization rather than fan geometry.\n        \"\"\"\n        for weight in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):\n            initialize_projection_parameter(weight)\n",
+                  ),
+              ],
+          )
+
+          write_from_master(
+              "src/shram/model/cache/router_cache.py",
+              [
+                  (
+                      "    def get_max_cache_shape(self) -> int:\n        \"\"\"Not supported — RouterCache does not hold KV pairs.\"\"\"\n        raise NotImplementedError(\"RouterCache does not have a KV cache shape.\")\n",
+                      "    def get_max_length(self) -> int:\n        \"\"\"Return an undefined maximum because no token sequence is stored.\"\"\"\n        return -1\n\n    def get_max_cache_shape(self) -> int:\n        \"\"\"Compatibility alias for the deprecated cache-shape interface.\"\"\"\n        return self.get_max_length()\n",
+                  ),
+              ],
+          )
+
+          write_from_master(
+              "src/shram/model/cache/mosrah_cache.py",
+              [
+                  (
+                      "    def get_max_cache_shape(self) -> int:  # type: ignore[override]\n        \"\"\"Return the static per-(batch, head) slot capacity of this cache.\n\n        Equal to mosrah_cache_length as supplied at construction, which is derived\n        from config.mosrah_cache_length. Required by the HuggingFace static cache\n        contract; generation machinery uses this to size attention masks.\n        \"\"\"\n        return self.mosrah_cache_length\n",
+                      "    def get_max_length(self) -> int:\n        \"\"\"Return the static per-(batch, head) slot capacity of this cache.\"\"\"\n        return self.mosrah_cache_length\n\n    def get_max_cache_shape(self) -> int:  # type: ignore[override]\n        \"\"\"Compatibility alias for the deprecated cache-shape interface.\"\"\"\n        return self.get_max_length()\n",
+                  ),
+              ],
+          )
+
+          write_from_master(
+              "src/shram/model/cache/slow_mosrah_cache.py",
+              [
+                  (
+                      "    def get_max_cache_shape(self) -> int:  # type: ignore[override]\n        \"\"\"Not supported — SlowMoSRAHCache is dynamic and unbounded.\"\"\"\n        raise NotImplementedError(\n            \"SlowMoSRAHCache is unbounded; get_max_cache_shape() is not supported.\"\n        )\n",
+                      "    def get_max_length(self) -> int:\n        \"\"\"Return the fixed reference-buffer capacity.\"\"\"\n        return self.mosrah_cache_length\n\n    def get_max_cache_shape(self) -> int:  # type: ignore[override]\n        \"\"\"Compatibility alias for the deprecated cache-shape interface.\"\"\"\n        return self.get_max_length()\n",
+                  ),
+              ],
+          )
+
+          write_from_master(
+              "src/shram/model/cache/sliding_window_cache.py",
+              [
+                  (
+                      "    def get_max_cache_shape(self) -> int:\n        return self.sliding_window\n",
+                      "    def get_max_length(self) -> int:\n        \"\"\"Return the retained local sliding-window capacity.\"\"\"\n        return self.sliding_window\n\n    def get_max_cache_shape(self) -> int:\n        \"\"\"Compatibility alias for the deprecated cache-shape interface.\"\"\"\n        return self.get_max_length()\n",
+                  ),
+              ],
+          )
+
+          write_from_master(
+              "src/shram/model/cache/shram_layer_cache.py",
+              [
+                  (
+                      "    def get_max_cache_shape(self) -> int:  # type: ignore[override]\n        \"\"\"Return the maximum sequence length this layer cache can serve.\n\n        The authoritative upper bound is ``config.inference_sequence_length``, which\n        governs the full accumulated token history the model is configured to handle.\n        HuggingFace's static-cache machinery reads this value to determine whether the\n        cache is compileable and to size generation loops.\n        \"\"\"\n        return self._inference_sequence_length\n",
+                      "    def get_max_length(self) -> int:\n        \"\"\"Return the maximum sequence length this layer cache can serve.\n\n        The authoritative upper bound is ``config.inference_sequence_length``, which\n        governs the full accumulated token history the model is configured to handle.\n        \"\"\"\n        return self._inference_sequence_length\n\n    def get_max_cache_shape(self) -> int:  # type: ignore[override]\n        \"\"\"Compatibility alias for the deprecated cache-shape interface.\"\"\"\n        return self.get_max_length()\n",
+                  ),
+              ],
+          )
+
+          for temporary in (
+              ".github/workflows/shram_full_diagnostic.yml",
+              ".github/workflows/agent_apply_cache_compat.yml",
+          ):
+              Path(temporary).unlink(missing_ok=True)
+          PY
+      - name: Commit exact compatibility patch
+        shell: bash
+        run: |
+          git config user.name "OpenAI Agent"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            src/shram/model/attention/bottlenecked_ensemble_attention.py \
+            src/shram/model/cache/router_cache.py \
+            src/shram/model/cache/mosrah_cache.py \
+            src/shram/model/cache/slow_mosrah_cache.py \
+            src/shram/model/cache/sliding_window_cache.py \
+            src/shram/model/cache/shram_layer_cache.py \
+            .github/workflows/shram_full_diagnostic.yml \
+            .github/workflows/agent_apply_cache_compat.yml
+          git commit -m "Complete SHRAM cache compatibility update"
+          git push origin HEAD:agent/shram-trainability-fixes
