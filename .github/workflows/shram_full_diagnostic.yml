@@ -1,22 +1,18 @@
-name: Apply RoPE response contract correction
+name: Build corrected RoPE response test
 
 on:
   pull_request:
     paths:
       - "tests/shram/model/attention/test_shram.py"
       - ".github/workflows/shram_full_diagnostic.yml"
-      - ".github/workflows/agent_update_rope_response_test.yml"
-
-permissions:
-  contents: write
 
 jobs:
-  apply:
+  build-corrected-file:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: agent/shram-trainability-fixes
       - name: Remove initialization-dependent response threshold
         shell: bash
         run: |
@@ -44,13 +40,9 @@ jobs:
               raise RuntimeError(f"Expected exactly one response-threshold block, found {count}")
           text = text.replace(old, new)
           path.write_bytes(text.replace("\n", newline).encode("utf-8"))
-          Path(".github/workflows/agent_update_rope_response_test.yml").unlink(missing_ok=True)
           PY
-      - name: Commit corrected response contract
-        shell: bash
-        run: |
-          git config user.name "OpenAI Agent"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add tests/shram/model/attention/test_shram.py .github/workflows/agent_update_rope_response_test.yml
-          git commit -m "Make RoPE response test initialization-scale independent"
-          git push origin HEAD:agent/shram-trainability-fixes
+      - name: Upload corrected test file
+        uses: actions/upload-artifact@v4
+        with:
+          name: corrected-test-shram
+          path: tests/shram/model/attention/test_shram.py
