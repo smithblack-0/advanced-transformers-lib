@@ -17,13 +17,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install SHRAM test dependencies
-        run: python -m pip install -q -e "src/shram[dev]"
-      - name: Run full SHRAM suite and capture first failure
+      - name: Install exact SHRAM CI dependencies
+        run: pip install -r src/shram/requirements-dev.txt && pip install -e src/shram/[dev]
+      - name: Run exact SHRAM integration command and capture first failure
         shell: bash
         run: |
           set +e
-          python -m pytest -q --tb=short -x tests/shram > shram-pytest.txt 2>&1
+          pytest tests/shram/ -x --tb=short > shram-pytest.txt 2>&1
           status=$?
           echo "$status" > shram-pytest-status.txt
           cat shram-pytest.txt
