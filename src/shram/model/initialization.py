@@ -40,5 +40,5 @@ def initialize_projection_parameter(parameter: nn.Parameter) -> None:
 
     raise ValueError(
         "SHRAM raw projection parameters must be rank two (router) or rank "
-        f"three (independent expert bank), got rank {parameter.ndim}."
+        f"three (independent expert bank), got shape {tuple(parameter.shape)}."
     )
