@@ -247,9 +247,13 @@ class RouterCache(CacheLayerMixin):
         """Not supported — RouterCache tracks block position, not sequence length."""
         raise NotImplementedError("RouterCache does not track sequence length.")
 
+    def get_max_length(self) -> int:
+        """Return an undefined maximum because no token sequence is stored."""
+        return -1
+
     def get_max_cache_shape(self) -> int:
-        """Not supported — RouterCache does not hold KV pairs."""
-        raise NotImplementedError("RouterCache does not have a KV cache shape.")
+        """Compatibility alias for the deprecated cache-shape interface."""
+        return self.get_max_length()
 
     def get_mask_sizes(  # type: ignore[override]
         self,

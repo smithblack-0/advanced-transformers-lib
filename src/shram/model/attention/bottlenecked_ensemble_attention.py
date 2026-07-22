@@ -19,6 +19,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from ..configuration import ShramConfig
 from ..cache.mosrah_cache import MoSRAHCache
+from ..initialization import initialize_projection_parameter
 from ..rope import RotaryEmbedding
 
 
@@ -168,9 +169,13 @@ class BottleneckedEnsembleAttention(nn.Module):
         return torch.einsum("bltu,lud->bltd", attended_states, self.o_proj)
 
     def _reset_parameters(self) -> None:
-        """Initialize per-head projection weights."""
+        """Initialize projection banks independently of storage rank.
+
+        These tensors store independent per-head linear maps. Their leading
+        head dimension is storage organization rather than fan geometry.
+        """
         for weight in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
-            nn.init.xavier_uniform_(weight)
+            initialize_projection_parameter(weight)
 
     def _validate_tensor_shape(self, packed_embeddings: torch.Tensor) -> None:
         """Validate the local packed-embedding shape contract required by BEA."""

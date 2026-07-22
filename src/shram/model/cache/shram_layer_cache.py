@@ -216,15 +216,17 @@ class ShramLayerCache(CacheLayerMixin):
             "Update sliding_window_cache or mosrah_cache directly."
         )
 
-    def get_max_cache_shape(self) -> int:  # type: ignore[override]
+    def get_max_length(self) -> int:
         """Return the maximum sequence length this layer cache can serve.
 
         The authoritative upper bound is ``config.inference_sequence_length``, which
         governs the full accumulated token history the model is configured to handle.
-        HuggingFace's static-cache machinery reads this value to determine whether the
-        cache is compileable and to size generation loops.
         """
         return self._inference_sequence_length
+
+    def get_max_cache_shape(self) -> int:  # type: ignore[override]
+        """Compatibility alias for the deprecated cache-shape interface."""
+        return self.get_max_length()
 
     def get_mask_sizes(  # type: ignore[override]
         self,

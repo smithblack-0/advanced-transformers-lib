@@ -305,14 +305,13 @@ class MoSRAHCache(CacheLayerMixin):
             "Use get_heads_lengths() for per-head occupancy."
         )
 
-    def get_max_cache_shape(self) -> int:  # type: ignore[override]
-        """Return the static per-(batch, head) slot capacity of this cache.
-
-        Equal to mosrah_cache_length as supplied at construction, which is derived
-        from config.mosrah_cache_length. Required by the HuggingFace static cache
-        contract; generation machinery uses this to size attention masks.
-        """
+    def get_max_length(self) -> int:
+        """Return the static per-(batch, head) slot capacity of this cache."""
         return self.mosrah_cache_length
+
+    def get_max_cache_shape(self) -> int:  # type: ignore[override]
+        """Compatibility alias for the deprecated cache-shape interface."""
+        return self.get_max_length()
 
     def get_mask_sizes(  # type: ignore[override]
         self,

@@ -12,7 +12,7 @@ Invariants verified in this file:
 - get_seq_length() raises NotImplementedError
 - lazy_initialization() is a no-op
 - update() is the primary interface — stores and returns in one call
-- get_max_cache_shape() raises NotImplementedError
+- get_max_length() and get_max_cache_shape() return the fixed buffer capacity
 - get_mask_sizes() raises NotImplementedError
 - get_heads_lengths() returns the (B, L) count tensor
 - get_heads_lengths() returns zeros for a fresh cache
@@ -105,11 +105,11 @@ def test_lazy_initialization_is_noop():
     assert cache.is_initialized is True
 
 
-def test_get_max_cache_shape_raises():
-    """get_max_cache_shape() raises NotImplementedError — cache is unbounded."""
+def test_max_length_contract_returns_fixed_buffer_capacity():
+    """Both current and deprecated interfaces report the fixed capacity."""
     cache = make_cache()
-    with pytest.raises(NotImplementedError):
-        cache.get_max_cache_shape()
+    assert cache.get_max_length() == CACHE_LENGTH
+    assert cache.get_max_cache_shape() == CACHE_LENGTH
 
 
 def test_get_mask_sizes_raises():

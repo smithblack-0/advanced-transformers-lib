@@ -11,6 +11,7 @@ dependencies = [
     "transformers",
     "huggingface_hub",
     "libcst",
+    "entmax==1.3",
 ]
 
 [project.optional-dependencies]
