@@ -6,8 +6,10 @@ input hidden state x, the router produces two outputs used downstream:
   - selected_heads (I): which K of the L available expert heads each token
     routes to, determined by a block-balanced causal solver.
   - routing_probs (P): the weights used for the weighted output reduction,
-    gathered from the Entmax routing distribution at the selected indices and
-    renormalized to sum to 1 per token.
+    gathered from the Entmax routing distribution at the selected indices.
+    Tokens with positive selected mass are renormalized to sum to one; tokens
+    whose mechanically assigned experts all have zero Entmax mass receive an
+    all-zero mixture and therefore no sparse-path contribution.
 
 Routing uses a single learnable projection:
 
@@ -39,7 +41,6 @@ from ..initialization import initialize_projection_parameter
 
 
 ENTMAX_ALPHA = 1.2
-ROUTING_GATE_EPS = 1e-9
 
 
 class MoSRAHRouter(nn.Module):
@@ -71,7 +72,6 @@ class MoSRAHRouter(nn.Module):
         self.num_selected_heads = config.num_selected_heads
         self.block_length = config.block_length
         self.entmax_alpha = ENTMAX_ALPHA
-        self.gate_eps = ROUTING_GATE_EPS
 
         # Routing projection: maps input (B, N, d) to per-head routing scores (B, N, L).
         self.routing_weight = nn.Parameter(
@@ -96,9 +96,10 @@ class MoSRAHRouter(nn.Module):
         Returns:
             selected_heads: Head indices I of shape (batch, seq_len, num_selected_heads).
                 Each token's K selected head indices from the block-balanced solver.
-            routing_probs: Routing probabilities P of shape (batch, seq_len,
-                num_selected_heads). Gathered from the pre-balance Entmax
-                distribution and renormalized to sum to 1 per token.
+            routing_probs: Routing weights P of shape (batch, seq_len,
+                num_selected_heads). Selected positive Entmax mass is normalized
+                to one. An all-zero selected support remains all-zero, allowing
+                the token to make no sparse-path contribution.
             router_diagnostics: Dict of routing scalars:
                 - ``regret_loss``: gradient-carrying mean regret, mean of
                   max(p_max_active − p_chosen, 0) over live (B, num_blocks, L)
@@ -137,8 +138,8 @@ class MoSRAHRouter(nn.Module):
         #
         # Establish the clean routing distribution before any -inf masking.
         # Entmax and selected-weight normalization are computed in fp32 by
-        # numeric policy. Only the final normalized route weights return to the
-        # model dtype. The regret objective also retains the fp32 distribution.
+        # numeric policy. Only the final route weights return to model dtype.
+        # The regret objective also retains the fp32 distribution.
         routing_logits = self._compute_routing_logits(x)                       # (B, N, L)
         routing_logits_fp32 = routing_logits.float()
         logit_std = routing_logits_fp32.std(dim=-1).mean().detach()
@@ -258,18 +259,22 @@ class MoSRAHRouter(nn.Module):
                 active_mask,
             )
 
-        # ── Phase: routing probabilities ────────────────────────────────────────
+        # ── Phase: routing weights ──────────────────────────────────────────────
         #
-        # Gather from the clean fp32 Entmax distribution. Mechanical balance can
-        # force every selected expert outside the sparse Entmax support, so epsilon
-        # smoothing is part of the normalization contract rather than a
-        # denominator-only clamp. Normalize in fp32, then return to model dtype.
+        # Gather from the clean fp32 Entmax distribution. If mechanical balance
+        # assigns only experts outside a token's sparse Entmax support, the token
+        # intentionally receives an all-zero mixture and contributes nothing on
+        # the sparse path. Positive selected mass is normalized in fp32.
         gathered_fp32 = routing_scores_fp32.gather(                             # (B, N, K)
             dim=-1,
             index=selected_heads,
-        ).clamp_min(self.gate_eps)
+        )
+        gathered_sum = gathered_fp32.sum(dim=-1, keepdim=True)
+        normalization_denominator = gathered_sum.clamp_min(
+            torch.finfo(gathered_fp32.dtype).tiny
+        )
         routing_probs = (
-            gathered_fp32 / gathered_fp32.sum(dim=-1, keepdim=True)
+            gathered_fp32 / normalization_denominator
         ).to(dtype=routing_logits.dtype)                                        # (B, N, K)
 
         router_diagnostics = {
