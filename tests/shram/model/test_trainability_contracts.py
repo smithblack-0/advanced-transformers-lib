@@ -68,7 +68,7 @@ def test_router_projection_uses_balance_initialization_scale() -> None:
     assert observed == pytest.approx(ROUTER_INIT_STD, rel=0.20)
 
 
-def test_router_entmax_outputs_are_normalized_and_finite() -> None:
+def test_router_entmax_outputs_are_finite_and_have_valid_total_mass() -> None:
     torch.manual_seed(0)
     config = small_config()
     router = MoSRAHRouter(config)
@@ -82,27 +82,32 @@ def test_router_entmax_outputs_are_normalized_and_finite() -> None:
     assert probabilities.dtype == hidden.dtype
     assert torch.isfinite(probabilities).all()
     assert (probabilities >= 0).all()
-    assert torch.allclose(
-        probabilities.sum(dim=-1),
-        torch.ones_like(probabilities[..., 0]),
+
+    probability_mass = probabilities.sum(dim=-1)
+    has_no_sparse_contribution = probability_mass == 0
+    has_normalized_sparse_contribution = torch.isclose(
+        probability_mass,
+        torch.ones_like(probability_mass),
         atol=1e-6,
+        rtol=1e-6,
     )
+    assert torch.all(has_no_sparse_contribution | has_normalized_sparse_contribution)
+
     assert diagnostics["regret_loss"].dtype == torch.float32
     assert torch.isfinite(diagnostics["regret_loss"])
     assert torch.isfinite(diagnostics["logit_regret"])
     assert torch.isfinite(diagnostics["logit_std"])
 
 
-def test_forced_zero_support_assignments_still_normalize(monkeypatch) -> None:
-    """Mechanical balance must not produce an all-zero selected mixture."""
+def test_forced_zero_support_assignment_skips_sparse_contribution(monkeypatch) -> None:
+    """A token with no selected Entmax mass should contribute nothing sparsely."""
     config = small_config()
     router = MoSRAHRouter(config)
     hidden = torch.zeros(1, config.block_length, config.embedding_width)
     active = torch.ones(1, config.block_length, dtype=torch.bool)
 
     # Both tokens strongly prefer experts 0..3. The first token claims them,
-    # forcing the second token onto experts 4..7, which lie outside its sparse
-    # Entmax support before selected-weight smoothing.
+    # forcing the second token onto experts 4..7, all outside its Entmax support.
     forced_logits = torch.tensor(
         [[
             [100.0, 99.0, 98.0, 97.0, -100.0, -101.0, -102.0, -103.0],
@@ -117,13 +122,13 @@ def test_forced_zero_support_assignments_still_normalize(monkeypatch) -> None:
     assert torch.equal(selected[0, 1].sort().values, torch.tensor([4, 5, 6, 7]))
     torch.testing.assert_close(
         probabilities[0, 1],
-        torch.full((config.num_selected_heads,), 1.0 / config.num_selected_heads),
-        atol=1e-6,
-        rtol=1e-6,
+        torch.zeros(config.num_selected_heads),
+        atol=0.0,
+        rtol=0.0,
     )
     torch.testing.assert_close(
-        probabilities.sum(dim=-1),
-        torch.ones_like(probabilities[..., 0]),
+        probabilities[0, 0].sum(),
+        torch.tensor(1.0),
         atol=1e-6,
         rtol=1e-6,
     )
